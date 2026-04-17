@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 from collections import deque
+import base64
 import json
 import os
 import queue
@@ -12,6 +13,15 @@ import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
+
+import cv2
+import numpy as np
+
+
+LEFT_KEYS = {81, 2424832, 65361}
+UP_KEYS = {82, 2490368, 65362}
+RIGHT_KEYS = {83, 2555904, 65363}
+DOWN_KEYS = {84, 2621440, 65364}
 
 
 def _print_json(prefix: str, payload: Any) -> None:
@@ -31,6 +41,20 @@ class GatewayClient:
         self.lock = threading.Lock()
         self.last_stderr_lines: deque[str] = deque(maxlen=30)
         self.last_error: str = ""
+
+        self.frame_lock = threading.Lock()
+        self.latest_camera_frame: Optional[np.ndarray] = None
+        self.latest_lidar_image: Optional[np.ndarray] = None
+        self.latest_lidar_point_count = 0
+
+        self.camera_stream_enabled = bool(args.enable_camera)
+        self.lidar_stream_enabled = bool(args.enable_lidar)
+
+        self.gui_enabled = not args.no_gui
+        self.show_video_window = self.gui_enabled and not args.no_video_window
+        self.show_lidar_window = self.gui_enabled and not args.no_lidar_window
+        self.arrow_teleop_enabled = self.gui_enabled and not args.disable_arrow_teleop
+        self.pending_stop_at = 0.0
 
     def _next_id(self) -> str:
         with self.lock:

@@ -1,0 +1,8 @@
+fastapi>=0.116.0
+uvicorn>=0.35.0
+paho-mqtt>=2.1.0
+websockets>=13.1
+numpy>=2.1.0
+opencv-python>=4.10.0
+sounddevice>=0.5.2
+unitree-webrtc-connect>=2.0.4

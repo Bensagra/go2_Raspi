@@ -10,14 +10,26 @@ import time
 from typing import Any, Dict, List, Optional
 
 import cv2
+import numpy as np
 
-from unitree_webrtc_connect import (
-    DATA_CHANNEL_TYPE,
-    RTC_TOPIC,
-    SPORT_CMD,
-    UnitreeWebRTCConnection,
-    WebRTCConnectionMethod,
-)
+try:
+    from unitree_webrtc_connect import (
+        AUDIO_API,
+        DATA_CHANNEL_TYPE,
+        RTC_TOPIC,
+        SPORT_CMD,
+        UnitreeWebRTCConnection,
+        WebRTCConnectionMethod,
+    )
+except ImportError:
+    from unitree_webrtc_connect.constants import (
+        AUDIO_API,
+        DATA_CHANNEL_TYPE,
+        RTC_TOPIC,
+        SPORT_CMD,
+        WebRTCConnectionMethod,
+    )
+    from unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection
 
 
 DEFAULT_GO2_IP = "192.168.123.161"
@@ -64,6 +76,7 @@ PROFILE_TOPICS = {
         "LIDAR_LOCALIZATION_CLOUD_POINT",
     ],
     "lidar": ["ULIDAR_ARRAY", "ULIDAR_STATE", "ROBOTODOM"],
+    "audio": ["AUDIO_HUB_PLAY_STATE"],
     "navigation": [
         "SLAM_ODOMETRY",
         "LIDAR_MAPPING_ODOM",
@@ -96,6 +109,11 @@ class Go2SshGateway:
         self.camera_frame_count = 0
 
         self.lidar_enabled = args.enable_lidar
+        self.audio_enabled = args.enable_audio
+        self.audio_emit_every = args.audio_emit_every
+        self.audio_max_bytes = args.audio_max_bytes
+        self.audio_frame_count = 0
+        self.last_audio_error_at = 0.0
 
         self.video_task: Optional[asyncio.Task[None]] = None
 
@@ -300,11 +318,121 @@ class Go2SshGateway:
             }
             await self.emit(event)
 
+    def _audio_frame_to_pcm_payload(self, frame) -> Dict[str, Any]:
+        array = frame.to_ndarray()
+        if array is None:
+            raise ValueError("Audio frame payload is empty")
+
+        if not isinstance(array, np.ndarray):
+            array = np.asarray(array)
+
+        if array.ndim == 0:
+            array = np.expand_dims(array, axis=0)
+
+        if array.ndim == 1:
+            array = np.expand_dims(array, axis=1)
+
+        if array.ndim > 2:
+            array = array.reshape(array.shape[0], -1)
+
+        # aiortc often yields planar audio in (channels, samples) shape.
+        if array.ndim == 2 and array.shape[0] <= 8 and array.shape[1] > array.shape[0]:
+            array = array.T
+
+        if np.issubdtype(array.dtype, np.floating):
+            array = (np.clip(array, -1.0, 1.0) * 32767.0).astype(np.int16)
+        else:
+            array = array.astype(np.int16, copy=False)
+
+        array = np.ascontiguousarray(array)
+
+        channels = int(array.shape[1]) if array.ndim == 2 else 1
+        samples_per_channel = int(array.shape[0])
+
+        pcm_bytes = array.tobytes()
+        total_bytes = len(pcm_bytes)
+
+        truncated = False
+        if self.audio_max_bytes > 0 and total_bytes > self.audio_max_bytes:
+            truncated = True
+            pcm_bytes = pcm_bytes[: self.audio_max_bytes]
+
+        bytes_per_sample = 2
+        bytes_per_frame = max(bytes_per_sample * channels, bytes_per_sample)
+        aligned_len = len(pcm_bytes) - (len(pcm_bytes) % bytes_per_frame)
+        pcm_bytes = pcm_bytes[:aligned_len]
+
+        if not pcm_bytes:
+            raise ValueError("Audio payload too small after alignment")
+
+        return {
+            "pcm_bytes": pcm_bytes,
+            "channels": channels,
+            "samples_per_channel": samples_per_channel,
+            "sample_rate": int(getattr(frame, "sample_rate", 0) or 0),
+            "layout": getattr(getattr(frame, "layout", None), "name", "unknown"),
+            "frame_format": getattr(getattr(frame, "format", None), "name", "unknown"),
+            "total_bytes": total_bytes,
+            "truncated": truncated,
+        }
+
+    async def _on_audio_frame(self, frame) -> None:
+        self.audio_frame_count += 1
+
+        if not self.audio_enabled:
+            return
+
+        if self.audio_frame_count % self.audio_emit_every != 0 and self.audio_frame_count != 1:
+            return
+
+        try:
+            payload = self._audio_frame_to_pcm_payload(frame)
+        except Exception as exc:
+            now = time.time()
+            if now - self.last_audio_error_at > 2.0:
+                self.last_audio_error_at = now
+                await self.emit(
+                    {
+                        "type": "error",
+                        "source": "audio",
+                        "message": f"Failed to encode audio frame: {exc}",
+                        "ts": now,
+                    }
+                )
+            return
+
+        event = {
+            "type": "event",
+            "stream": "audio",
+            "ts": time.time(),
+            "data": {
+                "frame_index": self.audio_frame_count,
+                "pts": frame.pts,
+                "time_base": str(frame.time_base),
+                "audio_format": "pcm_s16le",
+                "sample_rate": payload["sample_rate"],
+                "channels": payload["channels"],
+                "samples_per_channel": payload["samples_per_channel"],
+                "layout": payload["layout"],
+                "frame_format": payload["frame_format"],
+                "total_bytes": payload["total_bytes"],
+                "truncated": payload["truncated"],
+                "audio_base64": base64.b64encode(payload["pcm_bytes"]).decode("ascii"),
+            },
+        }
+        await self.emit(event)
+
     async def _set_video(self, enabled: bool) -> None:
         if self.conn is None:
             raise RuntimeError("Connection not ready")
         self.camera_enabled = enabled
         self.conn.video.switchVideoChannel(enabled)
+
+    async def _set_audio(self, enabled: bool) -> None:
+        if self.conn is None:
+            raise RuntimeError("Connection not ready")
+        self.audio_enabled = enabled
+        self.conn.audio.switchAudioChannel(enabled)
 
     async def _set_lidar(self, enabled: bool) -> None:
         if self.conn is None:
@@ -330,6 +458,92 @@ class Go2SshGateway:
         )
         return response
 
+    async def _audiohub_request(self, api_id: int, parameter: Optional[Any] = None) -> Any:
+        if self.conn is None:
+            raise RuntimeError("Connection not ready")
+
+        if parameter is None:
+            parameter = {}
+
+        options: Dict[str, Any] = {"api_id": api_id}
+        if isinstance(parameter, str):
+            options["parameter"] = parameter
+        else:
+            options["parameter"] = json.dumps(parameter, ensure_ascii=True)
+
+        response = await self.conn.datachannel.pub_sub.publish_request_new(
+            TOPIC_ALIAS_TO_VALUE["AUDIO_HUB_REQ"],
+            options,
+        )
+        return response
+
+    async def _handle_audiohub_action(self, command: Dict[str, Any]) -> Any:
+        action = str(command.get("action", "")).strip().lower()
+        if not action:
+            raise ValueError("audiohub requires 'action'")
+
+        if action in {"list", "get_audio_list"}:
+            return await self._audiohub_request(int(AUDIO_API["GET_AUDIO_LIST"]), {})
+
+        if action in {"play", "select_start_play"}:
+            unique_id = command.get("unique_id", command.get("uuid"))
+            if not unique_id:
+                raise ValueError("audiohub play requires 'unique_id' or 'uuid'")
+            return await self._audiohub_request(
+                int(AUDIO_API["SELECT_START_PLAY"]),
+                {"unique_id": str(unique_id)},
+            )
+
+        if action in {"pause"}:
+            return await self._audiohub_request(int(AUDIO_API["PAUSE"]), {})
+
+        if action in {"resume", "unsuspend"}:
+            return await self._audiohub_request(int(AUDIO_API["UNSUSPEND"]), {})
+
+        if action in {"prev", "previous"}:
+            return await self._audiohub_request(int(AUDIO_API["SELECT_PREV_START_PLAY"]), {})
+
+        if action in {"next"}:
+            return await self._audiohub_request(int(AUDIO_API["SELECT_NEXT_START_PLAY"]), {})
+
+        if action in {"set_mode", "set_play_mode"}:
+            play_mode = command.get("play_mode", command.get("mode"))
+            if not isinstance(play_mode, str) or not play_mode:
+                raise ValueError("audiohub set_mode requires 'play_mode' (single_cycle|no_cycle|list_loop)")
+            return await self._audiohub_request(int(AUDIO_API["SET_PLAY_MODE"]), {"play_mode": play_mode})
+
+        if action in {"get_mode", "get_play_mode"}:
+            return await self._audiohub_request(int(AUDIO_API["GET_PLAY_MODE"]), {})
+
+        if action in {"rename", "select_rename"}:
+            unique_id = command.get("unique_id", command.get("uuid"))
+            new_name = command.get("new_name", command.get("name"))
+            if not unique_id or not isinstance(new_name, str) or not new_name:
+                raise ValueError("audiohub rename requires 'unique_id' and 'new_name'")
+            return await self._audiohub_request(
+                int(AUDIO_API["SELECT_RENAME"]),
+                {"unique_id": str(unique_id), "new_name": new_name},
+            )
+
+        if action in {"delete", "select_delete"}:
+            unique_id = command.get("unique_id", command.get("uuid"))
+            if not unique_id:
+                raise ValueError("audiohub delete requires 'unique_id' or 'uuid'")
+            return await self._audiohub_request(int(AUDIO_API["SELECT_DELETE"]), {"unique_id": str(unique_id)})
+
+        if action in {"enter_megaphone"}:
+            return await self._audiohub_request(int(AUDIO_API["ENTER_MEGAPHONE"]), {})
+
+        if action in {"exit_megaphone"}:
+            return await self._audiohub_request(int(AUDIO_API["EXIT_MEGAPHONE"]), {})
+
+        if action in {"raw", "request"}:
+            api_id = int(command["api_id"])
+            parameter = command.get("parameter", {})
+            return await self._audiohub_request(api_id, parameter)
+
+        raise ValueError(f"Unknown audiohub action: {action}")
+
     def _status_snapshot(self) -> Dict[str, Any]:
         return {
             "connected": bool(self.conn and self.conn.isConnected),
@@ -347,6 +561,12 @@ class Go2SshGateway:
             "lidar": {
                 "enabled": self.lidar_enabled,
                 "decoder": self.args.lidar_decoder,
+            },
+            "audio": {
+                "enabled": self.audio_enabled,
+                "emit_every": self.audio_emit_every,
+                "max_bytes": self.audio_max_bytes,
+                "frame_count": self.audio_frame_count,
             },
         }
 
@@ -437,6 +657,8 @@ class Go2SshGateway:
                             "get_motion_mode",
                             "set_video",
                             "set_camera_stream",
+                            "set_audio",
+                            "audiohub",
                             "set_lidar",
                             "set_lidar_decoder",
                             "exit",
@@ -625,6 +847,30 @@ class Go2SshGateway:
                 await self._send_response(cmd_id, True, {"lidar_enabled": self.lidar_enabled})
                 return
 
+            if op == "set_audio":
+                if "emit_every" in command:
+                    new_emit_every = int(command["emit_every"])
+                    if new_emit_every <= 0:
+                        raise ValueError("emit_every must be > 0")
+                    self.audio_emit_every = new_emit_every
+
+                if "max_bytes" in command:
+                    max_bytes = int(command["max_bytes"])
+                    if max_bytes < 0:
+                        raise ValueError("max_bytes must be >= 0")
+                    self.audio_max_bytes = max_bytes
+
+                if "enabled" in command:
+                    await self._set_audio(bool(command["enabled"]))
+
+                await self._send_response(cmd_id, True, self._status_snapshot()["audio"])
+                return
+
+            if op == "audiohub":
+                result = await self._handle_audiohub_action(command)
+                await self._send_response(cmd_id, True, result)
+                return
+
             if op == "set_lidar_decoder":
                 if self.conn is None:
                     raise RuntimeError("Connection not ready")
@@ -694,6 +940,7 @@ class Go2SshGateway:
         await self.conn.connect()
 
         self.conn.video.add_track_callback(self._on_video_track)
+        self.conn.audio.add_track_callback(self._on_audio_frame)
 
         if self.args.disable_traffic_saving:
             with contextlib.suppress(Exception):
@@ -714,6 +961,11 @@ class Go2SshGateway:
 
         if self.camera_enabled:
             await self._set_video(True)
+
+        if self.audio_enabled:
+            await self._set_audio(True)
+            with contextlib.suppress(Exception):
+                await self._subscribe_topic(TOPIC_ALIAS_TO_VALUE["AUDIO_HUB_PLAY_STATE"])
 
         if self.lidar_enabled:
             await self._set_lidar(True)
@@ -765,6 +1017,8 @@ class Go2SshGateway:
                 with contextlib.suppress(Exception):
                     self.conn.video.switchVideoChannel(False)
                 with contextlib.suppress(Exception):
+                    self.conn.audio.switchAudioChannel(False)
+                with contextlib.suppress(Exception):
                     await self.conn.disconnect()
 
 
@@ -781,7 +1035,7 @@ def _split_csv_values(values: List[str]) -> List[str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Go2 SSH gateway: stream telemetry/camera/lidar as NDJSON on stdout "
+            "Go2 SSH gateway: stream telemetry/camera/lidar/audio as NDJSON on stdout "
             "and receive control commands as NDJSON on stdin."
         )
     )
@@ -791,7 +1045,7 @@ def parse_args() -> argparse.Namespace:
         "--subscribe-profile",
         action="append",
         default=["core"],
-        help="Auto-subscribe profile(s): core, all_telemetry, lidar, navigation (repeat or comma-separated)",
+        help="Auto-subscribe profile(s): core, all_telemetry, lidar, audio, navigation (repeat or comma-separated)",
     )
     parser.add_argument(
         "--subscribe-topic",
@@ -823,6 +1077,14 @@ def parse_args() -> argparse.Namespace:
         "--disable-traffic-saving",
         action="store_true",
         help="Send disableTrafficSaving(on) after connect (recommended for lidar)",
+    )
+    parser.add_argument("--enable-audio", action="store_true", help="Enable audio streaming at startup")
+    parser.add_argument("--audio-emit-every", type=int, default=1, help="Emit one audio packet every N audio frames")
+    parser.add_argument(
+        "--audio-max-bytes",
+        type=int,
+        default=24576,
+        help="Max PCM bytes per audio event (0 disables truncation)",
     )
     parser.add_argument(
         "--exit-on-stdin-eof",
@@ -862,6 +1124,12 @@ def parse_args() -> argparse.Namespace:
 
     if args.camera_png_compression < 0 or args.camera_png_compression > 9:
         parser.error("--camera-png-compression must be between 0 and 9")
+
+    if args.audio_emit_every <= 0:
+        parser.error("--audio-emit-every must be > 0")
+
+    if args.audio_max_bytes < 0:
+        parser.error("--audio-max-bytes must be >= 0")
 
     if args.max_list_items < 0:
         parser.error("--max-list-items must be >= 0")

@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Go2 Operator Console</title>
+  <style>
+    :root {
+      --bg: #0f1720;
+      --panel: #182330;
+      --panel-2: #1f2d3d;
+      --text: #e4edf5;
+      --muted: #9ab0c3;
+      --ok: #45d483;
+      --warn: #ffb347;
+      --err: #ff6f6f;
+      --accent: #59a8ff;
+      --border: #2c3f53;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 20% -20%, #20384f 0%, #0f1720 55%, #0d141c 100%);
+      color: var(--text);
+      font-family: "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+      min-height: 100vh;
+    }
+
+    .wrap {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 16px;
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 16px;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+    }
+
+    .title {
+      margin: 0 0 8px;
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    input, select, button {
+      background: #111b25;
+      border: 1px solid #2f455a;
+      border-radius: 8px;
+      color: var(--text);
+      padding: 8px 10px;
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+      background: #12304b;
+    }
+
+    button:hover { filter: brightness(1.15); }
+
+    .status {
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid #2f455a;
+      background: #112030;
+      color: var(--muted);
+    }
+
+    .status.ok { color: var(--ok); border-color: #285a41; }
+    .status.err { color: var(--err); border-color: #663338; }
+
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .media {
+      width: 100%;
+      aspect-ratio: 16/9;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #0b1118;
+      object-fit: cover;
+    }
+
+    .mono {
+      white-space: pre-wrap;
+      margin: 0;
+      background: #0e1822;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      min-height: 180px;
+      max-height: 320px;
+      overflow: auto;
+      color: #c8d6e2;
+      font-size: 12px;
+    }
+
+    .events {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      max-height: 320px;
+      overflow: auto;
+      display: grid;
+      gap: 8px;
+    }
+
+    .events li {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #101b26;
+      padding: 8px;
+      font-size: 12px;
+      color: #cddbe7;
+    }
+
+    .events .ts {
+      color: var(--muted);
+      font-size: 11px;
+      margin-right: 8px;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 8px;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(90px, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .kbd {
+      color: #8ac2ff;
+      font-weight: 700;
+    }
+
+    @media (max-width: 1080px) {
+      .wrap { grid-template-columns: 1fr; }
+      .grid2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h2 class="title">Conexion</h2>
+      <div class="row">
+        <label>API</label>
+        <input id="apiBase" value="http://127.0.0.1:8000" style="min-width: 260px">
+        <label>Token</label>
+        <input id="token" value="dev-operator-token" style="min-width: 220px">
+        <label>Robot</label>
+        <input id="robotId" value="go2_01" style="width: 120px">
+        <button id="connectBtn">Conectar</button>
+        <span id="connStatus" class="status">desconectado</span>
+      </div>
+      <p class="hint">
+        Canal operativo: WebSocket + API al servidor. Canal pesado: media recibida desde edge (video/audio/lidar) reenviada por el server.
+      </p>
+
+      <div class="grid2" style="margin-top: 12px;">
+        <div>
+          <h2 class="title">Video</h2>
+          <img id="videoFrame" class="media" alt="video">
+        </div>
+        <div>
+          <h2 class="title">Lidar Preview</h2>
+          <img id="lidarFrame" class="media" alt="lidar">
+        </div>
+      </div>
+
+      <h2 class="title" style="margin-top: 14px;">Controles</h2>
+      <div class="controls">
+        <button data-cmd="forward">Forward</button>
+        <button data-cmd="left">Left</button>
+        <button data-cmd="right">Right</button>
+        <button data-cmd="back">Back</button>
+        <button data-cmd="strafeL">Strafe L</button>
+        <button data-cmd="strafeR">Strafe R</button>
+        <button data-cmd="stop" style="background:#4a1c24">STOP</button>
+        <button data-cmd="modeManual">Modo Manual</button>
+      </div>
+      <p class="hint">
+        Teclado: <span class="kbd">WASD</span> mover, <span class="kbd">Z/C</span> lateral, <span class="kbd">Space</span> stop.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2 class="title">Telemetria</h2>
+      <pre id="telemetryBox" class="mono">{}</pre>
+
+      <h2 class="title" style="margin-top: 12px;">Eventos / ACK / Predicciones</h2>
+      <ul id="events" class="events"></ul>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      ws: null,
+      controlLoop: null,
+      serverHeartbeatLoop: null,
+      keyState: new Set(),
+      token: "",
+      apiBase: "",
+      robotId: "go2_01",
+      connected: false,
+    };
+
+    const els = {
+      apiBase: document.getElementById("apiBase"),
+      token: document.getElementById("token"),
+      robotId: document.getElementById("robotId"),
+      connectBtn: document.getElementById("connectBtn"),
+      connStatus: document.getElementById("connStatus"),
+      telemetryBox: document.getElementById("telemetryBox"),
+      events: document.getElementById("events"),
+      videoFrame: document.getElementById("videoFrame"),
+      lidarFrame: document.getElementById("lidarFrame"),
+    };
+
+    function setStatus(text, ok = false) {
+      els.connStatus.textContent = text;
+      els.connStatus.className = "status" + (ok ? " ok" : " err");
+    }
+
+    function wsUrlFromApi(apiBase, token) {
+      const u = new URL(apiBase);
+      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+      u.pathname = "/ws/live";
+      u.search = "token=" + encodeURIComponent(token);
+      return u.toString();
+    }
+
+    function api(path) {
+      return state.apiBase.replace(/\/$/, "") + path;
+    }
+
+    async function sendCommand(type, payload = {}, ttl_ms = 1200) {
+      const body = { type, payload, ttl_ms };
+      const res = await fetch(api(`/api/robots/${state.robotId}/commands`), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + state.token,
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        addEvent("http_error", text);
+      }
+    }
+
+    async function activateControl() {
+      await fetch(api(`/api/robots/${state.robotId}/control/activate`), {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + state.token },
+      });
+    }
+
+    function addEvent(type, data) {
+      const li = document.createElement("li");
+      const ts = new Date().toLocaleTimeString();
+      li.innerHTML = `<span class="ts">${ts}</span><strong>${type}</strong><div>${escapeHtml(JSON.stringify(data))}</div>`;
+      els.events.prepend(li);
+
+      while (els.events.children.length > 80) {
+        els.events.removeChild(els.events.lastChild);
+      }
+    }
+
+    function escapeHtml(text) {
+      return String(text)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function handleWsMessage(msg) {
+      const type = msg.type;
+
+      if (type === "telemetry") {
+        if (msg.robot_id !== state.robotId) return;
+        els.telemetryBox.textContent = JSON.stringify(msg.data || {}, null, 2);
+        return;
+      }
+
+      if (type === "media") {
+        if (msg.robot_id !== state.robotId) return;
+        const stream = msg.stream;
+        const data = msg.data || {};
+
+        if (stream === "video" && data.image_base64) {
+          els.videoFrame.src = `data:image/jpeg;base64,${data.image_base64}`;
+        }
+
+        if (stream === "lidar" && data.image_base64) {
+          els.lidarFrame.src = `data:image/jpeg;base64,${data.image_base64}`;
+        }
+
+        return;
+      }
+
+      if (type === "event" || type === "prediction" || type === "command_ack" || type === "command_out") {
+        addEvent(type, msg.data || msg);
+      }
+    }
+
+    function currentMoveFromKeys() {
+      let x = 0;
+      let y = 0;
+      let z = 0;
+
+      if (state.keyState.has("KeyW")) x += 0.3;
+      if (state.keyState.has("KeyS")) x -= 0.3;
+      if (state.keyState.has("KeyA")) z += 0.8;
+      if (state.keyState.has("KeyD")) z -= 0.8;
+      if (state.keyState.has("KeyZ")) y += 0.2;
+      if (state.keyState.has("KeyC")) y -= 0.2;
+
+      return { x, y, z };
+    }
+
+    function startControlLoop() {
+      stopControlLoop();
+
+      state.controlLoop = setInterval(async () => {
+        if (!state.connected) return;
+
+        const m = currentMoveFromKeys();
+        const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
+
+        if (active) {
+          await sendCommand("move", {
+            linear_x: m.x,
+            lateral_y: m.y,
+            angular_z: m.z,
+            duration_ms: 400,
+          }, 800);
+        }
+      }, 120);
+
+      state.serverHeartbeatLoop = setInterval(() => {
+        if (!state.connected || !state.ws) return;
+        state.ws.send(JSON.stringify({ op: "heartbeat", robot_id: state.robotId }));
+      }, 500);
+    }
+
+    function stopControlLoop() {
+      if (state.controlLoop) {
+        clearInterval(state.controlLoop);
+        state.controlLoop = null;
+      }
+      if (state.serverHeartbeatLoop) {
+        clearInterval(state.serverHeartbeatLoop);
+        state.serverHeartbeatLoop = null;
+      }
+    }
+
+    async function connect() {
+      state.token = els.token.value.trim();
+      state.apiBase = els.apiBase.value.trim();
+      state.robotId = els.robotId.value.trim();
+
+      if (!state.token || !state.apiBase || !state.robotId) {
+        setStatus("faltan datos", false);
+        return;
+      }
+
+      try {
+        await activateControl();
+      } catch (err) {
+        setStatus("token/api invalidos", false);
+        addEvent("auth_error", String(err));
+        return;
+      }
+
+      if (state.ws) {
+        try { state.ws.close(); } catch (e) {}
+      }
+
+      const url = wsUrlFromApi(state.apiBase, state.token);
+      const ws = new WebSocket(url);
+      state.ws = ws;
+
+      ws.onopen = () => {
+        state.connected = true;
+        setStatus("conectado", true);
+        startControlLoop();
+      };
+
+      ws.onclose = () => {
+        state.connected = false;
+        setStatus("desconectado", false);
+        stopControlLoop();
+      };
+
+      ws.onerror = (e) => {
+        addEvent("ws_error", "error websocket");
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          handleWsMessage(msg);
+        } catch (err) {
+          addEvent("ws_parse_error", ev.data);
+        }
+      };
+    }
+
+    document.querySelectorAll("button[data-cmd]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const cmd = btn.getAttribute("data-cmd");
+        if (!state.connected) return;
+
+        if (cmd === "forward") return sendCommand("move", { linear_x: 0.3, angular_z: 0.0, duration_ms: 500 });
+        if (cmd === "back") return sendCommand("move", { linear_x: -0.3, angular_z: 0.0, duration_ms: 500 });
+        if (cmd === "left") return sendCommand("move", { linear_x: 0.0, angular_z: 0.8, duration_ms: 450 });
+        if (cmd === "right") return sendCommand("move", { linear_x: 0.0, angular_z: -0.8, duration_ms: 450 });
+        if (cmd === "strafeL") return sendCommand("move", { linear_x: 0.0, lateral_y: 0.2, duration_ms: 500 });
+        if (cmd === "strafeR") return sendCommand("move", { linear_x: 0.0, lateral_y: -0.2, duration_ms: 500 });
+        if (cmd === "stop") return sendCommand("stop", {});
+        if (cmd === "modeManual") return sendCommand("enter_mode", { mode: "normal" });
+      });
+    });
+
+    els.connectBtn.addEventListener("click", connect);
+
+    window.addEventListener("keydown", async (ev) => {
+      if (["KeyW", "KeyA", "KeyS", "KeyD", "KeyZ", "KeyC"].includes(ev.code)) {
+        state.keyState.add(ev.code);
+      }
+      if (ev.code === "Space") {
+        ev.preventDefault();
+        if (state.connected) {
+          await sendCommand("stop", {});
+        }
+      }
+    });
+
+    window.addEventListener("keyup", async (ev) => {
+      if (["KeyW", "KeyA", "KeyS", "KeyD", "KeyZ", "KeyC"].includes(ev.code)) {
+        state.keyState.delete(ev.code);
+      }
+
+      const m = currentMoveFromKeys();
+      const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
+      if (!active && state.connected) {
+        await sendCommand("stop", {});
+      }
+    });
+  </script>
+</body>
+</html>

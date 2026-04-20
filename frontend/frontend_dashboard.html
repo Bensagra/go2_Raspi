@@ -172,7 +172,7 @@
       <h2 class="title">Conexion</h2>
       <div class="row">
         <label>API</label>
-        <input id="apiBase" value="http://127.0.0.1:8000" style="min-width: 260px">
+        <input id="apiBase" value="http://10.40.5.8:8000" style="min-width: 260px">
         <label>Token</label>
         <input id="token" value="dev-operator-token" style="min-width: 220px">
         <label>Robot</label>
@@ -261,25 +261,60 @@
       return state.apiBase.replace(/\/$/, "") + path;
     }
 
-    async function sendCommand(type, payload = {}, ttl_ms = 1200) {
-      const body = { type, payload, ttl_ms };
-      const res = await fetch(api(`/api/robots/${state.robotId}/commands`), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": "Bearer " + state.token,
-        },
-        body: JSON.stringify(body),
-      });
+    function normalizeApiBase(input) {
+      let raw = String(input || "").trim();
+      if (!raw) return "";
+      if (!/^https?:\/\//i.test(raw)) {
+        raw = "http://" + raw;
+      }
+      return raw.replace(/\/$/, "");
+    }
+
+    function normalizeError(err) {
+      if (err instanceof Error) {
+        if (err.message === "Failed to fetch") {
+          return "No se pudo conectar a la API (red/CORS). Verifica URL y server.";
+        }
+        return err.message;
+      }
+      return String(err);
+    }
+
+    async function fetchOrThrow(url, options = {}) {
+      let res;
+      try {
+        res = await fetch(url, options);
+      } catch (err) {
+        throw new Error(normalizeError(err));
+      }
 
       if (!res.ok) {
         const text = await res.text();
-        addEvent("http_error", text);
+        throw new Error(`HTTP ${res.status}: ${text || res.statusText || "request failed"}`);
+      }
+
+      return res;
+    }
+
+    async function sendCommand(type, payload = {}, ttl_ms = 1200) {
+      const body = { type, payload, ttl_ms };
+      try {
+        await fetchOrThrow(api(`/api/robots/${state.robotId}/commands`), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + state.token,
+          },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        addEvent("http_error", { type, error: normalizeError(err) });
+        throw err;
       }
     }
 
     async function activateControl() {
-      await fetch(api(`/api/robots/${state.robotId}/control/activate`), {
+      await fetchOrThrow(api(`/api/robots/${state.robotId}/control/activate`), {
         method: "POST",
         headers: { "Authorization": "Bearer " + state.token },
       });
@@ -359,12 +394,16 @@
         const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
 
         if (active) {
-          await sendCommand("move", {
-            linear_x: m.x,
-            lateral_y: m.y,
-            angular_z: m.z,
-            duration_ms: 400,
-          }, 800);
+          try {
+            await sendCommand("move", {
+              linear_x: m.x,
+              lateral_y: m.y,
+              angular_z: m.z,
+              duration_ms: 400,
+            }, 800);
+          } catch (err) {
+            // Error already recorded in events.
+          }
         }
       }, 120);
 
@@ -387,7 +426,8 @@
 
     async function connect() {
       state.token = els.token.value.trim();
-      state.apiBase = els.apiBase.value.trim();
+      state.apiBase = normalizeApiBase(els.apiBase.value);
+      els.apiBase.value = state.apiBase;
       state.robotId = els.robotId.value.trim();
 
       if (!state.token || !state.apiBase || !state.robotId) {
@@ -398,8 +438,8 @@
       try {
         await activateControl();
       } catch (err) {
-        setStatus("token/api invalidos", false);
-        addEvent("auth_error", String(err));
+        setStatus("fallo API", false);
+        addEvent("connect_error", normalizeError(err));
         return;
       }
 
@@ -407,7 +447,14 @@
         try { state.ws.close(); } catch (e) {}
       }
 
-      const url = wsUrlFromApi(state.apiBase, state.token);
+      let url;
+      try {
+        url = wsUrlFromApi(state.apiBase, state.token);
+      } catch (err) {
+        setStatus("api invalida", false);
+        addEvent("connect_error", normalizeError(err));
+        return;
+      }
       const ws = new WebSocket(url);
       state.ws = ws;
 
@@ -417,10 +464,11 @@
         startControlLoop();
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         state.connected = false;
         setStatus("desconectado", false);
         stopControlLoop();
+        addEvent("ws_close", { code: ev.code, reason: ev.reason || "" });
       };
 
       ws.onerror = (e) => {
@@ -462,7 +510,11 @@
       if (ev.code === "Space") {
         ev.preventDefault();
         if (state.connected) {
-          await sendCommand("stop", {});
+          try {
+            await sendCommand("stop", {});
+          } catch (err) {
+            // Error already recorded in events.
+          }
         }
       }
     });
@@ -475,7 +527,11 @@
       const m = currentMoveFromKeys();
       const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
       if (!active && state.connected) {
-        await sendCommand("stop", {});
+        try {
+          await sendCommand("stop", {});
+        } catch (err) {
+          // Error already recorded in events.
+        }
       }
     });
   </script>

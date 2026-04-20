@@ -69,6 +69,7 @@ mosquitto -p 1883
 python server/server_core.py \
   --host 0.0.0.0 \
   --port 8000 \
+  --cors-origin "*" \
   --mqtt-host 127.0.0.1 \
   --mqtt-port 1883 \
   --edge-media-token edge-media-dev-token \

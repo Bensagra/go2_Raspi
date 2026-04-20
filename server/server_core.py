@@ -12,6 +12,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 import paho.mqtt.client as mqtt
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
@@ -54,6 +55,7 @@ class CoreRuntime:
         self.heartbeat_task: Optional[asyncio.Task[None]] = None
 
         self.app = FastAPI(title="Go2 Server Core", version="0.1.0")
+        self._setup_cors()
         self._setup_routes()
 
         self.mqtt_client: Optional[mqtt.Client] = None
@@ -131,6 +133,19 @@ class CoreRuntime:
 
         for ws in stale:
             self.frontend_sockets.discard(ws)
+
+    def _setup_cors(self) -> None:
+        origins = [x.strip() for x in self.args.cors_origin if x.strip()]
+        if not origins:
+            origins = ["*"]
+
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=("*" not in origins),
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     def _setup_mqtt(self) -> None:
         client_id = self.args.mqtt_client_id or f"server-core-{uuid.uuid4().hex[:8]}"
@@ -545,6 +560,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        default=[],
+        help="Allowed CORS origin. Repeat for multiple origins. Default allows all origins.",
+    )
 
     parser.add_argument("--mqtt-host", default="127.0.0.1")
     parser.add_argument("--mqtt-port", type=int, default=1883)

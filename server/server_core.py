@@ -18,8 +18,30 @@ from pydantic import BaseModel, Field
 
 ROLE_ALLOWED_COMMANDS = {
     "viewer": set(),
-    "operator": {"move", "turn", "stop", "enter_mode"},
-    "admin": {"move", "turn", "stop", "enter_mode", "go_to", "follow_target"},
+    "operator": {
+        "move",
+        "turn",
+        "stop",
+        "enter_mode",
+        "set_video",
+        "set_camera_stream",
+        "set_audio",
+        "set_lidar",
+        "set_lidar_decoder",
+    },
+    "admin": {
+        "move",
+        "turn",
+        "stop",
+        "enter_mode",
+        "go_to",
+        "follow_target",
+        "set_video",
+        "set_camera_stream",
+        "set_audio",
+        "set_lidar",
+        "set_lidar_decoder",
+    },
 }
 
 
@@ -314,6 +336,39 @@ class CoreRuntime:
         if command_type == "enter_mode":
             output["mode"] = str(output.get("mode", "normal"))
 
+        if command_type == "set_video":
+            output["enabled"] = bool(output.get("enabled", True))
+
+        if command_type == "set_camera_stream":
+            if "enabled" in output:
+                output["enabled"] = bool(output["enabled"])
+
+            if "emit_every" in output:
+                output["emit_every"] = max(1, int(output["emit_every"]))
+
+            if "jpeg_quality" in output:
+                output["jpeg_quality"] = int(clamp(float(output["jpeg_quality"]), 1, 100))
+
+        if command_type == "set_audio":
+            if "enabled" in output:
+                output["enabled"] = bool(output["enabled"])
+            if "emit_every" in output:
+                output["emit_every"] = max(1, int(output["emit_every"]))
+            if "max_bytes" in output:
+                output["max_bytes"] = max(0, int(output["max_bytes"]))
+            if not output:
+                output["enabled"] = True
+
+        if command_type == "set_lidar":
+            output["enabled"] = bool(output.get("enabled", True))
+            output["subscribe"] = bool(output.get("subscribe", True))
+
+        if command_type == "set_lidar_decoder":
+            decoder = str(output.get("decoder", "libvoxel")).strip().lower()
+            if decoder not in {"libvoxel", "native"}:
+                raise HTTPException(status_code=400, detail="set_lidar_decoder supports only 'libvoxel' or 'native'")
+            output["decoder"] = decoder
+
         return output
 
     async def _heartbeat_loop(self) -> None:
@@ -375,6 +430,7 @@ class CoreRuntime:
                 "ts": time.time(),
                 "known_robots": self._known_robots(),
                 "frontend_clients": len(self.frontend_sockets),
+                "edge_media_clients": len(self.edge_media_sockets),
             }
 
         @app.get("/api/robots")
@@ -392,6 +448,23 @@ class CoreRuntime:
                 "telemetry": telemetry,
                 "media_streams": sorted(media.keys()),
                 "pending_commands": [x for x in self.pending_commands.values() if x.get("robot_id") == robot_id],
+            }
+
+        @app.get("/api/robots/{robot_id}/capabilities")
+        async def robot_capabilities(robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)) -> Dict[str, Any]:
+            role = auth["role"]
+            return {
+                "robot_id": robot_id,
+                "role": role,
+                "allowed_commands": sorted(ROLE_ALLOWED_COMMANDS.get(role, set())),
+                "limits": {
+                    "max_linear_speed": self.args.max_linear_speed,
+                    "max_lateral_speed": self.args.max_lateral_speed,
+                    "max_angular_speed": self.args.max_angular_speed,
+                    "default_move_duration_ms": self.args.default_move_duration_ms,
+                    "command_rate_max": self.args.command_rate_max,
+                    "command_rate_window_s": self.args.command_rate_window_s,
+                },
             }
 
         @app.get("/api/robots/{robot_id}/replay")
@@ -498,6 +571,22 @@ class CoreRuntime:
                     )
                 )
 
+            for media_robot_id, media_streams in self.latest_media.items():
+                for stream, data in media_streams.items():
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "media",
+                                "robot_id": media_robot_id,
+                                "stream": stream,
+                                "data": data,
+                                "ts": time.time(),
+                            },
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        )
+                    )
+
             try:
                 while True:
                     text = await ws.receive_text()
@@ -588,7 +677,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audit-log", default="./server/audit/server_audit.jsonl")
     parser.add_argument("--replay-max-items", type=int, default=2000)
 
-    parser.add_argument("--command-rate-max", type=int, default=30)
+    parser.add_argument("--command-rate-max", type=int, default=120)
     parser.add_argument("--command-rate-window-s", type=float, default=10.0)
 
     parser.add_argument("--max-linear-speed", type=float, default=0.45)

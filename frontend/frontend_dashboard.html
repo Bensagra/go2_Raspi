@@ -60,7 +60,7 @@
       align-items: center;
     }
 
-    input, select, button {
+    input:not([type="checkbox"]), select, button {
       background: #111b25;
       border: 1px solid #2f455a;
       border-radius: 8px;
@@ -160,6 +160,33 @@
       font-weight: 700;
     }
 
+    .inline-check {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid #2f455a;
+      border-radius: 8px;
+      padding: 6px 10px;
+      background: #0f1b26;
+      font-size: 12px;
+      color: #cddbe7;
+    }
+
+    input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: #59a8ff;
+      margin: 0;
+    }
+
+    .range {
+      width: 170px;
+    }
+
+    .small {
+      width: 86px;
+    }
+
     @media (max-width: 1080px) {
       .wrap { grid-template-columns: 1fr; }
       .grid2 { grid-template-columns: 1fr; }
@@ -206,8 +233,44 @@
         <button data-cmd="stop" style="background:#4a1c24">STOP</button>
         <button data-cmd="modeManual">Modo Manual</button>
       </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <label>Preset</label>
+        <select id="speedPreset">
+          <option value="turtle">Turtle</option>
+          <option value="normal" selected>Normal</option>
+          <option value="sport">Sport</option>
+        </select>
+
+        <label>Escala</label>
+        <input id="speedScale" class="range" type="range" min="20" max="140" value="70">
+        <span id="speedScaleLabel" class="status">70%</span>
+
+        <label>Loop(ms)</label>
+        <input id="loopMs" class="small" type="number" min="90" max="900" value="140">
+      </div>
+
+      <div class="row" style="margin-top: 8px;">
+        <label class="inline-check"><input id="enableVideo" type="checkbox" checked>Video</label>
+        <label class="inline-check"><input id="enableLidar" type="checkbox" checked>Lidar</label>
+        <label class="inline-check"><input id="enableAudio" type="checkbox" checked>Audio</label>
+
+        <label>Audio every</label>
+        <input id="audioEmitEvery" class="small" type="number" min="1" max="50" value="1">
+
+        <label>Audio max bytes</label>
+        <input id="audioMaxBytes" style="width:120px" type="number" min="0" max="262144" value="24576">
+
+        <button id="applyMediaBtn">Aplicar media</button>
+        <button id="unlockAudioBtn">Activar audio web</button>
+      </div>
+
+      <div class="row" style="margin-top: 8px;">
+        <span id="mediaStatus" class="status">media idle</span>
+        <span id="audioStatus" class="status">audio bloqueado</span>
+      </div>
       <p class="hint">
-        Teclado: <span class="kbd">WASD</span> mover, <span class="kbd">Z/C</span> lateral, <span class="kbd">Space</span> stop.
+        Teclado: <span class="kbd">WASD o Flechas</span> mover/girar, <span class="kbd">Q/E</span> lateral, <span class="kbd">Shift</span> boost, <span class="kbd">Space</span> stop, <span class="kbd">L</span> lidar, <span class="kbd">P</span> audio.
       </p>
     </div>
 
@@ -221,15 +284,54 @@
   </div>
 
   <script>
+    const DEFAULT_LIMITS = Object.freeze({
+      max_linear_speed: 0.45,
+      max_lateral_speed: 0.25,
+      max_angular_speed: 1.0,
+      default_move_duration_ms: 700,
+    });
+
+    const SPEED_PRESETS = Object.freeze({
+      turtle: { linear: 0.18, lateral: 0.1, angular: 0.45 },
+      normal: { linear: 0.3, lateral: 0.18, angular: 0.75 },
+      sport: { linear: 0.42, lateral: 0.24, angular: 0.95 },
+    });
+
+    const MOVEMENT_KEYS = new Set([
+      "KeyW", "KeyA", "KeyS", "KeyD",
+      "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight",
+      "KeyQ", "KeyE", "KeyZ", "KeyC",
+      "ShiftLeft", "ShiftRight",
+    ]);
+
     const state = {
       ws: null,
       controlLoop: null,
       serverHeartbeatLoop: null,
+      mediaStatsLoop: null,
+      controlSending: false,
+      lastMoveActive: false,
       keyState: new Set(),
       token: "",
       apiBase: "",
       robotId: "go2_01",
       connected: false,
+      speedPreset: "normal",
+      speedScale: 0.7,
+      serverLimits: { ...DEFAULT_LIMITS },
+      lastVideoAt: 0,
+      lastLidarAt: 0,
+      lastAudioAt: 0,
+      audio: {
+        ctx: null,
+        unlocked: false,
+        nextPlayTime: 0,
+        packets: 0,
+        dropped: 0,
+        lastSampleRate: 0,
+        lastChannels: 0,
+        lastDecodeErrorAt: 0,
+      },
     };
 
     const els = {
@@ -242,11 +344,37 @@
       events: document.getElementById("events"),
       videoFrame: document.getElementById("videoFrame"),
       lidarFrame: document.getElementById("lidarFrame"),
+      speedPreset: document.getElementById("speedPreset"),
+      speedScale: document.getElementById("speedScale"),
+      speedScaleLabel: document.getElementById("speedScaleLabel"),
+      loopMs: document.getElementById("loopMs"),
+      enableVideo: document.getElementById("enableVideo"),
+      enableLidar: document.getElementById("enableLidar"),
+      enableAudio: document.getElementById("enableAudio"),
+      audioEmitEvery: document.getElementById("audioEmitEvery"),
+      audioMaxBytes: document.getElementById("audioMaxBytes"),
+      applyMediaBtn: document.getElementById("applyMediaBtn"),
+      unlockAudioBtn: document.getElementById("unlockAudioBtn"),
+      mediaStatus: document.getElementById("mediaStatus"),
+      audioStatus: document.getElementById("audioStatus"),
     };
 
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function parseNum(value, fallback = 0) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function setBadge(el, text, mode = "") {
+      el.textContent = text;
+      el.className = "status" + (mode ? ` ${mode}` : "");
+    }
+
     function setStatus(text, ok = false) {
-      els.connStatus.textContent = text;
-      els.connStatus.className = "status" + (ok ? " ok" : " err");
+      setBadge(els.connStatus, text, ok ? "ok" : "err");
     }
 
     function wsUrlFromApi(apiBase, token) {
@@ -320,13 +448,34 @@
       });
     }
 
+    async function loadCapabilities() {
+      try {
+        const res = await fetchOrThrow(api(`/api/robots/${state.robotId}/capabilities`), {
+          headers: { "Authorization": "Bearer " + state.token },
+        });
+        const json = await res.json();
+        if (json && typeof json === "object" && json.limits) {
+          state.serverLimits = {
+            ...DEFAULT_LIMITS,
+            ...json.limits,
+          };
+          addEvent("capabilities", {
+            role: json.role,
+            limits: state.serverLimits,
+          });
+        }
+      } catch (err) {
+        addEvent("capabilities_error", normalizeError(err));
+      }
+    }
+
     function addEvent(type, data) {
       const li = document.createElement("li");
       const ts = new Date().toLocaleTimeString();
       li.innerHTML = `<span class="ts">${ts}</span><strong>${type}</strong><div>${escapeHtml(JSON.stringify(data))}</div>`;
       els.events.prepend(li);
 
-      while (els.events.children.length > 80) {
+      while (els.events.children.length > 100) {
         els.events.removeChild(els.events.lastChild);
       }
     }
@@ -337,6 +486,122 @@
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;");
+    }
+
+    function formatImageMime(imageFormat) {
+      const fmt = String(imageFormat || "jpg").toLowerCase();
+      if (fmt === "png") return "image/png";
+      return "image/jpeg";
+    }
+
+    function renderMediaImage(imgEl, data) {
+      if (!data || !data.image_base64) return;
+      const mime = formatImageMime(data.image_format);
+      imgEl.src = `data:${mime};base64,${data.image_base64}`;
+    }
+
+    function base64ToBytes(base64) {
+      const bin = atob(base64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) {
+        out[i] = bin.charCodeAt(i);
+      }
+      return out;
+    }
+
+    async function ensureAudioContext(userGesture = false) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) {
+        addEvent("audio_error", "AudioContext no soportado por este navegador");
+        return false;
+      }
+
+      if (!state.audio.ctx) {
+        state.audio.ctx = new Ctx({ latencyHint: "interactive" });
+      }
+
+      if (state.audio.ctx.state !== "running") {
+        if (!userGesture && !state.audio.unlocked) {
+          updateMediaStatus();
+          return false;
+        }
+        try {
+          await state.audio.ctx.resume();
+        } catch (err) {
+          addEvent("audio_resume_error", normalizeError(err));
+          updateMediaStatus();
+          return false;
+        }
+      }
+
+      state.audio.unlocked = state.audio.ctx.state === "running";
+      if (state.audio.unlocked && state.audio.nextPlayTime <= 0) {
+        state.audio.nextPlayTime = state.audio.ctx.currentTime + 0.03;
+      }
+      updateMediaStatus();
+      return state.audio.unlocked;
+    }
+
+    function queueAudioPacket(data) {
+      if (!data || !data.audio_base64) return;
+      state.lastAudioAt = Date.now();
+
+      if (!state.audio.ctx || !state.audio.unlocked) {
+        state.audio.dropped += 1;
+        return;
+      }
+
+      try {
+        const channels = clamp(Math.round(parseNum(data.channels, 1)), 1, 2);
+        const sampleRateRaw = Math.round(parseNum(data.sample_rate, 0));
+        const sampleRate = sampleRateRaw >= 3000 ? sampleRateRaw : 48000;
+
+        const bytes = base64ToBytes(data.audio_base64);
+        const bytesPerFrame = channels * 2;
+        const frameCount = Math.floor(bytes.byteLength / bytesPerFrame);
+        if (frameCount <= 0) return;
+
+        const alignedLen = frameCount * bytesPerFrame;
+        const aligned = alignedLen === bytes.byteLength ? bytes : bytes.subarray(0, alignedLen);
+        const pcm = new Int16Array(aligned.buffer, aligned.byteOffset, frameCount * channels);
+
+        const ctx = state.audio.ctx;
+        const buffer = ctx.createBuffer(channels, frameCount, sampleRate);
+
+        for (let ch = 0; ch < channels; ch += 1) {
+          const out = buffer.getChannelData(ch);
+          let idx = ch;
+          for (let i = 0; i < frameCount; i += 1) {
+            out[i] = pcm[idx] / 32768;
+            idx += channels;
+          }
+        }
+
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+
+        const now = ctx.currentTime;
+        if (!Number.isFinite(state.audio.nextPlayTime) || state.audio.nextPlayTime < now + 0.01) {
+          state.audio.nextPlayTime = now + 0.03;
+        }
+        if (state.audio.nextPlayTime - now > 0.6) {
+          state.audio.nextPlayTime = now + 0.05;
+        }
+
+        src.start(state.audio.nextPlayTime);
+        state.audio.nextPlayTime += buffer.duration;
+        state.audio.packets += 1;
+        state.audio.lastSampleRate = sampleRate;
+        state.audio.lastChannels = channels;
+      } catch (err) {
+        state.audio.dropped += 1;
+        const now = Date.now();
+        if (now - state.audio.lastDecodeErrorAt > 1500) {
+          state.audio.lastDecodeErrorAt = now;
+          addEvent("audio_decode_error", normalizeError(err));
+        }
+      }
     }
 
     function handleWsMessage(msg) {
@@ -350,15 +615,24 @@
 
       if (type === "media") {
         if (msg.robot_id !== state.robotId) return;
-        const stream = msg.stream;
+        const stream = String(msg.stream || "");
         const data = msg.data || {};
 
-        if (stream === "video" && data.image_base64) {
-          els.videoFrame.src = `data:image/jpeg;base64,${data.image_base64}`;
+        if (stream === "video") {
+          renderMediaImage(els.videoFrame, data);
+          state.lastVideoAt = Date.now();
+          return;
         }
 
-        if (stream === "lidar" && data.image_base64) {
-          els.lidarFrame.src = `data:image/jpeg;base64,${data.image_base64}`;
+        if (stream === "lidar") {
+          renderMediaImage(els.lidarFrame, data);
+          state.lastLidarAt = Date.now();
+          return;
+        }
+
+        if (stream === "audio") {
+          queueAudioPacket(data);
+          return;
         }
 
         return;
@@ -369,48 +643,193 @@
       }
     }
 
+    function currentPreset() {
+      const preset = SPEED_PRESETS[state.speedPreset] || SPEED_PRESETS.normal;
+      const scale = clamp(state.speedScale, 0.2, 1.4);
+      const boost = state.keyState.has("ShiftLeft") || state.keyState.has("ShiftRight") ? 1.35 : 1.0;
+
+      return {
+        linear: clamp(preset.linear * scale * boost, 0, parseNum(state.serverLimits.max_linear_speed, DEFAULT_LIMITS.max_linear_speed)),
+        lateral: clamp(preset.lateral * scale * boost, 0, parseNum(state.serverLimits.max_lateral_speed, DEFAULT_LIMITS.max_lateral_speed)),
+        angular: clamp(preset.angular * scale * boost, 0, parseNum(state.serverLimits.max_angular_speed, DEFAULT_LIMITS.max_angular_speed)),
+      };
+    }
+
     function currentMoveFromKeys() {
+      const speed = currentPreset();
+
       let x = 0;
       let y = 0;
       let z = 0;
 
-      if (state.keyState.has("KeyW")) x += 0.3;
-      if (state.keyState.has("KeyS")) x -= 0.3;
-      if (state.keyState.has("KeyA")) z += 0.8;
-      if (state.keyState.has("KeyD")) z -= 0.8;
-      if (state.keyState.has("KeyZ")) y += 0.2;
-      if (state.keyState.has("KeyC")) y -= 0.2;
+      if (state.keyState.has("KeyW") || state.keyState.has("ArrowUp")) x += speed.linear;
+      if (state.keyState.has("KeyS") || state.keyState.has("ArrowDown")) x -= speed.linear;
+      if (state.keyState.has("KeyA") || state.keyState.has("ArrowLeft")) z += speed.angular;
+      if (state.keyState.has("KeyD") || state.keyState.has("ArrowRight")) z -= speed.angular;
+      if (state.keyState.has("KeyQ") || state.keyState.has("KeyZ")) y += speed.lateral;
+      if (state.keyState.has("KeyE") || state.keyState.has("KeyC")) y -= speed.lateral;
 
       return { x, y, z };
     }
 
+    function parseLoopMs() {
+      const parsed = Math.round(parseNum(els.loopMs.value, 140));
+      const loopMs = clamp(parsed, 90, 900);
+      els.loopMs.value = String(loopMs);
+      return loopMs;
+    }
+
+    function updateSpeedUi() {
+      state.speedPreset = String(els.speedPreset.value || "normal");
+      state.speedScale = clamp(parseNum(els.speedScale.value, 70) / 100, 0.2, 1.4);
+      els.speedScaleLabel.textContent = `${Math.round(state.speedScale * 100)}%`;
+    }
+
+    function ageText(tsMs) {
+      if (!tsMs) return "--";
+      return `${((Date.now() - tsMs) / 1000).toFixed(1)}s`;
+    }
+
+    function updateMediaStatus() {
+      if (!state.connected) {
+        setBadge(els.mediaStatus, "media offline", "err");
+      } else {
+        const vAge = state.lastVideoAt ? Date.now() - state.lastVideoAt : Number.POSITIVE_INFINITY;
+        const lAge = state.lastLidarAt ? Date.now() - state.lastLidarAt : Number.POSITIVE_INFINITY;
+        const aAge = state.lastAudioAt ? Date.now() - state.lastAudioAt : Number.POSITIVE_INFINITY;
+
+        const staleVideo = els.enableVideo.checked && vAge > 3000;
+        const staleLidar = els.enableLidar.checked && lAge > 3500;
+        const staleAudio = els.enableAudio.checked && aAge > 3000;
+        const stale = staleVideo || staleLidar || staleAudio;
+
+        setBadge(
+          els.mediaStatus,
+          `V ${ageText(state.lastVideoAt)} | L ${ageText(state.lastLidarAt)} | A ${ageText(state.lastAudioAt)}`,
+          stale ? "err" : "ok"
+        );
+      }
+
+      if (!state.audio.unlocked) {
+        setBadge(els.audioStatus, "audio bloqueado (click Activar audio web)", "err");
+        return;
+      }
+
+      setBadge(
+        els.audioStatus,
+        `audio on ${state.audio.lastSampleRate || "--"}Hz ${state.audio.lastChannels || "--"}ch pkt:${state.audio.packets} drop:${state.audio.dropped}`,
+        "ok"
+      );
+    }
+
+    async function applyMediaSettings() {
+      if (!state.connected) {
+        addEvent("media_config", "Conectate antes de aplicar media");
+        return;
+      }
+
+      const audioEmitEvery = Math.max(1, Math.round(parseNum(els.audioEmitEvery.value, 1)));
+      const audioMaxBytes = Math.max(0, Math.round(parseNum(els.audioMaxBytes.value, 24576)));
+
+      els.audioEmitEvery.value = String(audioEmitEvery);
+      els.audioMaxBytes.value = String(audioMaxBytes);
+
+      if (els.enableAudio.checked) {
+        await ensureAudioContext(false);
+      }
+
+      const commands = [
+        {
+          type: "set_camera_stream",
+          payload: {
+            enabled: !!els.enableVideo.checked,
+            emit_every: 1,
+            jpeg_quality: 70,
+          },
+        },
+        {
+          type: "set_lidar",
+          payload: {
+            enabled: !!els.enableLidar.checked,
+            subscribe: true,
+          },
+        },
+        {
+          type: "set_audio",
+          payload: {
+            enabled: !!els.enableAudio.checked,
+            emit_every: audioEmitEvery,
+            max_bytes: audioMaxBytes,
+          },
+        },
+      ];
+
+      for (const cmd of commands) {
+        try {
+          await sendCommand(cmd.type, cmd.payload, 1600);
+        } catch (err) {
+          addEvent("media_config_error", { cmd: cmd.type, error: normalizeError(err) });
+        }
+      }
+
+      addEvent("media_config_applied", {
+        video: !!els.enableVideo.checked,
+        lidar: !!els.enableLidar.checked,
+        audio: !!els.enableAudio.checked,
+        audio_emit_every: audioEmitEvery,
+        audio_max_bytes: audioMaxBytes,
+      });
+      updateMediaStatus();
+    }
+
     function startControlLoop() {
       stopControlLoop();
+      const loopMs = parseLoopMs();
 
       state.controlLoop = setInterval(async () => {
-        if (!state.connected) return;
+        if (!state.connected || state.controlSending) return;
 
         const m = currentMoveFromKeys();
         const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
 
         if (active) {
+          state.controlSending = true;
           try {
             await sendCommand("move", {
               linear_x: m.x,
               lateral_y: m.y,
               angular_z: m.z,
-              duration_ms: 400,
-            }, 800);
+              duration_ms: Math.max(260, Math.round(loopMs * 2)),
+            }, 900);
+            state.lastMoveActive = true;
           } catch (err) {
             // Error already recorded in events.
+          } finally {
+            state.controlSending = false;
+          }
+          return;
+        }
+
+        if (state.lastMoveActive) {
+          state.controlSending = true;
+          try {
+            await sendCommand("stop", {}, 900);
+          } catch (err) {
+            // Error already recorded in events.
+          } finally {
+            state.controlSending = false;
+            state.lastMoveActive = false;
           }
         }
-      }, 120);
+      }, loopMs);
 
       state.serverHeartbeatLoop = setInterval(() => {
-        if (!state.connected || !state.ws) return;
+        if (!state.connected || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
         state.ws.send(JSON.stringify({ op: "heartbeat", robot_id: state.robotId }));
       }, 500);
+
+      state.mediaStatsLoop = setInterval(updateMediaStatus, 500);
+      updateMediaStatus();
     }
 
     function stopControlLoop() {
@@ -421,6 +840,21 @@
       if (state.serverHeartbeatLoop) {
         clearInterval(state.serverHeartbeatLoop);
         state.serverHeartbeatLoop = null;
+      }
+      if (state.mediaStatsLoop) {
+        clearInterval(state.mediaStatsLoop);
+        state.mediaStatsLoop = null;
+      }
+      state.lastMoveActive = false;
+      state.controlSending = false;
+    }
+
+    async function stopRobotNow() {
+      if (!state.connected) return;
+      try {
+        await sendCommand("stop", {}, 900);
+      } catch (err) {
+        // Error already recorded in events.
       }
     }
 
@@ -444,7 +878,7 @@
       }
 
       if (state.ws) {
-        try { state.ws.close(); } catch (e) {}
+        try { state.ws.close(); } catch (e) { }
       }
 
       let url;
@@ -455,6 +889,7 @@
         addEvent("connect_error", normalizeError(err));
         return;
       }
+
       const ws = new WebSocket(url);
       state.ws = ws;
 
@@ -462,16 +897,20 @@
         state.connected = true;
         setStatus("conectado", true);
         startControlLoop();
+        addEvent("ws_open", { robot_id: state.robotId });
+        void loadCapabilities();
+        void applyMediaSettings();
       };
 
       ws.onclose = (ev) => {
         state.connected = false;
         setStatus("desconectado", false);
         stopControlLoop();
+        updateMediaStatus();
         addEvent("ws_close", { code: ev.code, reason: ev.reason || "" });
       };
 
-      ws.onerror = (e) => {
+      ws.onerror = () => {
         addEvent("ws_error", "error websocket");
       };
 
@@ -490,50 +929,93 @@
         const cmd = btn.getAttribute("data-cmd");
         if (!state.connected) return;
 
-        if (cmd === "forward") return sendCommand("move", { linear_x: 0.3, angular_z: 0.0, duration_ms: 500 });
-        if (cmd === "back") return sendCommand("move", { linear_x: -0.3, angular_z: 0.0, duration_ms: 500 });
-        if (cmd === "left") return sendCommand("move", { linear_x: 0.0, angular_z: 0.8, duration_ms: 450 });
-        if (cmd === "right") return sendCommand("move", { linear_x: 0.0, angular_z: -0.8, duration_ms: 450 });
-        if (cmd === "strafeL") return sendCommand("move", { linear_x: 0.0, lateral_y: 0.2, duration_ms: 500 });
-        if (cmd === "strafeR") return sendCommand("move", { linear_x: 0.0, lateral_y: -0.2, duration_ms: 500 });
+        const speed = currentPreset();
+        if (cmd === "forward") return sendCommand("move", { linear_x: speed.linear, angular_z: 0.0, duration_ms: 520 });
+        if (cmd === "back") return sendCommand("move", { linear_x: -speed.linear, angular_z: 0.0, duration_ms: 520 });
+        if (cmd === "left") return sendCommand("move", { linear_x: 0.0, angular_z: speed.angular, duration_ms: 460 });
+        if (cmd === "right") return sendCommand("move", { linear_x: 0.0, angular_z: -speed.angular, duration_ms: 460 });
+        if (cmd === "strafeL") return sendCommand("move", { linear_x: 0.0, lateral_y: speed.lateral, duration_ms: 520 });
+        if (cmd === "strafeR") return sendCommand("move", { linear_x: 0.0, lateral_y: -speed.lateral, duration_ms: 520 });
         if (cmd === "stop") return sendCommand("stop", {});
         if (cmd === "modeManual") return sendCommand("enter_mode", { mode: "normal" });
       });
     });
 
-    els.connectBtn.addEventListener("click", connect);
+    els.connectBtn.addEventListener("click", async () => {
+      await ensureAudioContext(true);
+      await connect();
+    });
+
+    els.applyMediaBtn.addEventListener("click", async () => {
+      await applyMediaSettings();
+    });
+
+    els.unlockAudioBtn.addEventListener("click", async () => {
+      await ensureAudioContext(true);
+    });
+
+    els.speedPreset.addEventListener("change", () => {
+      updateSpeedUi();
+    });
+    els.speedScale.addEventListener("input", () => {
+      updateSpeedUi();
+    });
+    els.loopMs.addEventListener("change", () => {
+      if (state.connected) {
+        startControlLoop();
+      } else {
+        parseLoopMs();
+      }
+    });
 
     window.addEventListener("keydown", async (ev) => {
-      if (["KeyW", "KeyA", "KeyS", "KeyD", "KeyZ", "KeyC"].includes(ev.code)) {
+      if (MOVEMENT_KEYS.has(ev.code)) {
+        ev.preventDefault();
         state.keyState.add(ev.code);
       }
+
       if (ev.code === "Space") {
         ev.preventDefault();
-        if (state.connected) {
-          try {
-            await sendCommand("stop", {});
-          } catch (err) {
-            // Error already recorded in events.
-          }
+        await stopRobotNow();
+        return;
+      }
+
+      if (ev.repeat) return;
+
+      if (ev.code === "KeyL") {
+        els.enableLidar.checked = !els.enableLidar.checked;
+        if (state.connected) await applyMediaSettings();
+        return;
+      }
+
+      if (ev.code === "KeyP") {
+        els.enableAudio.checked = !els.enableAudio.checked;
+        if (els.enableAudio.checked) {
+          await ensureAudioContext(true);
         }
+        if (state.connected) await applyMediaSettings();
       }
     });
 
     window.addEventListener("keyup", async (ev) => {
-      if (["KeyW", "KeyA", "KeyS", "KeyD", "KeyZ", "KeyC"].includes(ev.code)) {
+      if (MOVEMENT_KEYS.has(ev.code)) {
         state.keyState.delete(ev.code);
       }
 
       const m = currentMoveFromKeys();
       const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
-      if (!active && state.connected) {
-        try {
-          await sendCommand("stop", {});
-        } catch (err) {
-          // Error already recorded in events.
-        }
+      if (!active) {
+        await stopRobotNow();
       }
     });
+
+    window.addEventListener("blur", () => {
+      state.keyState.clear();
+      void stopRobotNow();
+    });
+
+    updateSpeedUi();
+    updateMediaStatus();
   </script>
 </body>
 </html>

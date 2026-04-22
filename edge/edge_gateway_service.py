@@ -592,6 +592,14 @@ class EdgeGatewayService:
             "velocity": sport.get("velocity", {}),
             "battery": battery,
             "power_v": low.get("power_v"),
+            "media": {
+                "camera_enabled": self.camera_enabled,
+                "lidar_enabled": self.lidar_enabled,
+                "audio_enabled": self.audio_enabled,
+                "camera_emit_every": self.camera_emit_every,
+                "audio_emit_every": self.audio_emit_every,
+                "audio_max_bytes": self.audio_max_bytes,
+            },
             "temperatures": {
                 "ntc1": low.get("temperature_ntc1"),
                 "imu": sport.get("imu_temperature"),
@@ -613,7 +621,19 @@ class EdgeGatewayService:
             return False, "robot_id mismatch"
 
         cmd_type = str(command.get("type", "")).strip()
-        if cmd_type not in {"move", "turn", "stop", "enter_mode", "follow_target", "go_to"}:
+        if cmd_type not in {
+            "move",
+            "turn",
+            "stop",
+            "enter_mode",
+            "follow_target",
+            "go_to",
+            "set_video",
+            "set_camera_stream",
+            "set_audio",
+            "set_lidar",
+            "set_lidar_decoder",
+        }:
             return False, f"unsupported command type: {cmd_type}"
 
         now_s = time.time()
@@ -623,7 +643,8 @@ class EdgeGatewayService:
             return False, "command expired"
 
         heartbeat_age = time.monotonic() - self.last_heartbeat_monotonic
-        if cmd_type != "stop" and heartbeat_age > self.args.heartbeat_timeout_s:
+        requires_live_heartbeat = cmd_type in {"move", "turn", "enter_mode", "follow_target", "go_to"}
+        if requires_live_heartbeat and heartbeat_age > self.args.heartbeat_timeout_s:
             return False, "no recent server heartbeat"
 
         return True, ""
@@ -682,6 +703,92 @@ class EdgeGatewayService:
             mode = str(payload.get("mode", "normal"))
             response = await self._set_motion_mode(mode)
             return {"executed": "enter_mode", "mode": mode, "response": response}
+
+        if cmd_type == "set_video":
+            enabled = bool(payload.get("enabled", True))
+            await self._set_video(enabled)
+            return {
+                "executed": "set_video",
+                "camera_enabled": self.camera_enabled,
+            }
+
+        if cmd_type == "set_camera_stream":
+            if "emit_every" in payload:
+                emit_every = int(payload.get("emit_every", 1))
+                if emit_every <= 0:
+                    raise ValueError("emit_every must be > 0")
+                self.camera_emit_every = emit_every
+
+            if "jpeg_quality" in payload:
+                quality = int(payload.get("jpeg_quality", self.args.camera_jpeg_quality))
+                if quality < 1 or quality > 100:
+                    raise ValueError("jpeg_quality must be between 1 and 100")
+                self.camera_jpeg_quality = quality
+
+            if "enabled" in payload:
+                await self._set_video(bool(payload.get("enabled")))
+
+            return {
+                "executed": "set_camera_stream",
+                "camera_enabled": self.camera_enabled,
+                "emit_every": self.camera_emit_every,
+                "jpeg_quality": self.camera_jpeg_quality,
+            }
+
+        if cmd_type == "set_audio":
+            if "emit_every" in payload:
+                emit_every = int(payload.get("emit_every", 1))
+                if emit_every <= 0:
+                    raise ValueError("emit_every must be > 0")
+                self.audio_emit_every = emit_every
+
+            if "max_bytes" in payload:
+                max_bytes = int(payload.get("max_bytes", self.audio_max_bytes))
+                if max_bytes < 0:
+                    raise ValueError("max_bytes must be >= 0")
+                self.audio_max_bytes = max_bytes
+
+            if "enabled" in payload or not payload:
+                enabled = bool(payload.get("enabled", True))
+                await self._set_audio(enabled)
+                if enabled:
+                    with contextlib.suppress(Exception):
+                        await self._subscribe_topic(TOPIC_ALIAS_TO_VALUE["AUDIO_HUB_PLAY_STATE"])
+
+            return {
+                "executed": "set_audio",
+                "audio_enabled": self.audio_enabled,
+                "emit_every": self.audio_emit_every,
+                "max_bytes": self.audio_max_bytes,
+            }
+
+        if cmd_type == "set_lidar":
+            enabled = bool(payload.get("enabled", True))
+            subscribe = bool(payload.get("subscribe", True))
+            await self._set_lidar(enabled)
+            if enabled and subscribe:
+                with contextlib.suppress(Exception):
+                    await self._subscribe_topic(TOPIC_ALIAS_TO_VALUE["ULIDAR_ARRAY"])
+                with contextlib.suppress(Exception):
+                    await self._subscribe_topic(TOPIC_ALIAS_TO_VALUE["ULIDAR_STATE"])
+            return {
+                "executed": "set_lidar",
+                "lidar_enabled": self.lidar_enabled,
+                "subscribe": subscribe,
+            }
+
+        if cmd_type == "set_lidar_decoder":
+            if self.conn is None:
+                raise RuntimeError("Connection not ready")
+
+            decoder = str(payload.get("decoder", self.args.lidar_decoder)).strip().lower()
+            if decoder not in {"libvoxel", "native"}:
+                raise ValueError("decoder must be 'libvoxel' or 'native'")
+            self.conn.datachannel.set_decoder(decoder)
+            return {
+                "executed": "set_lidar_decoder",
+                "decoder": decoder,
+            }
 
         if cmd_type in {"follow_target", "go_to"}:
             raise ValueError(f"{cmd_type} not implemented yet on edge")

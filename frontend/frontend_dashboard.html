@@ -148,6 +148,17 @@
       margin-top: 8px;
     }
 
+    button.primary {
+      background: #2a5f3d !important;
+      border-color: #45d483 !important;
+      color: #45d483 !important;
+      font-weight: bold;
+    }
+
+    button.primary:hover {
+      filter: brightness(1.25) !important;
+    }
+
     .controls {
       display: grid;
       grid-template-columns: repeat(4, minmax(90px, 1fr));
@@ -235,16 +246,9 @@
       </div>
 
       <div class="row" style="margin-top: 10px;">
-        <label>Preset</label>
-        <select id="speedPreset">
-          <option value="turtle">Turtle</option>
-          <option value="normal" selected>Normal</option>
-          <option value="sport">Sport</option>
-        </select>
-
-        <label>Escala</label>
-        <input id="speedScale" class="range" type="range" min="20" max="140" value="70">
-        <span id="speedScaleLabel" class="status">70%</span>
+        <label>Velocidad</label>
+        <input id="speedSlider" class="range" type="range" min="1" max="100" value="50" style="width: 200px;">
+        <span id="speedLabel" class="status">50 (Normal)</span>
 
         <label>Loop(ms)</label>
         <input id="loopMs" class="small" type="number" min="90" max="900" value="140">
@@ -261,7 +265,7 @@
         <label>Audio max bytes</label>
         <input id="audioMaxBytes" style="width:120px" type="number" min="0" max="262144" value="24576">
 
-        <button id="applyMediaBtn">Aplicar media</button>
+        <button id="applyMediaBtn" class="primary">✓ Aplicar media</button>
         <button id="unlockAudioBtn">Activar audio web</button>
       </div>
 
@@ -291,12 +295,6 @@
       default_move_duration_ms: 700,
     });
 
-    const SPEED_PRESETS = Object.freeze({
-      turtle: { linear: 0.18, lateral: 0.1, angular: 0.45 },
-      normal: { linear: 0.3, lateral: 0.18, angular: 0.75 },
-      sport: { linear: 0.42, lateral: 0.24, angular: 0.95 },
-    });
-
     const MOVEMENT_KEYS = new Set([
       "KeyW", "KeyA", "KeyS", "KeyD",
       "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight",
@@ -309,6 +307,9 @@
       controlLoop: null,
       serverHeartbeatLoop: null,
       mediaStatsLoop: null,
+      reconnectTimer: null,
+      reconnectAttempt: 0,
+      connectGeneration: 0,
       controlSending: false,
       lastMoveActive: false,
       keyState: new Set(),
@@ -316,8 +317,7 @@
       apiBase: "",
       robotId: "go2_01",
       connected: false,
-      speedPreset: "normal",
-      speedScale: 0.7,
+      speedValue: 50,
       serverLimits: { ...DEFAULT_LIMITS },
       lastVideoAt: 0,
       lastLidarAt: 0,
@@ -344,9 +344,8 @@
       events: document.getElementById("events"),
       videoFrame: document.getElementById("videoFrame"),
       lidarFrame: document.getElementById("lidarFrame"),
-      speedPreset: document.getElementById("speedPreset"),
-      speedScale: document.getElementById("speedScale"),
-      speedScaleLabel: document.getElementById("speedScaleLabel"),
+      speedSlider: document.getElementById("speedSlider"),
+      speedLabel: document.getElementById("speedLabel"),
       loopMs: document.getElementById("loopMs"),
       enableVideo: document.getElementById("enableVideo"),
       enableLidar: document.getElementById("enableLidar"),
@@ -408,12 +407,23 @@
       return String(err);
     }
 
-    async function fetchOrThrow(url, options = {}) {
+    async function fetchOrThrow(url, options = {}, timeoutMs = 5000) {
       let res;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
       try {
-        res = await fetch(url, options);
+        res = await fetch(url, {
+          ...options,
+          signal: controller.signal,
+        });
       } catch (err) {
+        if (err && err.name === "AbortError") {
+          throw new Error(`Timeout HTTP después de ${timeoutMs}ms`);
+        }
         throw new Error(normalizeError(err));
+      } finally {
+        clearTimeout(timeout);
       }
 
       if (!res.ok) {
@@ -434,7 +444,7 @@
             "Authorization": "Bearer " + state.token,
           },
           body: JSON.stringify(body),
-        });
+        }, 2500);
       } catch (err) {
         addEvent("http_error", { type, error: normalizeError(err) });
         throw err;
@@ -445,14 +455,18 @@
       await fetchOrThrow(api(`/api/robots/${state.robotId}/control/activate`), {
         method: "POST",
         headers: { "Authorization": "Bearer " + state.token },
-      });
+      }, 3000);
     }
 
     async function loadCapabilities() {
       try {
-        const res = await fetchOrThrow(api(`/api/robots/${state.robotId}/capabilities`), {
-          headers: { "Authorization": "Bearer " + state.token },
-        });
+        const res = await fetchOrThrow(
+          api(`/api/robots/${state.robotId}/capabilities`),
+          {
+            headers: { "Authorization": "Bearer " + state.token },
+          },
+          3000
+        );
         const json = await res.json();
         if (json && typeof json === "object" && json.limits) {
           state.serverLimits = {
@@ -585,8 +599,9 @@
         if (!Number.isFinite(state.audio.nextPlayTime) || state.audio.nextPlayTime < now + 0.01) {
           state.audio.nextPlayTime = now + 0.03;
         }
-        if (state.audio.nextPlayTime - now > 0.6) {
-          state.audio.nextPlayTime = now + 0.05;
+        if (state.audio.nextPlayTime - now > 0.25) {
+          state.audio.dropped += 1;
+          return;
         }
 
         src.start(state.audio.nextPlayTime);
@@ -644,14 +659,18 @@
     }
 
     function currentPreset() {
-      const preset = SPEED_PRESETS[state.speedPreset] || SPEED_PRESETS.normal;
-      const scale = clamp(state.speedScale, 0.2, 1.4);
-      const boost = state.keyState.has("ShiftLeft") || state.keyState.has("ShiftRight") ? 1.35 : 1.0;
+      const speedVal = clamp(parseNum(state.speedValue, 50), 1, 100);
+      const boost = state.keyState.has("ShiftLeft") || state.keyState.has("ShiftRight") ? 1.3 : 1.0;
+      const scale = speedVal / 100;
+
+      const maxLinear = parseNum(state.serverLimits.max_linear_speed, DEFAULT_LIMITS.max_linear_speed);
+      const maxLateral = parseNum(state.serverLimits.max_lateral_speed, DEFAULT_LIMITS.max_lateral_speed);
+      const maxAngular = parseNum(state.serverLimits.max_angular_speed, DEFAULT_LIMITS.max_angular_speed);
 
       return {
-        linear: clamp(preset.linear * scale * boost, 0, parseNum(state.serverLimits.max_linear_speed, DEFAULT_LIMITS.max_linear_speed)),
-        lateral: clamp(preset.lateral * scale * boost, 0, parseNum(state.serverLimits.max_lateral_speed, DEFAULT_LIMITS.max_lateral_speed)),
-        angular: clamp(preset.angular * scale * boost, 0, parseNum(state.serverLimits.max_angular_speed, DEFAULT_LIMITS.max_angular_speed)),
+        linear: clamp(maxLinear * scale * boost, 0, maxLinear),
+        lateral: clamp(maxLateral * scale * boost, 0, maxLateral),
+        angular: clamp(maxAngular * scale * boost, 0, maxAngular),
       };
     }
 
@@ -680,9 +699,15 @@
     }
 
     function updateSpeedUi() {
-      state.speedPreset = String(els.speedPreset.value || "normal");
-      state.speedScale = clamp(parseNum(els.speedScale.value, 70) / 100, 0.2, 1.4);
-      els.speedScaleLabel.textContent = `${Math.round(state.speedScale * 100)}%`;
+      state.speedValue = Math.max(1, Math.min(100, parseNum(els.speedSlider.value, 50)));
+      els.speedSlider.value = state.speedValue;
+
+      let label = "Lento";
+      if (state.speedValue >= 75) label = "Rápido";
+      else if (state.speedValue >= 50) label = "Normal";
+      else if (state.speedValue >= 25) label = "Medio-Lento";
+
+      els.speedLabel.textContent = `${state.speedValue} (${label})`;
     }
 
     function ageText(tsMs) {
@@ -743,8 +768,14 @@
           type: "set_camera_stream",
           payload: {
             enabled: !!els.enableVideo.checked,
-            emit_every: 1,
-            jpeg_quality: 70,
+            emit_every: 2,
+            jpeg_quality: 60,
+          },
+        },
+        {
+          type: "set_lidar_decoder",
+          payload: {
+            decoder: "native",
           },
         },
         {
@@ -766,7 +797,8 @@
 
       for (const cmd of commands) {
         try {
-          await sendCommand(cmd.type, cmd.payload, 1600);
+          await sendCommand(cmd.type, cmd.payload, 2000);
+          addEvent(`media_${cmd.type}_ok`, cmd.payload);
         } catch (err) {
           addEvent("media_config_error", { cmd: cmd.type, error: normalizeError(err) });
         }
@@ -858,11 +890,39 @@
       }
     }
 
-    async function connect() {
+    function clearReconnectTimer() {
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
+    }
+
+    function scheduleReconnect() {
+      if (state.reconnectTimer || !state.token || !state.apiBase || !state.robotId) {
+        return;
+      }
+
+      state.reconnectAttempt += 1;
+      const delayMs = Math.min(1000 * (2 ** (state.reconnectAttempt - 1)), 10000);
+      setStatus(`reconectando en ${(delayMs / 1000).toFixed(0)}s`, false);
+
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        void connect(true);
+      }, delayMs);
+    }
+
+    async function connect(isReconnect = false) {
+      if (!isReconnect) {
+        clearReconnectTimer();
+        state.reconnectAttempt = 0;
+      }
+
       state.token = els.token.value.trim();
       state.apiBase = normalizeApiBase(els.apiBase.value);
       els.apiBase.value = state.apiBase;
       state.robotId = els.robotId.value.trim();
+      const generation = ++state.connectGeneration;
 
       if (!state.token || !state.apiBase || !state.robotId) {
         setStatus("faltan datos", false);
@@ -872,49 +932,73 @@
       try {
         await activateControl();
       } catch (err) {
+        if (generation !== state.connectGeneration) return;
         setStatus("fallo API", false);
         addEvent("connect_error", normalizeError(err));
+        scheduleReconnect();
         return;
       }
 
       if (state.ws) {
-        try { state.ws.close(); } catch (e) { }
+        const previousWs = state.ws;
+        state.ws = null;
+        try { previousWs.close(); } catch (e) { }
       }
 
       let url;
       try {
         url = wsUrlFromApi(state.apiBase, state.token);
       } catch (err) {
+        if (generation !== state.connectGeneration) return;
         setStatus("api invalida", false);
         addEvent("connect_error", normalizeError(err));
         return;
       }
 
-      const ws = new WebSocket(url);
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch (err) {
+        if (generation !== state.connectGeneration) return;
+        addEvent("ws_create_error", normalizeError(err));
+        scheduleReconnect();
+        return;
+      }
       state.ws = ws;
 
-      ws.onopen = () => {
+      ws.onopen = async () => {
+        if (state.ws !== ws || generation !== state.connectGeneration) return;
+        clearReconnectTimer();
+        state.reconnectAttempt = 0;
         state.connected = true;
         setStatus("conectado", true);
         startControlLoop();
         addEvent("ws_open", { robot_id: state.robotId });
-        void loadCapabilities();
-        void applyMediaSettings();
+        await loadCapabilities();
+        await new Promise(resolve => setTimeout(resolve, 200));
+        if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+        await applyMediaSettings();
       };
 
       ws.onclose = (ev) => {
+        if (state.ws !== ws || generation !== state.connectGeneration) return;
+        state.ws = null;
         state.connected = false;
+        state.audio.nextPlayTime = 0;
         setStatus("desconectado", false);
         stopControlLoop();
         updateMediaStatus();
         addEvent("ws_close", { code: ev.code, reason: ev.reason || "" });
+        scheduleReconnect();
       };
 
       ws.onerror = () => {
+        if (state.ws !== ws || generation !== state.connectGeneration) return;
         addEvent("ws_error", "error websocket");
       };
 
       ws.onmessage = (ev) => {
+        if (state.ws !== ws || generation !== state.connectGeneration) return;
         try {
           const msg = JSON.parse(ev.data);
           handleWsMessage(msg);
@@ -943,7 +1027,7 @@
 
     els.connectBtn.addEventListener("click", async () => {
       await ensureAudioContext(true);
-      await connect();
+      await connect(false);
     });
 
     els.applyMediaBtn.addEventListener("click", async () => {
@@ -954,10 +1038,24 @@
       await ensureAudioContext(true);
     });
 
-    els.speedPreset.addEventListener("change", () => {
-      updateSpeedUi();
+    els.enableVideo.addEventListener("change", async () => {
+      if (state.connected) await applyMediaSettings();
     });
-    els.speedScale.addEventListener("input", () => {
+
+    els.enableLidar.addEventListener("change", async () => {
+      if (state.connected) await applyMediaSettings();
+    });
+
+    els.enableAudio.addEventListener("change", async () => {
+      if (state.connected) {
+        if (els.enableAudio.checked) {
+          await ensureAudioContext(false);
+        }
+        await applyMediaSettings();
+      }
+    });
+
+    els.speedSlider.addEventListener("input", () => {
       updateSpeedUi();
     });
     els.loopMs.addEventListener("change", () => {

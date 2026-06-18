@@ -83,6 +83,8 @@ class CoreRuntime:
         self.mqtt_client: Optional[mqtt.Client] = None
 
         self.frontend_sockets: Set[WebSocket] = set()
+        self.frontend_queues: Dict[WebSocket, asyncio.Queue[str]] = {}
+        self.frontend_sender_tasks: Dict[WebSocket, asyncio.Task[None]] = {}
         self.edge_media_sockets: Dict[str, WebSocket] = {}
 
         self.latest_telemetry: Dict[str, Dict[str, Any]] = {}
@@ -142,19 +144,51 @@ class CoreRuntime:
             fh.write(json.dumps(line, ensure_ascii=True, separators=(",", ":")) + "\n")
 
     async def _broadcast(self, payload: Dict[str, Any]) -> None:
-        if not self.frontend_sockets:
+        if not self.frontend_queues:
             return
 
         text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-        stale: List[WebSocket] = []
-        for ws in self.frontend_sockets:
-            try:
-                await ws.send_text(text)
-            except Exception:
-                stale.append(ws)
+        for queue in list(self.frontend_queues.values()):
+            if queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
 
-        for ws in stale:
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(text)
+
+    def _enqueue_frontend(self, ws: WebSocket, payload: Dict[str, Any]) -> None:
+        queue = self.frontend_queues.get(ws)
+        if queue is None:
+            return
+
+        text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        if queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(text)
+
+    async def _frontend_sender_loop(self, ws: WebSocket, queue: asyncio.Queue[str]) -> None:
+        try:
+            while True:
+                text = await queue.get()
+                await asyncio.wait_for(
+                    ws.send_text(text),
+                    timeout=self.args.frontend_send_timeout_s,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        finally:
             self.frontend_sockets.discard(ws)
+            self.frontend_queues.pop(ws, None)
+            current_task = asyncio.current_task()
+            if self.frontend_sender_tasks.get(ws) is current_task:
+                self.frontend_sender_tasks.pop(ws, None)
+            with contextlib.suppress(Exception):
+                await ws.close()
 
     def _setup_cors(self) -> None:
         origins = [x.strip() for x in self.args.cors_origin if x.strip()]
@@ -183,7 +217,8 @@ class CoreRuntime:
         self.mqtt_client.on_message = self._on_mqtt_message
         self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
 
-        self.mqtt_client.connect(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
+        self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
+        self.mqtt_client.connect_async(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
         self.mqtt_client.loop_start()
 
     def _on_mqtt_connect(self, client, userdata, flags, rc, properties=None) -> None:
@@ -548,43 +583,49 @@ class CoreRuntime:
                 return
 
             await ws.accept()
-            self.frontend_sockets.add(ws)
-
-            await ws.send_text(
-                json.dumps(
-                    {
-                        "type": "hello",
-                        "ts": time.time(),
-                        "user": auth,
-                        "known_robots": self._known_robots(),
-                    },
-                    ensure_ascii=True,
+            try:
+                await asyncio.wait_for(
+                    ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "hello",
+                                "ts": time.time(),
+                                "user": auth,
+                                "known_robots": self._known_robots(),
+                            },
+                            ensure_ascii=True,
+                        )
+                    ),
+                    timeout=self.args.frontend_send_timeout_s,
                 )
-            )
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await ws.close()
+                return
+
+            queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self.args.frontend_queue_size)
+            self.frontend_sockets.add(ws)
+            self.frontend_queues[ws] = queue
+            sender_task = asyncio.create_task(self._frontend_sender_loop(ws, queue))
+            self.frontend_sender_tasks[ws] = sender_task
 
             for robot_id, telemetry in self.latest_telemetry.items():
-                await ws.send_text(
-                    json.dumps(
-                        {"type": "telemetry", "robot_id": robot_id, "data": telemetry},
-                        ensure_ascii=True,
-                        separators=(",", ":"),
-                    )
+                self._enqueue_frontend(
+                    ws,
+                    {"type": "telemetry", "robot_id": robot_id, "data": telemetry},
                 )
 
             for media_robot_id, media_streams in self.latest_media.items():
                 for stream, data in media_streams.items():
-                    await ws.send_text(
-                        json.dumps(
-                            {
-                                "type": "media",
-                                "robot_id": media_robot_id,
-                                "stream": stream,
-                                "data": data,
-                                "ts": time.time(),
-                            },
-                            ensure_ascii=True,
-                            separators=(",", ":"),
-                        )
+                    self._enqueue_frontend(
+                        ws,
+                        {
+                            "type": "media",
+                            "robot_id": media_robot_id,
+                            "stream": stream,
+                            "data": data,
+                            "ts": time.time(),
+                        },
                     )
 
             try:
@@ -600,6 +641,12 @@ class CoreRuntime:
                 pass
             finally:
                 self.frontend_sockets.discard(ws)
+                self.frontend_queues.pop(ws, None)
+                sender_task = self.frontend_sender_tasks.pop(ws, None)
+                if sender_task is not None and not sender_task.done():
+                    sender_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await sender_task
 
         @app.websocket("/ws/edge-media/{robot_id}")
         async def ws_edge_media(robot_id: str, ws: WebSocket, token: str = Query(default="")) -> None:
@@ -608,7 +655,11 @@ class CoreRuntime:
                 return
 
             await ws.accept()
+            previous_ws = self.edge_media_sockets.get(robot_id)
             self.edge_media_sockets[robot_id] = ws
+            if previous_ws is not None and previous_ws is not ws:
+                with contextlib.suppress(Exception):
+                    await previous_ws.close(code=1012)
             self._audit("edge_media_connected", {"robot_id": robot_id})
 
             try:
@@ -619,7 +670,7 @@ class CoreRuntime:
                         stream = str(payload.get("stream", "")).strip() or "unknown"
                         data = payload.get("data", {})
 
-                        if isinstance(data, dict):
+                        if isinstance(data, dict) and stream != "audio":
                             self.latest_media[robot_id][stream] = data
 
                         await self._broadcast(
@@ -673,6 +724,8 @@ def parse_args() -> argparse.Namespace:
         help="Token format: <token>:<role>:<user_id>",
     )
     parser.add_argument("--edge-media-token", default="edge-media-dev-token")
+    parser.add_argument("--frontend-queue-size", type=int, default=16)
+    parser.add_argument("--frontend-send-timeout-s", type=float, default=2.0)
 
     parser.add_argument("--audit-log", default="./server/audit/server_audit.jsonl")
     parser.add_argument("--replay-max-items", type=int, default=2000)
@@ -713,6 +766,12 @@ def parse_args() -> argparse.Namespace:
 
     if args.control_session_timeout_s <= 0:
         parser.error("--control-session-timeout-s must be > 0")
+
+    if args.frontend_queue_size <= 0:
+        parser.error("--frontend-queue-size must be > 0")
+
+    if args.frontend_send_timeout_s <= 0:
+        parser.error("--frontend-send-timeout-s must be > 0")
 
     return args
 

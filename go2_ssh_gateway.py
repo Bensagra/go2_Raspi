@@ -323,30 +323,45 @@ class Go2SshGateway:
         if array is None:
             raise ValueError("Audio frame payload is empty")
 
-        if not isinstance(array, np.ndarray):
-            array = np.asarray(array)
+        array = np.asarray(array)
 
-        if array.ndim == 0:
-            array = np.expand_dims(array, axis=0)
+        layout = getattr(frame, "layout", None)
+        layout_channels = getattr(layout, "channels", None)
+        channels = len(layout_channels) if layout_channels else 1
+        channels = max(channels, 1)
 
-        if array.ndim == 1:
-            array = np.expand_dims(array, axis=1)
+        if array.size % channels != 0:
+            raise ValueError(f"Audio samples={array.size} not divisible by channels={channels}")
 
-        if array.ndim > 2:
-            array = array.reshape(array.shape[0], -1)
+        frame_format = getattr(frame, "format", None)
+        is_planar = bool(getattr(frame_format, "is_planar", False))
 
-        # aiortc often yields planar audio in (channels, samples) shape.
-        if array.ndim == 2 and array.shape[0] <= 8 and array.shape[1] > array.shape[0]:
-            array = array.T
+        if is_planar:
+            array = array.reshape(channels, -1).T
+        else:
+            array = array.reshape(-1, channels)
 
         if np.issubdtype(array.dtype, np.floating):
             array = (np.clip(array, -1.0, 1.0) * 32767.0).astype(np.int16)
+        elif array.dtype == np.int16:
+            pass
+        elif array.dtype == np.uint8:
+            array = ((array.astype(np.int16) - 128) << 8).astype(np.int16)
+        elif np.issubdtype(array.dtype, np.unsignedinteger):
+            info = np.iinfo(array.dtype)
+            midpoint = float(info.max + 1) / 2.0
+            normalized = (array.astype(np.float64) - midpoint) / midpoint
+            array = (np.clip(normalized, -1.0, 1.0) * 32767.0).astype(np.int16)
+        elif np.issubdtype(array.dtype, np.integer):
+            info = np.iinfo(array.dtype)
+            scale = float(max(abs(info.min), info.max))
+            normalized = array.astype(np.float64) / scale
+            array = (np.clip(normalized, -1.0, 1.0) * 32767.0).astype(np.int16)
         else:
-            array = array.astype(np.int16, copy=False)
+            raise ValueError(f"Unsupported audio dtype: {array.dtype}")
 
-        array = np.ascontiguousarray(array)
+        array = np.ascontiguousarray(array, dtype="<i2")
 
-        channels = int(array.shape[1]) if array.ndim == 2 else 1
         samples_per_channel = int(array.shape[0])
 
         pcm_bytes = array.tobytes()
@@ -369,7 +384,7 @@ class Go2SshGateway:
             "pcm_bytes": pcm_bytes,
             "channels": channels,
             "samples_per_channel": samples_per_channel,
-            "sample_rate": int(getattr(frame, "sample_rate", 0) or 0),
+            "sample_rate": int(getattr(frame, "sample_rate", 0) or 48000),
             "layout": getattr(getattr(frame, "layout", None), "name", "unknown"),
             "frame_format": getattr(getattr(frame, "format", None), "name", "unknown"),
             "total_bytes": total_bytes,
@@ -1069,7 +1084,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lidar-decoder",
         choices=["libvoxel", "native"],
-        default="libvoxel",
+        default="native",
         help="Lidar decoder type",
     )
 

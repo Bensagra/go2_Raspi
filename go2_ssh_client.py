@@ -124,6 +124,8 @@ class GatewayClient:
             self.args.remote_gateway,
             "--ip",
             self.args.go2_ip,
+            "--lidar-decoder",
+            self.args.lidar_decoder,
             "--camera-format",
             self.args.camera_format,
             "--camera-jpeg-quality",
@@ -662,7 +664,21 @@ class GatewayClient:
         return "LIDAR" in topic_alias_upper or "ULIDAR" in topic_alias_upper or "CLOUD" in topic_alias_upper
 
     def _extract_lidar_points(self, value: Any, depth: int = 0) -> Optional[np.ndarray]:
-        if depth > 8:
+        if depth > 8 or value is None:
+            return None
+
+        if isinstance(value, np.ndarray):
+            arr = np.asarray(value)
+
+            if arr.ndim == 2 and arr.shape[1] >= 2:
+                return arr[:, : min(arr.shape[1], 3)].astype(np.float32, copy=False)
+
+            if arr.ndim == 1:
+                if arr.size % 3 == 0:
+                    return arr.astype(np.float32).reshape(-1, 3)
+                if arr.size % 2 == 0:
+                    return arr.astype(np.float32).reshape(-1, 2)
+
             return None
 
         if isinstance(value, dict):
@@ -670,6 +686,26 @@ class GatewayClient:
                 found = self._extract_lidar_points(value["items"], depth + 1)
                 if found is not None:
                     return found
+
+            if "positions" in value:
+                with contextlib.suppress(Exception):
+                    positions = np.asarray(value["positions"])
+                    is_byte_buffer = positions.dtype == np.uint8
+                    if (
+                        not is_byte_buffer
+                        and positions.ndim == 1
+                        and np.issubdtype(positions.dtype, np.integer)
+                        and "face_count" in value
+                        and positions.size > 0
+                    ):
+                        is_byte_buffer = bool(positions.min() >= 0 and positions.max() <= 255)
+
+                    if is_byte_buffer and positions.ndim == 1:
+                        if positions.size % 12 != 0:
+                            return None
+                        raw_positions = np.asarray(positions, dtype=np.uint8)
+                        points = np.frombuffer(raw_positions.tobytes(), dtype=np.float32).reshape(-1, 3)
+                        return points if points.size else None
 
             preferred_keys = (
                 "points",
@@ -700,22 +736,14 @@ class GatewayClient:
             if not value:
                 return None
 
-            first = value[0]
-
-            if isinstance(first, (list, tuple)) and len(first) >= 2:
-                with contextlib.suppress(Exception):
-                    arr = np.asarray(value, dtype=np.float32)
-                    if arr.ndim == 2 and arr.shape[1] >= 2:
-                        return arr[:, : min(arr.shape[1], 3)]
-
-            if isinstance(first, (int, float)):
-                with contextlib.suppress(Exception):
-                    arr = np.asarray(value, dtype=np.float32)
-                    if arr.ndim == 1 and arr.size >= 6:
-                        if arr.size % 3 == 0:
-                            return arr.reshape(-1, 3)
-                        if arr.size % 2 == 0:
-                            return arr.reshape(-1, 2)
+            with contextlib.suppress(Exception):
+                arr = np.asarray(value, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[1] >= 2:
+                    return arr[:, : min(arr.shape[1], 3)]
+                if arr.ndim == 1 and arr.size % 3 == 0:
+                    return arr.reshape(-1, 3)
+                if arr.ndim == 1 and arr.size % 2 == 0:
+                    return arr.reshape(-1, 2)
 
             for item in value[:10]:
                 found = self._extract_lidar_points(item, depth + 1)
@@ -1229,6 +1257,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to go2_ssh_gateway.py on remote PC/Raspberry",
     )
     parser.add_argument("--go2-ip", default="192.168.123.161", help="Go2 IP in STA mode")
+    parser.add_argument(
+        "--lidar-decoder",
+        choices=["libvoxel", "native"],
+        default="native",
+        help="Remote lidar decoder",
+    )
 
     parser.add_argument("--subscribe-profile", action="append", default=["core"], help="Gateway subscribe profile")
     parser.add_argument("--subscribe-topic", action="append", default=[], help="Gateway extra subscribe topic")

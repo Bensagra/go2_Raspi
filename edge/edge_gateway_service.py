@@ -59,9 +59,13 @@ class EdgeGatewayService:
 
         self.conn: Optional[UnitreeWebRTCConnection] = None
         self.video_task: Optional[asyncio.Task[None]] = None
+        self.robot_connected_at = 0.0
+        self.traffic_saving_disabled = False
 
         self.command_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=args.command_queue_size)
         self.media_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=args.media_queue_size)
+        self.latest_media_by_stream: Dict[str, Dict[str, Any]] = {}
+        self.media_ready = asyncio.Event()
 
         self.mqtt_client: Optional[mqtt.Client] = None
         self.last_heartbeat_monotonic = time.monotonic()
@@ -79,6 +83,7 @@ class EdgeGatewayService:
         self.audio_emit_every = args.audio_emit_every
         self.audio_max_bytes = args.audio_max_bytes
         self.audio_frame_count = 0
+        self.last_audio_error_at = 0.0
 
         self.lidar_enabled = args.enable_lidar
         self.last_lidar_media_at = 0.0
@@ -154,7 +159,8 @@ class EdgeGatewayService:
         self.mqtt_client.on_message = self._on_mqtt_message
         self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
 
-        self.mqtt_client.connect(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
+        self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
+        self.mqtt_client.connect_async(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
         self.mqtt_client.loop_start()
 
     def _on_mqtt_connect(self, client, userdata, flags, rc, properties=None) -> None:
@@ -222,7 +228,7 @@ class EdgeGatewayService:
         }
         self._mqtt_publish("topic_events", event_payload, qos=0)
 
-        if self.lidar_enabled and self._looks_like_lidar_topic(topic_alias):
+        if self.lidar_enabled and topic_alias == "ULIDAR_ARRAY":
             await self._maybe_publish_lidar_media(message)
 
     async def _subscribe_topic(self, topic_value: str) -> None:
@@ -242,19 +248,28 @@ class EdgeGatewayService:
 
     async def _set_video(self, enabled: bool) -> None:
         if self.conn is None:
-            return
+            raise RuntimeError("Robot connection not ready")
         self.camera_enabled = enabled
         self.conn.video.switchVideoChannel(enabled)
 
     async def _set_audio(self, enabled: bool) -> None:
         if self.conn is None:
-            return
+            raise RuntimeError("Robot connection not ready")
         self.audio_enabled = enabled
         self.conn.audio.switchAudioChannel(enabled)
 
     async def _set_lidar(self, enabled: bool) -> None:
         if self.conn is None:
-            return
+            raise RuntimeError("Robot connection not ready")
+
+        if enabled and not self.traffic_saving_disabled:
+            with contextlib.suppress(Exception):
+                disabled = await asyncio.wait_for(
+                    self.conn.datachannel.disableTrafficSaving(True),
+                    timeout=3.0,
+                )
+                self.traffic_saving_disabled = bool(disabled)
+
         self.lidar_enabled = enabled
         self.conn.datachannel.pub_sub.publish_without_callback(
             TOPIC_ALIAS_TO_VALUE["ULIDAR_SWITCH"],
@@ -336,39 +351,16 @@ class EdgeGatewayService:
         if not self.audio_enabled:
             return
 
-        if self.audio_frame_count % self.audio_emit_every != 0 and self.audio_frame_count != 1:
+        if self.audio_frame_count % self.audio_emit_every != 0:
             return
 
-        array = frame.to_ndarray()
-        if array is None:
-            return
-
-        if not isinstance(array, np.ndarray):
-            array = np.asarray(array)
-
-        if array.ndim == 1:
-            array = np.expand_dims(array, axis=1)
-        if array.ndim > 2:
-            array = array.reshape(array.shape[0], -1)
-
-        if array.ndim == 2 and array.shape[0] <= 8 and array.shape[1] > array.shape[0]:
-            array = array.T
-
-        if np.issubdtype(array.dtype, np.floating):
-            array = (np.clip(array, -1.0, 1.0) * 32767.0).astype(np.int16)
-        else:
-            array = array.astype(np.int16, copy=False)
-
-        raw = array.tobytes()
-        if self.audio_max_bytes > 0 and len(raw) > self.audio_max_bytes:
-            raw = raw[: self.audio_max_bytes]
-
-        channels = int(array.shape[1]) if array.ndim == 2 else 1
-        bytes_per_frame = max(2 * channels, 2)
-        if len(raw) % bytes_per_frame != 0:
-            raw = raw[: len(raw) - (len(raw) % bytes_per_frame)]
-
-        if not raw:
+        try:
+            raw, sample_rate, channels = self._audio_frame_to_pcm(frame)
+        except Exception as exc:
+            now = time.monotonic()
+            if now - self.last_audio_error_at >= 2.0:
+                self.last_audio_error_at = now
+                self._publish_event("audio_encode_error", {"error": str(exc)})
             return
 
         await self._enqueue_media(
@@ -379,66 +371,162 @@ class EdgeGatewayService:
                 "data": {
                     "frame_index": self.audio_frame_count,
                     "audio_format": "pcm_s16le",
-                    "sample_rate": int(getattr(frame, "sample_rate", 0) or 0),
+                    "sample_rate": sample_rate,
                     "channels": channels,
                     "audio_base64": base64.b64encode(raw).decode("ascii"),
                 },
             }
         )
 
+    def _audio_frame_to_pcm(self, frame) -> Tuple[bytes, int, int]:
+        array = frame.to_ndarray()
+        if array is None:
+            raise ValueError("empty audio frame")
+
+        array = np.asarray(array)
+
+        layout = getattr(frame, "layout", None)
+        layout_channels = getattr(layout, "channels", None)
+        channels = len(layout_channels) if layout_channels else 1
+        channels = max(channels, 1)
+
+        if array.size % channels != 0:
+            raise ValueError(f"audio samples={array.size} not divisible by channels={channels}")
+
+        frame_format = getattr(frame, "format", None)
+        is_planar = bool(getattr(frame_format, "is_planar", False))
+
+        if is_planar:
+            array = array.reshape(channels, -1).T
+        else:
+            array = array.reshape(-1, channels)
+
+        if np.issubdtype(array.dtype, np.floating):
+            array = (np.clip(array, -1.0, 1.0) * 32767.0).astype(np.int16)
+        elif array.dtype == np.int16:
+            pass
+        elif array.dtype == np.uint8:
+            array = ((array.astype(np.int16) - 128) << 8).astype(np.int16)
+        elif np.issubdtype(array.dtype, np.unsignedinteger):
+            info = np.iinfo(array.dtype)
+            midpoint = float(info.max + 1) / 2.0
+            normalized = (array.astype(np.float64) - midpoint) / midpoint
+            array = (np.clip(normalized, -1.0, 1.0) * 32767.0).astype(np.int16)
+        elif np.issubdtype(array.dtype, np.integer):
+            info = np.iinfo(array.dtype)
+            scale = float(max(abs(info.min), info.max))
+            normalized = array.astype(np.float64) / scale
+            array = (np.clip(normalized, -1.0, 1.0) * 32767.0).astype(np.int16)
+        else:
+            raise ValueError(f"unsupported audio dtype: {array.dtype}")
+
+        array = np.ascontiguousarray(array, dtype="<i2")
+        raw = array.tobytes()
+        if self.audio_max_bytes > 0 and len(raw) > self.audio_max_bytes:
+            raw = raw[: self.audio_max_bytes]
+
+        bytes_per_frame = channels * 2
+        if len(raw) % bytes_per_frame != 0:
+            raw = raw[: len(raw) - (len(raw) % bytes_per_frame)]
+
+        if not raw:
+            raise ValueError("empty PCM payload")
+
+        sample_rate = int(getattr(frame, "sample_rate", 0) or 48000)
+        return raw, sample_rate, channels
+
     async def _enqueue_media(self, payload: Dict[str, Any]) -> None:
         if not self.args.media_ws_url:
             return
 
-        if self.media_queue.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self.media_queue.get_nowait()
+        stream = str(payload.get("stream", "")).strip()
 
-        with contextlib.suppress(asyncio.QueueFull):
-            self.media_queue.put_nowait(payload)
+        if stream == "audio":
+            if self.media_queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self.media_queue.get_nowait()
+
+            with contextlib.suppress(asyncio.QueueFull):
+                self.media_queue.put_nowait(payload)
+        else:
+            self.latest_media_by_stream[stream] = payload
+
+        self.media_ready.set()
 
     def _looks_like_lidar_topic(self, topic_alias: str) -> bool:
         upper = topic_alias.upper()
         return "LIDAR" in upper or "ULIDAR" in upper or "CLOUD" in upper
 
     def _extract_lidar_points(self, value: Any, depth: int = 0) -> Optional[np.ndarray]:
-        if depth > 8:
+        if depth > 8 or value is None:
+            return None
+
+        if isinstance(value, np.ndarray):
+            arr = np.asarray(value)
+
+            if arr.ndim == 2 and arr.shape[1] >= 2:
+                return arr[:, : min(arr.shape[1], 3)].astype(np.float32, copy=False)
+
+            if arr.ndim == 1:
+                if arr.size % 3 == 0:
+                    return arr.astype(np.float32).reshape(-1, 3)
+                if arr.size % 2 == 0:
+                    return arr.astype(np.float32).reshape(-1, 2)
+
             return None
 
         if isinstance(value, dict):
-            data = value.get("data") if "data" in value else value
-            if isinstance(data, dict):
-                preferred = ["points", "cloud", "cloud_points", "xyz", "voxel_map", "data"]
-                for key in preferred:
-                    if key in data:
-                        found = self._extract_lidar_points(data[key], depth + 1)
-                        if found is not None:
-                            return found
-                for item in data.values():
-                    found = self._extract_lidar_points(item, depth + 1)
+            if all(key in value for key in ("x", "y")):
+                with contextlib.suppress(Exception):
+                    return np.asarray(
+                        [[float(value["x"]), float(value["y"]), float(value.get("z", 0.0))]],
+                        dtype=np.float32,
+                    )
+
+            if "positions" in value:
+                with contextlib.suppress(Exception):
+                    positions = np.asarray(value["positions"])
+                    if positions.dtype == np.uint8 and positions.ndim == 1:
+                        if positions.size % 12 != 0:
+                            return None
+                        points = np.frombuffer(positions.tobytes(), dtype=np.float32).reshape(-1, 3)
+                        return points if points.size else None
+
+            preferred = [
+                "points",
+                "cloud",
+                "cloud_points",
+                "xyz",
+                "voxel_map",
+                "positions",
+                "data",
+                "items",
+            ]
+            for key in preferred:
+                if key in value:
+                    found = self._extract_lidar_points(value[key], depth + 1)
                     if found is not None:
                         return found
+
+            for item in value.values():
+                found = self._extract_lidar_points(item, depth + 1)
+                if found is not None:
+                    return found
+
             return None
 
         if isinstance(value, (list, tuple)):
             if not value:
                 return None
 
-            first = value[0]
-            if isinstance(first, (list, tuple)) and len(first) >= 2:
-                with contextlib.suppress(Exception):
-                    arr = np.asarray(value, dtype=np.float32)
-                    if arr.ndim == 2 and arr.shape[1] >= 2:
-                        return arr[:, : min(arr.shape[1], 3)]
-
-            if isinstance(first, (int, float)):
-                with contextlib.suppress(Exception):
-                    arr = np.asarray(value, dtype=np.float32)
-                    if arr.ndim == 1 and arr.size >= 4:
-                        if arr.size % 3 == 0:
-                            return arr.reshape(-1, 3)
-                        if arr.size % 2 == 0:
-                            return arr.reshape(-1, 2)
+            with contextlib.suppress(Exception):
+                arr = np.asarray(value, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[1] >= 2:
+                    return arr[:, : min(arr.shape[1], 3)]
+                if arr.ndim == 1 and arr.size % 3 == 0:
+                    return arr.reshape(-1, 3)
+                if arr.ndim == 1 and arr.size % 2 == 0:
+                    return arr.reshape(-1, 2)
 
             for item in value[:10]:
                 found = self._extract_lidar_points(item, depth + 1)
@@ -481,6 +569,7 @@ class EdgeGatewayService:
         now = time.monotonic()
         if now - self.last_lidar_media_at < (1.0 / max(self.args.lidar_media_hz, 0.01)):
             return
+        self.last_lidar_media_at = now
 
         points = self._extract_lidar_points(payload)
         if points is None:
@@ -497,8 +586,6 @@ class EdgeGatewayService:
         )
         if not ok or encoded is None:
             return
-
-        self.last_lidar_media_at = now
 
         await self._enqueue_media(
             {
@@ -592,6 +679,17 @@ class EdgeGatewayService:
             "velocity": sport.get("velocity", {}),
             "battery": battery,
             "power_v": low.get("power_v"),
+            "robot_link": {
+                "connected": self.conn is not None,
+                "pc_state": str(getattr(getattr(self.conn, "pc", None), "connectionState", "closed")),
+                "data_state": str(
+                    getattr(
+                        getattr(getattr(self.conn, "datachannel", None), "channel", None),
+                        "readyState",
+                        "closed",
+                    )
+                ),
+            },
             "media": {
                 "camera_enabled": self.camera_enabled,
                 "lidar_enabled": self.lidar_enabled,
@@ -599,6 +697,7 @@ class EdgeGatewayService:
                 "camera_emit_every": self.camera_emit_every,
                 "audio_emit_every": self.audio_emit_every,
                 "audio_max_bytes": self.audio_max_bytes,
+                "audio_queue_depth": self.media_queue.qsize(),
             },
             "temperatures": {
                 "ntc1": low.get("temperature_ntc1"),
@@ -870,23 +969,62 @@ class EdgeGatewayService:
                     self._publish_event("media_uplink_connected", {"url": ws_url})
 
                     while not self.stop_event.is_set():
-                        payload = await self.media_queue.get()
-                        await ws.send(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+                        await self.media_ready.wait()
+                        self.media_ready.clear()
+
+                        batch: List[Dict[str, Any]] = []
+
+                        for _ in range(self.args.media_audio_batch_size):
+                            try:
+                                batch.append(self.media_queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+
+                        for stream in ("lidar", "video"):
+                            payload = self.latest_media_by_stream.pop(stream, None)
+                            if payload is not None:
+                                batch.append(payload)
+
+                        for stream in list(self.latest_media_by_stream):
+                            payload = self.latest_media_by_stream.pop(stream, None)
+                            if payload is not None:
+                                batch.append(payload)
+
+                        if not self.media_queue.empty() or self.latest_media_by_stream:
+                            self.media_ready.set()
+
+                        for payload in batch:
+                            text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+                            await asyncio.wait_for(ws.send(text), timeout=self.args.media_ws_send_timeout_s)
 
             except Exception as exc:
                 self._publish_event("media_uplink_retry", {"error": str(exc)})
                 await asyncio.sleep(self.args.media_ws_reconnect_s)
 
     async def _connect_robot(self) -> None:
-        self.conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip=self.args.go2_ip)
-        await self.conn.connect()
+        connection = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip=self.args.go2_ip)
+        try:
+            await connection.connect()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await connection.disconnect()
+            raise
+
+        self.conn = connection
+        self.robot_connected_at = time.monotonic()
+        self.subscribed_topics.clear()
+        self.latest_by_topic.clear()
 
         self.conn.video.add_track_callback(self._on_video_track)
         self.conn.audio.add_track_callback(self._on_audio_frame)
 
         if self.args.disable_traffic_saving:
             with contextlib.suppress(Exception):
-                await self.conn.datachannel.disableTrafficSaving(True)
+                disabled = await asyncio.wait_for(
+                    self.conn.datachannel.disableTrafficSaving(True),
+                    timeout=3.0,
+                )
+                self.traffic_saving_disabled = bool(disabled)
 
         with contextlib.suppress(Exception):
             self.conn.datachannel.set_decoder(self.args.lidar_decoder)
@@ -928,13 +1066,103 @@ class EdgeGatewayService:
             },
         )
 
+    async def _disconnect_robot(self) -> None:
+        if self.video_task and not self.video_task.done():
+            self.video_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.video_task
+
+        self.video_task = None
+
+        connection = self.conn
+        self.conn = None
+        self.robot_connected_at = 0.0
+        self.traffic_saving_disabled = False
+        self.subscribed_topics.clear()
+        self.latest_by_topic.clear()
+
+        if connection is None:
+            return
+
+        with contextlib.suppress(Exception):
+            connection.video.switchVideoChannel(False)
+        with contextlib.suppress(Exception):
+            connection.audio.switchAudioChannel(False)
+        with contextlib.suppress(Exception):
+            await connection.disconnect()
+
+    async def _robot_supervisor_loop(self) -> None:
+        bad_since = 0.0
+
+        while not self.stop_event.is_set():
+            if self.conn is None:
+                try:
+                    await asyncio.wait_for(
+                        self._connect_robot(),
+                        timeout=self.args.robot_connect_timeout_s,
+                    )
+                    bad_since = 0.0
+                except asyncio.CancelledError:
+                    raise
+                except (Exception, SystemExit) as exc:
+                    await self._disconnect_robot()
+                    self._publish_event("robot_connect_retry", {"error": str(exc)})
+                    await asyncio.sleep(self.args.robot_reconnect_s)
+                continue
+
+            connection = self.conn
+            pc = getattr(connection, "pc", None)
+            datachannel = getattr(connection, "datachannel", None)
+            channel = getattr(datachannel, "channel", None)
+
+            pc_state = str(getattr(pc, "connectionState", "closed"))
+            data_state = str(getattr(channel, "readyState", "closed"))
+
+            heartbeat = getattr(datachannel, "heartbeat", None)
+            heartbeat_at = getattr(heartbeat, "heartbeat_response", None)
+            connected_age = time.monotonic() - self.robot_connected_at
+
+            heartbeat_stale = False
+            if heartbeat_at is None:
+                heartbeat_stale = connected_age > self.args.robot_heartbeat_timeout_s
+            else:
+                heartbeat_stale = time.time() - float(heartbeat_at) > self.args.robot_heartbeat_timeout_s
+
+            link_bad = (
+                pc_state in {"failed", "closed", "disconnected"}
+                or data_state != "open"
+                or heartbeat_stale
+            )
+
+            if not link_bad:
+                bad_since = 0.0
+                await asyncio.sleep(1.0)
+                continue
+
+            if bad_since <= 0:
+                bad_since = time.monotonic()
+
+            if time.monotonic() - bad_since >= self.args.robot_link_grace_s:
+                self._publish_event(
+                    "robot_link_lost",
+                    {
+                        "pc_state": pc_state,
+                        "data_state": data_state,
+                        "heartbeat_stale": heartbeat_stale,
+                    },
+                )
+                await self._disconnect_robot()
+                bad_since = 0.0
+
+            await asyncio.sleep(1.0)
+
     async def run(self) -> None:
         self.loop = asyncio.get_running_loop()
 
         self._setup_mqtt()
-        await self._connect_robot()
 
         tasks: List[asyncio.Task[Any]] = [
+            asyncio.create_task(self._robot_supervisor_loop()),
             asyncio.create_task(self._command_loop()),
             asyncio.create_task(self._watchdog_loop()),
             asyncio.create_task(self._telemetry_loop()),
@@ -950,18 +1178,7 @@ class EdgeGatewayService:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-            if self.video_task and not self.video_task.done():
-                self.video_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self.video_task
-
-            if self.conn:
-                with contextlib.suppress(Exception):
-                    self.conn.video.switchVideoChannel(False)
-                with contextlib.suppress(Exception):
-                    self.conn.audio.switchAudioChannel(False)
-                with contextlib.suppress(Exception):
-                    await self.conn.disconnect()
+            await self._disconnect_robot()
 
             if self.mqtt_client is not None:
                 with contextlib.suppress(Exception):
@@ -985,7 +1202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-audio", action="store_true")
     parser.add_argument("--enable-lidar", action="store_true")
     parser.add_argument("--disable-traffic-saving", action="store_true")
-    parser.add_argument("--lidar-decoder", choices=["libvoxel", "native"], default="libvoxel")
+    parser.add_argument("--lidar-decoder", choices=["libvoxel", "native"], default="native")
 
     parser.add_argument("--subscribe-profile", action="append", default=["core,lidar,audio"])
     parser.add_argument("--subscribe-topic", action="append", default=[])
@@ -1030,8 +1247,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--media-ws-token", default="")
     parser.add_argument("--media-queue-size", type=int, default=64)
+    parser.add_argument("--media-audio-batch-size", type=int, default=8)
     parser.add_argument("--media-ws-reconnect-s", type=float, default=2.0)
+    parser.add_argument("--media-ws-send-timeout-s", type=float, default=2.0)
     parser.add_argument("--media-ws-max-size", type=int, default=8 * 1024 * 1024)
+
+    parser.add_argument("--robot-connect-timeout-s", type=float, default=20.0)
+    parser.add_argument("--robot-reconnect-s", type=float, default=2.0)
+    parser.add_argument("--robot-heartbeat-timeout-s", type=float, default=10.0)
+    parser.add_argument("--robot-link-grace-s", type=float, default=3.0)
 
     args = parser.parse_args()
 
@@ -1061,6 +1285,24 @@ def parse_args() -> argparse.Namespace:
 
     if args.media_queue_size <= 0:
         parser.error("--media-queue-size must be > 0")
+
+    if args.media_audio_batch_size <= 0:
+        parser.error("--media-audio-batch-size must be > 0")
+
+    if args.media_ws_send_timeout_s <= 0:
+        parser.error("--media-ws-send-timeout-s must be > 0")
+
+    if args.robot_connect_timeout_s <= 0:
+        parser.error("--robot-connect-timeout-s must be > 0")
+
+    if args.robot_reconnect_s <= 0:
+        parser.error("--robot-reconnect-s must be > 0")
+
+    if args.robot_heartbeat_timeout_s <= 0:
+        parser.error("--robot-heartbeat-timeout-s must be > 0")
+
+    if args.robot_link_grace_s < 0:
+        parser.error("--robot-link-grace-s must be >= 0")
 
     if args.lidar_media_hz <= 0:
         parser.error("--lidar-media-hz must be > 0")

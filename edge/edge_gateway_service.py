@@ -6,14 +6,11 @@ import contextlib
 import json
 import time
 import uuid
-from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import paho.mqtt.client as mqtt
-from aiortc import AudioStreamTrack
-from av import AudioFrame
 from av.audio.resampler import AudioResampler
 
 try:
@@ -52,67 +49,6 @@ PROFILE_TOPICS = {
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
-
-
-class BrowserMicrophoneTrack(AudioStreamTrack):
-    kind = "audio"
-
-    def __init__(self, sample_rate: int = 48000, frame_samples: int = 960) -> None:
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.frame_samples = frame_samples
-        self.frame_bytes = frame_samples * 2
-        self.max_buffer_bytes = sample_rate * 2
-        self.buffer = bytearray()
-        self.enabled = False
-        self._timestamp = 0
-        self._started_at = 0.0
-        self.received_packets = 0
-        self.dropped_bytes = 0
-
-    def feed(self, pcm_s16le: bytes) -> None:
-        if not pcm_s16le:
-            return
-
-        aligned = pcm_s16le[: len(pcm_s16le) - (len(pcm_s16le) % 2)]
-        if not aligned:
-            return
-
-        self.buffer.extend(aligned)
-        self.received_packets += 1
-
-        overflow = len(self.buffer) - self.max_buffer_bytes
-        if overflow > 0:
-            overflow -= overflow % 2
-            del self.buffer[:overflow]
-            self.dropped_bytes += overflow
-
-    def set_enabled(self, enabled: bool) -> None:
-        self.enabled = enabled
-        if not enabled:
-            self.buffer.clear()
-
-    async def recv(self) -> AudioFrame:
-        if self._started_at <= 0:
-            self._started_at = time.monotonic()
-            self._timestamp = 0
-        else:
-            self._timestamp += self.frame_samples
-            deadline = self._started_at + (self._timestamp / self.sample_rate)
-            await asyncio.sleep(max(0.0, deadline - time.monotonic()))
-
-        if self.enabled and len(self.buffer) >= self.frame_bytes:
-            data = bytes(self.buffer[: self.frame_bytes])
-            del self.buffer[: self.frame_bytes]
-        else:
-            data = bytes(self.frame_bytes)
-
-        frame = AudioFrame(format="s16", layout="mono", samples=self.frame_samples)
-        frame.planes[0].update(data)
-        frame.sample_rate = self.sample_rate
-        frame.pts = self._timestamp
-        frame.time_base = Fraction(1, self.sample_rate)
-        return frame
 
 
 class EdgeGatewayService:
@@ -156,9 +92,6 @@ class EdgeGatewayService:
         self.audio_resampler = AudioResampler(format="s16", layout="mono", rate=48000)
         self.audio_pcm_buffer = bytearray()
         self.audio_buffered_frames = 0
-        self.talkback_track: Optional[BrowserMicrophoneTrack] = None
-        self.talkback_sender = None
-        self.talkback_enabled = False
 
         self.lidar_enabled = args.enable_lidar
         self.last_lidar_media_at = 0.0
@@ -614,70 +547,6 @@ class EdgeGatewayService:
 
         return b"".join(chunks), 48000, 1
 
-    def _attach_talkback_track(self) -> None:
-        if self.conn is None:
-            raise RuntimeError("Robot connection not ready")
-
-        if self.talkback_track is None:
-            self.talkback_track = BrowserMicrophoneTrack()
-
-        pc = getattr(self.conn, "pc", None)
-        if pc is None:
-            raise RuntimeError("Robot peer connection not ready")
-
-        for transceiver in pc.getTransceivers():
-            if getattr(transceiver, "kind", "") != "audio":
-                continue
-            sender = transceiver.sender
-            sender.replaceTrack(self.talkback_track)
-            self.talkback_sender = sender
-            return
-
-        self.talkback_sender = pc.addTrack(self.talkback_track)
-
-    async def _set_talkback(self, enabled: bool) -> None:
-        if enabled:
-            self._attach_talkback_track()
-            if self.conn is None:
-                raise RuntimeError("Robot connection not ready")
-            self.conn.audio.switchAudioChannel(True)
-
-        if self.talkback_track is not None:
-            self.talkback_track.set_enabled(enabled)
-
-        self.talkback_enabled = enabled
-        self._publish_event("talkback_changed", {"enabled": enabled})
-        await self._enqueue_media(
-            {
-                "stream": "talkback_status",
-                "data": {
-                    "active": enabled,
-                    "ok": True,
-                    "error": "",
-                },
-                "ts": time.time(),
-            }
-        )
-
-    def _feed_talkback_audio(self, data: Dict[str, Any]) -> None:
-        if not self.talkback_enabled or self.talkback_track is None:
-            return
-
-        sample_rate = int(data.get("sample_rate", 0) or 0)
-        channels = int(data.get("channels", 0) or 0)
-        audio_format = str(data.get("audio_format", ""))
-        encoded = data.get("audio_base64")
-
-        if sample_rate != 48000 or channels != 1 or audio_format != "pcm_s16le":
-            raise ValueError("Talkback requires mono pcm_s16le at 48000 Hz")
-        if not isinstance(encoded, str) or not encoded:
-            return
-
-        raw = base64.b64decode(encoded, validate=True)
-        if len(raw) > self.args.talkback_max_packet_bytes:
-            raise ValueError("Talkback packet too large")
-        self.talkback_track.feed(raw)
-
     async def _enqueue_media(self, payload: Dict[str, Any]) -> None:
         if not self.args.media_ws_url:
             return
@@ -947,10 +816,6 @@ class EdgeGatewayService:
                 "audio_emit_every": self.audio_emit_every,
                 "audio_max_bytes": self.audio_max_bytes,
                 "audio_queue_depth": self.media_queue.qsize(),
-                "talkback_enabled": self.talkback_enabled,
-                "talkback_buffer_bytes": (
-                    len(self.talkback_track.buffer) if self.talkback_track is not None else 0
-                ),
             },
             "temperatures": {
                 "ntc1": low.get("temperature_ntc1"),
@@ -1217,81 +1082,6 @@ class EdgeGatewayService:
 
             await asyncio.sleep(0.05)
 
-    async def _media_sender_loop(self, ws) -> None:
-        while not self.stop_event.is_set():
-            await self.media_ready.wait()
-            self.media_ready.clear()
-
-            batch: List[Dict[str, Any]] = []
-
-            for _ in range(self.args.media_audio_batch_size):
-                try:
-                    batch.append(self.media_queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-
-            for stream in ("lidar", "video"):
-                payload = self.latest_media_by_stream.pop(stream, None)
-                if payload is not None:
-                    batch.append(payload)
-
-            for stream in list(self.latest_media_by_stream):
-                payload = self.latest_media_by_stream.pop(stream, None)
-                if payload is not None:
-                    batch.append(payload)
-
-            if not self.media_queue.empty() or self.latest_media_by_stream:
-                self.media_ready.set()
-
-            for payload in batch:
-                text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-                await asyncio.wait_for(ws.send(text), timeout=self.args.media_ws_send_timeout_s)
-
-    async def _media_receiver_loop(self, ws) -> None:
-        async for text in ws:
-            try:
-                payload = json.loads(text)
-            except (TypeError, ValueError) as exc:
-                self._publish_event("media_downlink_invalid", {"error": str(exc)})
-                continue
-
-            op = str(payload.get("op", "")).strip()
-
-            try:
-                if op == "mic_start":
-                    await self._set_talkback(True)
-                    continue
-
-                if op == "mic_stop":
-                    await self._set_talkback(False)
-                    continue
-
-                if op == "mic_audio":
-                    data = payload.get("data", {})
-                    if isinstance(data, dict):
-                        self._feed_talkback_audio(data)
-            except Exception as exc:
-                if op == "mic_start":
-                    self.talkback_enabled = False
-                    if self.talkback_track is not None:
-                        self.talkback_track.set_enabled(False)
-
-                self._publish_event(
-                    "talkback_error",
-                    {"operation": op, "error": str(exc)},
-                )
-                await self._enqueue_media(
-                    {
-                        "stream": "talkback_status",
-                        "data": {
-                            "active": False,
-                            "ok": False,
-                            "error": str(exc),
-                        },
-                        "ts": time.time(),
-                    }
-                )
-
     async def _media_uplink_loop(self) -> None:
         if not self.args.media_ws_url:
             return
@@ -1320,25 +1110,36 @@ class EdgeGatewayService:
                 ) as ws:
                     self._publish_event("media_uplink_connected", {"url": ws_url})
 
-                    sender_task = asyncio.create_task(self._media_sender_loop(ws))
-                    receiver_task = asyncio.create_task(self._media_receiver_loop(ws))
-                    done, pending = await asyncio.wait(
-                        {sender_task, receiver_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    while not self.stop_event.is_set():
+                        await self.media_ready.wait()
+                        self.media_ready.clear()
 
-                    for task in pending:
-                        task.cancel()
-                    for task in pending:
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await task
+                        batch: List[Dict[str, Any]] = []
 
-                    for task in done:
-                        task.result()
+                        for _ in range(self.args.media_audio_batch_size):
+                            try:
+                                batch.append(self.media_queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+
+                        for stream in ("lidar", "video"):
+                            payload = self.latest_media_by_stream.pop(stream, None)
+                            if payload is not None:
+                                batch.append(payload)
+
+                        for stream in list(self.latest_media_by_stream):
+                            payload = self.latest_media_by_stream.pop(stream, None)
+                            if payload is not None:
+                                batch.append(payload)
+
+                        if not self.media_queue.empty() or self.latest_media_by_stream:
+                            self.media_ready.set()
+
+                        for payload in batch:
+                            text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+                            await asyncio.wait_for(ws.send(text), timeout=self.args.media_ws_send_timeout_s)
 
             except Exception as exc:
-                with contextlib.suppress(Exception):
-                    await self._set_talkback(False)
                 self._publish_event("media_uplink_retry", {"error": str(exc)})
                 await asyncio.sleep(self.args.media_ws_reconnect_s)
 
@@ -1423,12 +1224,6 @@ class EdgeGatewayService:
         self.subscribed_topics.clear()
         self.latest_by_topic.clear()
         self._reset_audio_pipeline()
-        self.talkback_enabled = False
-        if self.talkback_track is not None:
-            self.talkback_track.set_enabled(False)
-            self.talkback_track.stop()
-        self.talkback_track = None
-        self.talkback_sender = None
 
         if connection is None:
             return
@@ -1600,7 +1395,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--media-ws-reconnect-s", type=float, default=2.0)
     parser.add_argument("--media-ws-send-timeout-s", type=float, default=2.0)
     parser.add_argument("--media-ws-max-size", type=int, default=8 * 1024 * 1024)
-    parser.add_argument("--talkback-max-packet-bytes", type=int, default=32768)
 
     parser.add_argument("--robot-connect-timeout-s", type=float, default=20.0)
     parser.add_argument("--robot-reconnect-s", type=float, default=2.0)
@@ -1643,9 +1437,6 @@ def parse_args() -> argparse.Namespace:
 
     if args.media_ws_send_timeout_s <= 0:
         parser.error("--media-ws-send-timeout-s must be > 0")
-
-    if args.talkback_max_packet_bytes <= 0:
-        parser.error("--talkback-max-packet-bytes must be > 0")
 
     if args.robot_connect_timeout_s <= 0:
         parser.error("--robot-connect-timeout-s must be > 0")

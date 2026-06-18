@@ -63,9 +63,13 @@ class EdgeGatewayService:
         self.traffic_saving_disabled = False
 
         self.command_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=args.command_queue_size)
+        self.latest_motion_command: Optional[Dict[str, Any]] = None
+        self.motion_marker_queued = False
         self.media_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=args.media_queue_size)
         self.latest_media_by_stream: Dict[str, Dict[str, Any]] = {}
         self.media_ready = asyncio.Event()
+        self.robot_request_lock = asyncio.Lock()
+        self.robot_request_sequence = int(time.time() * 1000) & 0x3FFFFFFF
 
         self.mqtt_client: Optional[mqtt.Client] = None
         self.last_heartbeat_monotonic = time.monotonic()
@@ -210,6 +214,30 @@ class EdgeGatewayService:
             payload.setdefault("robot_id", self.args.robot_id)
 
             def enqueue() -> None:
+                command_type = str(payload.get("type", "")).strip()
+
+                if command_type in {"move", "turn"}:
+                    previous = self.latest_motion_command
+                    self.latest_motion_command = payload
+
+                    if self.motion_marker_queued:
+                        if previous is not None:
+                            self._send_command_ack(previous, "rejected", "superseded by newer motion command")
+                        return
+
+                    try:
+                        self.command_queue.put_nowait({"__motion_marker__": True})
+                        self.motion_marker_queued = True
+                    except asyncio.QueueFull:
+                        self.latest_motion_command = previous
+                        self._send_command_ack(payload, "rejected", "edge command queue full")
+                    return
+
+                if command_type == "stop" and self.latest_motion_command is not None:
+                    pending_motion = self.latest_motion_command
+                    self.latest_motion_command = None
+                    self._send_command_ack(pending_motion, "rejected", "superseded by stop command")
+
                 try:
                     self.command_queue.put_nowait(payload)
                 except asyncio.QueueFull:
@@ -276,29 +304,113 @@ class EdgeGatewayService:
             "on" if enabled else "off",
         )
 
+    def _next_robot_request_id(self) -> int:
+        self.robot_request_sequence = (self.robot_request_sequence + 1) & 0x7FFFFFFF
+        if self.robot_request_sequence == 0:
+            self.robot_request_sequence = 1
+        return self.robot_request_sequence
+
+    @staticmethod
+    def _cleanup_pending_request(connection: UnitreeWebRTCConnection, request_id: int) -> None:
+        pub_sub = getattr(getattr(connection, "datachannel", None), "pub_sub", None)
+        resolver = getattr(pub_sub, "future_resolver", None)
+        if resolver is None:
+            return
+
+        pending_callbacks = getattr(resolver, "pending_callbacks", None)
+        if isinstance(pending_callbacks, dict):
+            pending_callbacks.pop(request_id, None)
+
+        chunk_storage = getattr(resolver, "chunk_data_storage", None)
+        if isinstance(chunk_storage, dict):
+            chunk_storage.pop(request_id, None)
+
+    async def _robot_request(
+        self,
+        topic: str,
+        api_id: int,
+        parameter: Optional[Any] = None,
+    ) -> Any:
+        async with self.robot_request_lock:
+            connection = self.conn
+            if connection is None:
+                raise RuntimeError("Connection not ready")
+
+            channel = getattr(getattr(connection, "datachannel", None), "channel", None)
+            if getattr(channel, "readyState", "closed") != "open":
+                raise RuntimeError("Robot data channel is not open")
+
+            pub_sub = connection.datachannel.pub_sub
+            resolver = getattr(pub_sub, "future_resolver", None)
+            if resolver is None:
+                raise RuntimeError("Robot response resolver is not available")
+
+            request_id = self._next_robot_request_id()
+            request_payload: Dict[str, Any] = {
+                "header": {
+                    "identity": {
+                        "id": request_id,
+                        "api_id": api_id,
+                    }
+                },
+                "parameter": "",
+            }
+            if parameter is not None:
+                request_payload["parameter"] = (
+                    parameter if isinstance(parameter, str) else json.dumps(parameter)
+                )
+
+            response_future = asyncio.get_running_loop().create_future()
+            resolver.save_resolve(
+                DATA_CHANNEL_TYPE["REQUEST"],
+                topic,
+                response_future,
+                request_id,
+            )
+
+            wire_message = json.dumps(
+                {
+                    "type": DATA_CHANNEL_TYPE["REQUEST"],
+                    "topic": topic,
+                    "data": request_payload,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+
+            try:
+                channel.send(wire_message)
+                return await asyncio.wait_for(
+                    asyncio.shield(response_future),
+                    timeout=self.args.robot_request_timeout_s,
+                )
+            except asyncio.TimeoutError as exc:
+                self._cleanup_pending_request(connection, request_id)
+                response_future.cancel()
+                raise TimeoutError(
+                    f"Robot request timeout api_id={api_id} id={request_id}"
+                ) from exc
+            except asyncio.CancelledError:
+                self._cleanup_pending_request(connection, request_id)
+                response_future.cancel()
+                raise
+            except Exception:
+                self._cleanup_pending_request(connection, request_id)
+                response_future.cancel()
+                raise
+
     async def _sport_request(self, api_id: int, parameter: Optional[Any] = None) -> Any:
-        if self.conn is None:
-            raise RuntimeError("Connection not ready")
-
-        options: Dict[str, Any] = {"api_id": api_id}
-        if parameter is not None:
-            options["parameter"] = parameter
-
-        return await self.conn.datachannel.pub_sub.publish_request_new(
+        return await self._robot_request(
             TOPIC_ALIAS_TO_VALUE["SPORT_MOD"],
-            options,
+            api_id,
+            parameter,
         )
 
     async def _set_motion_mode(self, mode_name: str) -> Any:
-        if self.conn is None:
-            raise RuntimeError("Connection not ready")
-
-        return await self.conn.datachannel.pub_sub.publish_request_new(
+        return await self._robot_request(
             TOPIC_ALIAS_TO_VALUE["MOTION_SWITCHER"],
-            {
-                "api_id": 1002,
-                "parameter": {"name": mode_name},
-            },
+            1002,
+            {"name": mode_name},
         )
 
     async def _on_video_track(self, track) -> None:
@@ -764,12 +876,13 @@ class EdgeGatewayService:
             z = clamp(float(payload.get("angular_z", 0.0)), -self.args.max_angular_speed, self.args.max_angular_speed)
             duration_ms = int(payload.get("duration_ms", self.args.default_move_duration_ms))
 
-            await self._sport_request(int(SPORT_CMD["Move"]), {"x": x, "y": y, "z": z})
             self.move_active = True
             self.last_move_command = {"x": x, "y": y, "z": z}
             self.last_move_sent_at = time.monotonic()
             if duration_ms > 0:
                 self.pending_stop_deadline = time.monotonic() + (duration_ms / 1000.0)
+
+            await self._sport_request(int(SPORT_CMD["Move"]), {"x": x, "y": y, "z": z})
 
             return {
                 "executed": "move",
@@ -785,11 +898,12 @@ class EdgeGatewayService:
             z = direction * clamp(abs(float(payload.get("angular_z", self.args.turn_angular_speed))), 0.05, self.args.max_angular_speed)
             duration_ms = int(payload.get("duration_ms", abs(angle_deg) * self.args.turn_ms_per_degree))
 
-            await self._sport_request(int(SPORT_CMD["Move"]), {"x": 0.0, "y": 0.0, "z": z})
             self.move_active = True
             self.last_move_command = {"x": 0.0, "y": 0.0, "z": z}
             self.last_move_sent_at = time.monotonic()
             self.pending_stop_deadline = time.monotonic() + max(duration_ms / 1000.0, 0.1)
+
+            await self._sport_request(int(SPORT_CMD["Move"]), {"x": 0.0, "y": 0.0, "z": z})
 
             return {
                 "executed": "turn",
@@ -897,6 +1011,14 @@ class EdgeGatewayService:
     async def _command_loop(self) -> None:
         while not self.stop_event.is_set():
             command = await self.command_queue.get()
+
+            if command.get("__motion_marker__"):
+                self.motion_marker_queued = False
+                command = self.latest_motion_command
+                self.latest_motion_command = None
+                if command is None:
+                    continue
+
             command_id = str(command.get("command_id", ""))
 
             valid, reason = self._validate_command(command)
@@ -920,26 +1042,35 @@ class EdgeGatewayService:
             now = time.monotonic()
             heartbeat_age = now - self.last_heartbeat_monotonic
 
-            if self.move_active and self.pending_stop_deadline > 0 and now >= self.pending_stop_deadline:
-                with contextlib.suppress(Exception):
-                    await self._sport_request(int(SPORT_CMD["StopMove"]))
-                self.move_active = False
-                self.pending_stop_deadline = 0.0
-                self._publish_event("auto_stop_timeout", {})
+            deadline_expired = (
+                self.move_active
+                and self.pending_stop_deadline > 0
+                and now >= self.pending_stop_deadline
+            )
+            heartbeat_expired = self.move_active and heartbeat_age > self.args.heartbeat_timeout_s
 
-            if self.move_active and heartbeat_age > self.args.heartbeat_timeout_s:
-                with contextlib.suppress(Exception):
+            if deadline_expired or heartbeat_expired:
+                try:
                     await self._sport_request(int(SPORT_CMD["StopMove"]))
-                self.move_active = False
-                self.pending_stop_deadline = 0.0
-
-                if now - self.last_heartbeat_fault_event_at >= 1.0:
-                    self.last_heartbeat_fault_event_at = now
+                except Exception as exc:
+                    self.pending_stop_deadline = time.monotonic() + self.args.stop_retry_interval_s
+                    if now - self.last_heartbeat_fault_event_at >= 1.0:
+                        self.last_heartbeat_fault_event_at = now
+                        self._publish_event(
+                            "safe_stop_retry",
+                            {
+                                "error": str(exc),
+                                "heartbeat_age_s": round(heartbeat_age, 3),
+                            },
+                        )
+                else:
+                    self.move_active = False
+                    self.pending_stop_deadline = 0.0
                     self._publish_event(
-                        "safe_stop_heartbeat_timeout",
+                        "safe_stop_executed",
                         {
+                            "reason": "heartbeat_timeout" if heartbeat_expired else "duration_timeout",
                             "heartbeat_age_s": round(heartbeat_age, 3),
-                            "timeout_s": self.args.heartbeat_timeout_s,
                         },
                     )
 
@@ -1256,6 +1387,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-reconnect-s", type=float, default=2.0)
     parser.add_argument("--robot-heartbeat-timeout-s", type=float, default=10.0)
     parser.add_argument("--robot-link-grace-s", type=float, default=3.0)
+    parser.add_argument("--robot-request-timeout-s", type=float, default=2.0)
+    parser.add_argument("--stop-retry-interval-s", type=float, default=0.5)
 
     args = parser.parse_args()
 
@@ -1303,6 +1436,12 @@ def parse_args() -> argparse.Namespace:
 
     if args.robot_link_grace_s < 0:
         parser.error("--robot-link-grace-s must be >= 0")
+
+    if args.robot_request_timeout_s <= 0:
+        parser.error("--robot-request-timeout-s must be > 0")
+
+    if args.stop_retry_interval_s <= 0:
+        parser.error("--stop-retry-interval-s must be > 0")
 
     if args.lidar_media_hz <= 0:
         parser.error("--lidar-media-hz must be > 0")

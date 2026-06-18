@@ -251,7 +251,7 @@
         <span id="speedLabel" class="status">50 (Normal)</span>
 
         <label>Loop(ms)</label>
-        <input id="loopMs" class="small" type="number" min="90" max="900" value="140">
+        <input id="loopMs" class="small" type="number" min="150" max="900" value="200">
       </div>
 
       <div class="row" style="margin-top: 8px;">
@@ -311,7 +311,10 @@
       reconnectAttempt: 0,
       connectGeneration: 0,
       controlSending: false,
+      stopSending: false,
       lastMoveActive: false,
+      lastMoveSentAt: 0,
+      lastMoveSignature: "",
       keyState: new Set(),
       token: "",
       apiBase: "",
@@ -692,8 +695,8 @@
     }
 
     function parseLoopMs() {
-      const parsed = Math.round(parseNum(els.loopMs.value, 140));
-      const loopMs = clamp(parsed, 90, 900);
+      const parsed = Math.round(parseNum(els.loopMs.value, 200));
+      const loopMs = clamp(parsed, 150, 900);
       els.loopMs.value = String(loopMs);
       return loopMs;
     }
@@ -825,6 +828,12 @@
         const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
 
         if (active) {
+          const now = Date.now();
+          const signature = `${m.x.toFixed(3)}:${m.y.toFixed(3)}:${m.z.toFixed(3)}`;
+          if (signature === state.lastMoveSignature && now - state.lastMoveSentAt < 300) {
+            return;
+          }
+
           state.controlSending = true;
           try {
             await sendCommand("move", {
@@ -834,6 +843,8 @@
               duration_ms: Math.max(260, Math.round(loopMs * 2)),
             }, 900);
             state.lastMoveActive = true;
+            state.lastMoveSignature = signature;
+            state.lastMoveSentAt = Date.now();
           } catch (err) {
             // Error already recorded in events.
           } finally {
@@ -878,15 +889,26 @@
         state.mediaStatsLoop = null;
       }
       state.lastMoveActive = false;
+      state.lastMoveSignature = "";
+      state.lastMoveSentAt = 0;
       state.controlSending = false;
+      state.stopSending = false;
     }
 
     async function stopRobotNow() {
-      if (!state.connected) return;
+      if (!state.connected || state.stopSending) return;
+
+      state.stopSending = true;
+      state.lastMoveActive = false;
+      state.lastMoveSignature = "";
+      state.lastMoveSentAt = 0;
+
       try {
         await sendCommand("stop", {}, 900);
       } catch (err) {
         // Error already recorded in events.
+      } finally {
+        state.stopSending = false;
       }
     }
 

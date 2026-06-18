@@ -138,6 +138,8 @@ class GatewayClient:
             str(self.args.audio_emit_every),
             "--audio-max-bytes",
             str(self.args.audio_max_bytes),
+            "--request-timeout-s",
+            str(self.args.remote_request_timeout),
             "--max-list-items",
             str(self.args.max_list_items),
             "--max-depth",
@@ -1288,6 +1290,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--ready-timeout", type=float, default=45.0, help="Seconds to wait for gateway ready")
     parser.add_argument("--response-timeout", type=float, default=20.0, help="Seconds to wait for command response")
+    parser.add_argument(
+        "--remote-request-timeout",
+        type=float,
+        default=2.0,
+        help="Timeout for each Raspberry-to-Go2 API request",
+    )
 
     parser.add_argument("--no-gui", action="store_true", help="Disable OpenCV windows")
     parser.add_argument("--no-video-window", action="store_true", help="Do not show camera window")
@@ -1350,6 +1358,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--ready-timeout must be > 0")
     if args.response_timeout <= 0:
         parser.error("--response-timeout must be > 0")
+    if args.remote_request_timeout <= 0:
+        parser.error("--remote-request-timeout must be > 0")
 
     if args.teleop_refresh_hz <= 0:
         parser.error("--teleop-refresh-hz must be > 0")

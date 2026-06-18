@@ -94,6 +94,8 @@ class Go2SshGateway:
         self.stop_event = asyncio.Event()
         self.command_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self.stdout_lock = asyncio.Lock()
+        self.request_lock = asyncio.Lock()
+        self.request_sequence = int(time.time() * 1000) & 0x3FFFFFFF
 
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.stdin_thread: Optional[threading.Thread] = None
@@ -459,19 +461,107 @@ class Go2SshGateway:
             "on" if enabled else "off",
         )
 
+    def _next_request_id(self) -> int:
+        self.request_sequence = (self.request_sequence + 1) & 0x7FFFFFFF
+        if self.request_sequence == 0:
+            self.request_sequence = 1
+        return self.request_sequence
+
+    @staticmethod
+    def _cleanup_pending_request(connection: UnitreeWebRTCConnection, request_id: int) -> None:
+        pub_sub = getattr(getattr(connection, "datachannel", None), "pub_sub", None)
+        resolver = getattr(pub_sub, "future_resolver", None)
+        if resolver is None:
+            return
+
+        pending_callbacks = getattr(resolver, "pending_callbacks", None)
+        if isinstance(pending_callbacks, dict):
+            pending_callbacks.pop(request_id, None)
+
+        chunk_storage = getattr(resolver, "chunk_data_storage", None)
+        if isinstance(chunk_storage, dict):
+            chunk_storage.pop(request_id, None)
+
+    async def _request(
+        self,
+        topic: str,
+        api_id: int,
+        parameter: Optional[Any] = None,
+    ) -> Any:
+        async with self.request_lock:
+            connection = self.conn
+            if connection is None:
+                raise RuntimeError("Connection not ready")
+
+            channel = getattr(getattr(connection, "datachannel", None), "channel", None)
+            if getattr(channel, "readyState", "closed") != "open":
+                raise RuntimeError("Robot data channel is not open")
+
+            pub_sub = connection.datachannel.pub_sub
+            resolver = getattr(pub_sub, "future_resolver", None)
+            if resolver is None:
+                raise RuntimeError("Robot response resolver is not available")
+
+            request_id = self._next_request_id()
+            request_payload: Dict[str, Any] = {
+                "header": {
+                    "identity": {
+                        "id": request_id,
+                        "api_id": api_id,
+                    }
+                },
+                "parameter": "",
+            }
+            if parameter is not None:
+                request_payload["parameter"] = (
+                    parameter if isinstance(parameter, str) else json.dumps(parameter)
+                )
+
+            response_future = asyncio.get_running_loop().create_future()
+            resolver.save_resolve(
+                DATA_CHANNEL_TYPE["REQUEST"],
+                topic,
+                response_future,
+                request_id,
+            )
+
+            wire_message = json.dumps(
+                {
+                    "type": DATA_CHANNEL_TYPE["REQUEST"],
+                    "topic": topic,
+                    "data": request_payload,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+
+            try:
+                channel.send(wire_message)
+                return await asyncio.wait_for(
+                    asyncio.shield(response_future),
+                    timeout=self.args.request_timeout_s,
+                )
+            except asyncio.TimeoutError as exc:
+                self._cleanup_pending_request(connection, request_id)
+                response_future.cancel()
+                raise TimeoutError(
+                    f"Robot request timeout api_id={api_id} id={request_id}"
+                ) from exc
+            except asyncio.CancelledError:
+                self._cleanup_pending_request(connection, request_id)
+                response_future.cancel()
+                raise
+            except Exception:
+                self._cleanup_pending_request(connection, request_id)
+                response_future.cancel()
+                raise
+
     async def _sport_request(self, api_id: int, parameter: Optional[Any] = None) -> Any:
-        if self.conn is None:
-            raise RuntimeError("Connection not ready")
-
-        options: Dict[str, Any] = {"api_id": api_id}
-        if parameter is not None:
-            options["parameter"] = parameter
-
-        response = await self.conn.datachannel.pub_sub.publish_request_new(
+        return await self._request(
             TOPIC_ALIAS_TO_VALUE["SPORT_MOD"],
-            options,
+            api_id,
+            parameter,
         )
-        return response
 
     async def _audiohub_request(self, api_id: int, parameter: Optional[Any] = None) -> Any:
         if self.conn is None:
@@ -480,15 +570,10 @@ class Go2SshGateway:
         if parameter is None:
             parameter = {}
 
-        options: Dict[str, Any] = {"api_id": api_id}
-        if isinstance(parameter, str):
-            options["parameter"] = parameter
-        else:
-            options["parameter"] = json.dumps(parameter, ensure_ascii=True)
-
-        response = await self.conn.datachannel.pub_sub.publish_request_new(
+        response = await self._request(
             TOPIC_ALIAS_TO_VALUE["AUDIO_HUB_REQ"],
-            options,
+            api_id,
+            parameter,
         )
         return response
 
@@ -747,10 +832,7 @@ class Go2SshGateway:
                 topic_value = self._resolve_topic(str(command["topic"]))
                 api_id = int(command["api_id"])
                 parameter = command.get("parameter")
-                options: Dict[str, Any] = {"api_id": api_id}
-                if parameter is not None:
-                    options["parameter"] = parameter
-                response = await self.conn.datachannel.pub_sub.publish_request_new(topic_value, options)
+                response = await self._request(topic_value, api_id, parameter)
                 await self._send_response(cmd_id, True, response)
                 return
 
@@ -795,12 +877,10 @@ class Go2SshGateway:
                 if self.conn is None:
                     raise RuntimeError("Connection not ready")
                 name = str(command["name"])
-                response = await self.conn.datachannel.pub_sub.publish_request_new(
+                response = await self._request(
                     TOPIC_ALIAS_TO_VALUE["MOTION_SWITCHER"],
-                    {
-                        "api_id": 1002,
-                        "parameter": {"name": name},
-                    },
+                    1002,
+                    {"name": name},
                 )
                 await self._send_response(cmd_id, True, response)
                 return
@@ -808,9 +888,9 @@ class Go2SshGateway:
             if op == "get_motion_mode":
                 if self.conn is None:
                     raise RuntimeError("Connection not ready")
-                response = await self.conn.datachannel.pub_sub.publish_request_new(
+                response = await self._request(
                     TOPIC_ALIAS_TO_VALUE["MOTION_SWITCHER"],
-                    {"api_id": 1001},
+                    1001,
                 )
                 await self._send_response(cmd_id, True, response)
                 return
@@ -1106,6 +1186,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Stop gateway when stdin closes",
     )
+    parser.add_argument(
+        "--request-timeout-s",
+        type=float,
+        default=2.0,
+        help="Timeout for robot API requests",
+    )
 
     parser.add_argument(
         "--max-list-items",
@@ -1145,6 +1231,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.audio_max_bytes < 0:
         parser.error("--audio-max-bytes must be >= 0")
+
+    if args.request_timeout_s <= 0:
+        parser.error("--request-timeout-s must be > 0")
 
     if args.max_list_items < 0:
         parser.error("--max-list-items must be >= 0")

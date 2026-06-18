@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import base64
 import contextlib
 import json
 import time
@@ -86,6 +87,7 @@ class CoreRuntime:
         self.frontend_queues: Dict[WebSocket, asyncio.Queue[str]] = {}
         self.frontend_sender_tasks: Dict[WebSocket, asyncio.Task[None]] = {}
         self.edge_media_sockets: Dict[str, WebSocket] = {}
+        self.edge_media_send_locks: Dict[str, asyncio.Lock] = {}
 
         self.latest_telemetry: Dict[str, Dict[str, Any]] = {}
         self.latest_media: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
@@ -189,6 +191,28 @@ class CoreRuntime:
                 self.frontend_sender_tasks.pop(ws, None)
             with contextlib.suppress(Exception):
                 await ws.close()
+
+    async def _send_edge_message(self, robot_id: str, payload: Dict[str, Any]) -> bool:
+        ws = self.edge_media_sockets.get(robot_id)
+        if ws is None:
+            return False
+
+        lock = self.edge_media_send_locks.setdefault(robot_id, asyncio.Lock())
+        text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+        try:
+            async with lock:
+                if self.edge_media_sockets.get(robot_id) is not ws:
+                    return False
+                await asyncio.wait_for(
+                    ws.send_text(text),
+                    timeout=self.args.edge_send_timeout_s,
+                )
+            return True
+        except Exception:
+            if self.edge_media_sockets.get(robot_id) is ws:
+                self.edge_media_sockets.pop(robot_id, None)
+            return False
 
     def _setup_cors(self) -> None:
         origins = [x.strip() for x in self.args.cors_origin if x.strip()]
@@ -608,6 +632,7 @@ class CoreRuntime:
             self.frontend_queues[ws] = queue
             sender_task = asyncio.create_task(self._frontend_sender_loop(ws, queue))
             self.frontend_sender_tasks[ws] = sender_task
+            mic_robots: Set[str] = set()
 
             for robot_id, telemetry in self.latest_telemetry.items():
                 self._enqueue_frontend(
@@ -637,9 +662,79 @@ class CoreRuntime:
                             robot_id = str(message.get("robot_id", "")).strip()
                             if robot_id:
                                 self.last_control_activity[robot_id] = time.time()
+                            continue
+
+                        op = str(message.get("op", "")).strip()
+                        if op not in {"mic_start", "mic_audio", "mic_stop"}:
+                            continue
+
+                        if auth["role"] not in {"operator", "admin"}:
+                            self._enqueue_frontend(
+                                ws,
+                                {
+                                    "type": "talkback_status",
+                                    "ok": False,
+                                    "error": "role not allowed to use microphone",
+                                },
+                            )
+                            continue
+
+                        robot_id = str(message.get("robot_id", "")).strip()
+                        if not robot_id:
+                            continue
+
+                        edge_payload: Dict[str, Any] = {"op": op}
+
+                        if op == "mic_audio":
+                            data = message.get("data", {})
+                            if not isinstance(data, dict):
+                                continue
+
+                            encoded = data.get("audio_base64")
+                            if not isinstance(encoded, str) or not encoded:
+                                continue
+                            if len(encoded) > self.args.talkback_max_base64_chars:
+                                continue
+
+                            with contextlib.suppress(Exception):
+                                decoded = base64.b64decode(encoded, validate=True)
+                                if len(decoded) > self.args.talkback_max_packet_bytes:
+                                    continue
+
+                                edge_payload["data"] = {
+                                    "audio_format": "pcm_s16le",
+                                    "sample_rate": 48000,
+                                    "channels": 1,
+                                    "audio_base64": encoded,
+                                }
+
+                            if "data" not in edge_payload:
+                                continue
+
+                        sent = await self._send_edge_message(robot_id, edge_payload)
+
+                        if op == "mic_start" and sent:
+                            mic_robots.add(robot_id)
+                        elif op == "mic_stop":
+                            mic_robots.discard(robot_id)
+
+                        if op != "mic_audio":
+                            self._enqueue_frontend(
+                                ws,
+                                {
+                                    "type": "talkback_status",
+                                    "robot_id": robot_id,
+                                    "active": op == "mic_start" and sent,
+                                    "ok": sent,
+                                    "error": "" if sent else "edge media offline",
+                                },
+                            )
             except WebSocketDisconnect:
                 pass
             finally:
+                for robot_id in mic_robots:
+                    with contextlib.suppress(Exception):
+                        await self._send_edge_message(robot_id, {"op": "mic_stop"})
                 self.frontend_sockets.discard(ws)
                 self.frontend_queues.pop(ws, None)
                 sender_task = self.frontend_sender_tasks.pop(ws, None)
@@ -657,6 +752,7 @@ class CoreRuntime:
             await ws.accept()
             previous_ws = self.edge_media_sockets.get(robot_id)
             self.edge_media_sockets[robot_id] = ws
+            self.edge_media_send_locks.setdefault(robot_id, asyncio.Lock())
             if previous_ws is not None and previous_ws is not ws:
                 with contextlib.suppress(Exception):
                     await previous_ws.close(code=1012)
@@ -687,6 +783,7 @@ class CoreRuntime:
             finally:
                 if self.edge_media_sockets.get(robot_id) is ws:
                     self.edge_media_sockets.pop(robot_id, None)
+                    self.edge_media_send_locks.pop(robot_id, None)
                 self._audit("edge_media_disconnected", {"robot_id": robot_id})
 
 
@@ -726,6 +823,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--edge-media-token", default="edge-media-dev-token")
     parser.add_argument("--frontend-queue-size", type=int, default=16)
     parser.add_argument("--frontend-send-timeout-s", type=float, default=2.0)
+    parser.add_argument("--edge-send-timeout-s", type=float, default=1.0)
+    parser.add_argument("--talkback-max-packet-bytes", type=int, default=32768)
+    parser.add_argument("--talkback-max-base64-chars", type=int, default=65536)
 
     parser.add_argument("--audit-log", default="./server/audit/server_audit.jsonl")
     parser.add_argument("--replay-max-items", type=int, default=2000)
@@ -772,6 +872,15 @@ def parse_args() -> argparse.Namespace:
 
     if args.frontend_send_timeout_s <= 0:
         parser.error("--frontend-send-timeout-s must be > 0")
+
+    if args.edge_send_timeout_s <= 0:
+        parser.error("--edge-send-timeout-s must be > 0")
+
+    if args.talkback_max_packet_bytes <= 0:
+        parser.error("--talkback-max-packet-bytes must be > 0")
+
+    if args.talkback_max_base64_chars <= 0:
+        parser.error("--talkback-max-base64-chars must be > 0")
 
     return args
 

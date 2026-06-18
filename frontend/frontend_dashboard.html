@@ -267,14 +267,17 @@
 
         <button id="applyMediaBtn" class="primary">✓ Aplicar media</button>
         <button id="unlockAudioBtn">Activar audio web</button>
+        <button id="micBtn">Activar micrófono</button>
       </div>
 
       <div class="row" style="margin-top: 8px;">
         <span id="mediaStatus" class="status">media idle</span>
         <span id="audioStatus" class="status">audio bloqueado</span>
+        <span id="micStatus" class="status">micrófono apagado</span>
       </div>
       <p class="hint">
         Teclado: <span class="kbd">WASD o Flechas</span> mover/girar, <span class="kbd">Q/E</span> lateral, <span class="kbd">Shift</span> boost, <span class="kbd">Space</span> stop, <span class="kbd">L</span> lidar, <span class="kbd">P</span> audio.
+        El navegador permite micrófono solamente desde HTTPS, localhost o un archivo local autorizado.
       </p>
     </div>
 
@@ -341,6 +344,18 @@
         lastChannels: 0,
         lastDecodeErrorAt: 0,
       },
+      mic: {
+        active: false,
+        starting: false,
+        stopping: false,
+        stream: null,
+        ctx: null,
+        source: null,
+        processor: null,
+        sink: null,
+        packets: 0,
+        dropped: 0,
+      },
     };
 
     const els = {
@@ -363,8 +378,10 @@
       audioMaxBytes: document.getElementById("audioMaxBytes"),
       applyMediaBtn: document.getElementById("applyMediaBtn"),
       unlockAudioBtn: document.getElementById("unlockAudioBtn"),
+      micBtn: document.getElementById("micBtn"),
       mediaStatus: document.getElementById("mediaStatus"),
       audioStatus: document.getElementById("audioStatus"),
+      micStatus: document.getElementById("micStatus"),
     };
 
     function clamp(value, min, max) {
@@ -530,6 +547,245 @@
         out[i] = bin.charCodeAt(i);
       }
       return out;
+    }
+
+    function bytesToBase64(bytes) {
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        const chunk = bytes.subarray(offset, offset + chunkSize);
+        binary += String.fromCharCode(...chunk);
+      }
+      return btoa(binary);
+    }
+
+    function sendLiveMessage(payload, maxBufferedBytes = 256 * 1024) {
+      const ws = state.ws;
+      if (!state.connected || !ws || ws.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+      if (ws.bufferedAmount > maxBufferedBytes) {
+        return false;
+      }
+      ws.send(JSON.stringify(payload));
+      return true;
+    }
+
+    function updateMicStatus() {
+      if (state.mic.starting) {
+        setBadge(els.micStatus, "solicitando permiso...", "");
+        els.micBtn.textContent = "Activando...";
+        els.micBtn.disabled = true;
+        return;
+      }
+
+      if (state.mic.stopping) {
+        setBadge(els.micStatus, "apagando micrófono...", "");
+        els.micBtn.disabled = true;
+        return;
+      }
+
+      els.micBtn.disabled = false;
+      if (state.mic.active) {
+        setBadge(
+          els.micStatus,
+          `hablando al perro · pkt:${state.mic.packets} drop:${state.mic.dropped}`,
+          "ok"
+        );
+        els.micBtn.textContent = "Apagar micrófono";
+        return;
+      }
+
+      setBadge(
+        els.micStatus,
+        state.connected ? "micrófono apagado" : "micrófono offline",
+        state.connected ? "" : "err"
+      );
+      els.micBtn.textContent = "Activar micrófono";
+    }
+
+    function floatToPcm16(samples) {
+      const bytes = new Uint8Array(samples.length * 2);
+      const view = new DataView(bytes.buffer);
+      for (let i = 0; i < samples.length; i += 1) {
+        const sample = clamp(samples[i], -1, 1);
+        const value = sample < 0
+          ? Math.round(sample * 32768)
+          : Math.round(sample * 32767);
+        view.setInt16(i * 2, value, true);
+      }
+      return bytes;
+    }
+
+    async function stopMicrophone(sendStop = true, reason = "") {
+      const mic = state.mic;
+      if (mic.stopping) return;
+
+      const hadResources = mic.active || mic.starting || mic.stream || mic.ctx;
+      if (!hadResources) {
+        updateMicStatus();
+        return;
+      }
+
+      mic.stopping = true;
+      mic.starting = false;
+      updateMicStatus();
+
+      if (sendStop) {
+        sendLiveMessage({
+          op: "mic_stop",
+          robot_id: state.robotId,
+        });
+      }
+
+      mic.active = false;
+
+      if (mic.processor) {
+        mic.processor.onaudioprocess = null;
+        try { mic.processor.disconnect(); } catch (err) { }
+      }
+      if (mic.source) {
+        try { mic.source.disconnect(); } catch (err) { }
+      }
+      if (mic.sink) {
+        try { mic.sink.disconnect(); } catch (err) { }
+      }
+      if (mic.stream) {
+        for (const track of mic.stream.getTracks()) {
+          track.stop();
+        }
+      }
+      if (mic.ctx && mic.ctx.state !== "closed") {
+        try { await mic.ctx.close(); } catch (err) { }
+      }
+
+      mic.stream = null;
+      mic.ctx = null;
+      mic.source = null;
+      mic.processor = null;
+      mic.sink = null;
+      mic.stopping = false;
+
+      if (state.audio.gain) {
+        state.audio.gain.gain.value = 1.0;
+      }
+
+      if (reason) {
+        addEvent("microphone_stopped", reason);
+      }
+      updateMicStatus();
+    }
+
+    async function startMicrophone() {
+      const mic = state.mic;
+      if (mic.active || mic.starting || mic.stopping) return;
+
+      if (!state.connected || !state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        addEvent("microphone_error", "Conectate al servidor antes de activar el micrófono");
+        updateMicStatus();
+        return;
+      }
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        addEvent(
+          "microphone_error",
+          "Micrófono bloqueado: abrí el panel desde HTTPS, localhost o como archivo local"
+        );
+        return;
+      }
+
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) {
+        addEvent("microphone_error", "AudioContext no soportado por este navegador");
+        return;
+      }
+
+      mic.starting = true;
+      mic.packets = 0;
+      mic.dropped = 0;
+      updateMicStatus();
+
+      try {
+        mic.stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
+
+        if (!state.connected || !state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          throw new Error("La conexión se cerró mientras se activaba el micrófono");
+        }
+
+        mic.ctx = new Ctx({
+          latencyHint: "interactive",
+          sampleRate: 48000,
+        });
+        if (mic.ctx.state !== "running") {
+          await mic.ctx.resume();
+        }
+
+        mic.source = mic.ctx.createMediaStreamSource(mic.stream);
+        mic.processor = mic.ctx.createScriptProcessor(2048, 1, 1);
+        mic.sink = mic.ctx.createGain();
+        mic.sink.gain.value = 0;
+
+        mic.processor.onaudioprocess = (event) => {
+          if (!mic.active) return;
+
+          const input = event.inputBuffer.getChannelData(0);
+          const mono48k = resampleMono(input, mic.ctx.sampleRate, 48000);
+          const pcm = floatToPcm16(mono48k);
+          const sent = sendLiveMessage({
+            op: "mic_audio",
+            robot_id: state.robotId,
+            data: {
+              audio_format: "pcm_s16le",
+              sample_rate: 48000,
+              channels: 1,
+              audio_base64: bytesToBase64(pcm),
+            },
+          });
+
+          if (sent) {
+            mic.packets += 1;
+          } else {
+            mic.dropped += 1;
+          }
+        };
+
+        mic.source.connect(mic.processor);
+        mic.processor.connect(mic.sink);
+        mic.sink.connect(mic.ctx.destination);
+
+        if (!sendLiveMessage({
+          op: "mic_start",
+          robot_id: state.robotId,
+        })) {
+          throw new Error("No se pudo enviar la activación al servidor");
+        }
+
+        mic.active = true;
+        mic.starting = false;
+
+        // Evita que el parlante de la computadora vuelva a entrar por el micrófono.
+        if (state.audio.gain) {
+          state.audio.gain.gain.value = 0;
+        }
+
+        addEvent("microphone_started", {
+          input_sample_rate: mic.ctx.sampleRate,
+          output_sample_rate: 48000,
+        });
+        updateMicStatus();
+      } catch (err) {
+        mic.starting = false;
+        addEvent("microphone_error", normalizeError(err));
+        await stopMicrophone(false);
+      }
     }
 
     function setupAudioPipeline() {
@@ -743,11 +999,40 @@
           return;
         }
 
+        if (stream === "talkback_status") {
+          handleTalkbackStatus(data);
+          return;
+        }
+
+        return;
+      }
+
+      if (type === "talkback_status") {
+        if (msg.robot_id && msg.robot_id !== state.robotId) return;
+        handleTalkbackStatus(msg);
         return;
       }
 
       if (type === "event" || type === "prediction" || type === "command_ack" || type === "command_out") {
         addEvent(type, msg.data || msg);
+      }
+    }
+
+    function handleTalkbackStatus(status) {
+      if (!status || typeof status !== "object") return;
+
+      if (!status.ok) {
+        addEvent("microphone_error", status.error || "No se pudo activar el micrófono");
+        if (state.mic.active || state.mic.starting) {
+          void stopMicrophone(false);
+        }
+        return;
+      }
+
+      if (status.active) {
+        setBadge(els.micStatus, "micrófono conectado al perro", "ok");
+      } else if (!state.mic.stopping) {
+        updateMicStatus();
       }
     }
 
@@ -830,6 +1115,7 @@
 
       if (!state.audio.unlocked) {
         setBadge(els.audioStatus, "audio bloqueado (click Activar audio web)", "err");
+        updateMicStatus();
         return;
       }
 
@@ -838,6 +1124,7 @@
         `audio ${state.audio.lastSampleRate || "--"}Hz ${state.audio.lastChannels || "--"}ch pkt:${state.audio.packets} drop:${state.audio.dropped} under:${state.audio.underruns}`,
         "ok"
       );
+      updateMicStatus();
     }
 
     async function applyMediaSettings() {
@@ -1098,6 +1385,7 @@
         if (state.ws !== ws || generation !== state.connectGeneration) return;
         state.ws = null;
         state.connected = false;
+        void stopMicrophone(false, "conexión cerrada");
         resetAudioQueue();
         setStatus("desconectado", false);
         stopControlLoop();
@@ -1150,6 +1438,14 @@
 
     els.unlockAudioBtn.addEventListener("click", async () => {
       await ensureAudioContext(true);
+    });
+
+    els.micBtn.addEventListener("click", async () => {
+      if (state.mic.active || state.mic.starting) {
+        await stopMicrophone(true, "apagado por el usuario");
+      } else {
+        await startMicrophone();
+      }
     });
 
     els.enableVideo.addEventListener("change", async () => {
@@ -1226,8 +1522,20 @@
       void stopRobotNow();
     });
 
+    window.addEventListener("beforeunload", () => {
+      if (state.mic.active) {
+        sendLiveMessage({ op: "mic_stop", robot_id: state.robotId });
+      }
+      if (state.mic.stream) {
+        for (const track of state.mic.stream.getTracks()) {
+          track.stop();
+        }
+      }
+    });
+
     updateSpeedUi();
     updateMediaStatus();
+    updateMicStatus();
   </script>
 </body>
 </html>

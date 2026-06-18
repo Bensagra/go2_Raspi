@@ -260,7 +260,7 @@
         <label class="inline-check"><input id="enableAudio" type="checkbox" checked>Audio</label>
 
         <label>Audio every</label>
-        <input id="audioEmitEvery" class="small" type="number" min="1" max="50" value="1">
+        <input id="audioEmitEvery" class="small" type="number" min="1" max="10" value="2">
 
         <label>Audio max bytes</label>
         <input id="audioMaxBytes" style="width:120px" type="number" min="0" max="262144" value="24576">
@@ -328,9 +328,15 @@
       audio: {
         ctx: null,
         unlocked: false,
-        nextPlayTime: 0,
+        processor: null,
+        gain: null,
+        filters: [],
+        queue: [],
+        queueOffset: 0,
+        queuedSamples: 0,
         packets: 0,
         dropped: 0,
+        underruns: 0,
         lastSampleRate: 0,
         lastChannels: 0,
         lastDecodeErrorAt: 0,
@@ -526,6 +532,94 @@
       return out;
     }
 
+    function setupAudioPipeline() {
+      const audio = state.audio;
+      if (!audio.ctx || audio.processor) return;
+
+      const bufferSize = 2048;
+      audio.processor = audio.ctx.createScriptProcessor(bufferSize, 0, 1);
+      audio.gain = audio.ctx.createGain();
+      audio.gain.gain.value = 1.0;
+      audio.filters = [
+        audio.ctx.createBiquadFilter(),
+        audio.ctx.createBiquadFilter(),
+        audio.ctx.createBiquadFilter(),
+      ];
+
+      audio.filters[0].type = "highpass";
+      audio.filters[0].frequency.value = 80;
+      audio.filters[0].Q.value = 0.707;
+
+      audio.filters[1].type = "notch";
+      audio.filters[1].frequency.value = 120;
+      audio.filters[1].Q.value = 25;
+
+      audio.filters[2].type = "notch";
+      audio.filters[2].frequency.value = 240;
+      audio.filters[2].Q.value = 25;
+
+      audio.processor.onaudioprocess = (event) => {
+        const output = event.outputBuffer.getChannelData(0);
+        let written = 0;
+
+        while (written < output.length && audio.queue.length > 0) {
+          const chunk = audio.queue[0];
+          const available = chunk.length - audio.queueOffset;
+          const needed = output.length - written;
+          const count = Math.min(available, needed);
+
+          output.set(
+            chunk.subarray(audio.queueOffset, audio.queueOffset + count),
+            written
+          );
+
+          written += count;
+          audio.queueOffset += count;
+          audio.queuedSamples -= count;
+
+          if (audio.queueOffset >= chunk.length) {
+            audio.queue.shift();
+            audio.queueOffset = 0;
+          }
+        }
+
+        if (written < output.length) {
+          output.fill(0, written);
+          audio.underruns += 1;
+        }
+      };
+
+      audio.processor.connect(audio.filters[0]);
+      audio.filters[0].connect(audio.filters[1]);
+      audio.filters[1].connect(audio.filters[2]);
+      audio.filters[2].connect(audio.gain);
+      audio.gain.connect(audio.ctx.destination);
+    }
+
+    function resetAudioQueue() {
+      state.audio.queue.length = 0;
+      state.audio.queueOffset = 0;
+      state.audio.queuedSamples = 0;
+    }
+
+    function resampleMono(samples, sourceRate, targetRate) {
+      if (sourceRate === targetRate || samples.length === 0) return samples;
+
+      const outputLength = Math.max(1, Math.round(samples.length * targetRate / sourceRate));
+      const output = new Float32Array(outputLength);
+      const scale = sourceRate / targetRate;
+
+      for (let i = 0; i < outputLength; i += 1) {
+        const position = i * scale;
+        const left = Math.floor(position);
+        const right = Math.min(left + 1, samples.length - 1);
+        const fraction = position - left;
+        output[i] = samples[left] + (samples[right] - samples[left]) * fraction;
+      }
+
+      return output;
+    }
+
     async function ensureAudioContext(userGesture = false) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) {
@@ -534,7 +628,11 @@
       }
 
       if (!state.audio.ctx) {
-        state.audio.ctx = new Ctx({ latencyHint: "interactive" });
+        state.audio.ctx = new Ctx({
+          latencyHint: "interactive",
+          sampleRate: 48000,
+        });
+        setupAudioPipeline();
       }
 
       if (state.audio.ctx.state !== "running") {
@@ -552,9 +650,6 @@
       }
 
       state.audio.unlocked = state.audio.ctx.state === "running";
-      if (state.audio.unlocked && state.audio.nextPlayTime <= 0) {
-        state.audio.nextPlayTime = state.audio.ctx.currentTime + 0.03;
-      }
       updateMediaStatus();
       return state.audio.unlocked;
     }
@@ -578,37 +673,32 @@
         const frameCount = Math.floor(bytes.byteLength / bytesPerFrame);
         if (frameCount <= 0) return;
 
-        const alignedLen = frameCount * bytesPerFrame;
-        const aligned = alignedLen === bytes.byteLength ? bytes : bytes.subarray(0, alignedLen);
-        const pcm = new Int16Array(aligned.buffer, aligned.byteOffset, frameCount * channels);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, frameCount * bytesPerFrame);
+        const mono = new Float32Array(frameCount);
 
-        const ctx = state.audio.ctx;
-        const buffer = ctx.createBuffer(channels, frameCount, sampleRate);
-
-        for (let ch = 0; ch < channels; ch += 1) {
-          const out = buffer.getChannelData(ch);
-          let idx = ch;
-          for (let i = 0; i < frameCount; i += 1) {
-            out[i] = pcm[idx] / 32768;
-            idx += channels;
+        for (let i = 0; i < frameCount; i += 1) {
+          let sum = 0;
+          for (let ch = 0; ch < channels; ch += 1) {
+            sum += view.getInt16((i * channels + ch) * 2, true) / 32768;
           }
+          mono[i] = sum / channels;
         }
 
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(ctx.destination);
+        const output = resampleMono(mono, sampleRate, state.audio.ctx.sampleRate);
+        const maxQueued = Math.round(state.audio.ctx.sampleRate * 0.35);
 
-        const now = ctx.currentTime;
-        if (!Number.isFinite(state.audio.nextPlayTime) || state.audio.nextPlayTime < now + 0.01) {
-          state.audio.nextPlayTime = now + 0.03;
-        }
-        if (state.audio.nextPlayTime - now > 0.25) {
+        while (
+          state.audio.queue.length > 0
+          && state.audio.queuedSamples + output.length > maxQueued
+        ) {
+          const removed = state.audio.queue.shift();
+          state.audio.queuedSamples -= removed.length - state.audio.queueOffset;
+          state.audio.queueOffset = 0;
           state.audio.dropped += 1;
-          return;
         }
 
-        src.start(state.audio.nextPlayTime);
-        state.audio.nextPlayTime += buffer.duration;
+        state.audio.queue.push(output);
+        state.audio.queuedSamples += output.length;
         state.audio.packets += 1;
         state.audio.lastSampleRate = sampleRate;
         state.audio.lastChannels = channels;
@@ -745,7 +835,7 @@
 
       setBadge(
         els.audioStatus,
-        `audio on ${state.audio.lastSampleRate || "--"}Hz ${state.audio.lastChannels || "--"}ch pkt:${state.audio.packets} drop:${state.audio.dropped}`,
+        `audio ${state.audio.lastSampleRate || "--"}Hz ${state.audio.lastChannels || "--"}ch pkt:${state.audio.packets} drop:${state.audio.dropped} under:${state.audio.underruns}`,
         "ok"
       );
     }
@@ -756,7 +846,7 @@
         return;
       }
 
-      const audioEmitEvery = Math.max(1, Math.round(parseNum(els.audioEmitEvery.value, 1)));
+      const audioEmitEvery = Math.max(1, Math.min(10, Math.round(parseNum(els.audioEmitEvery.value, 2))));
       const audioMaxBytes = Math.max(0, Math.round(parseNum(els.audioMaxBytes.value, 24576)));
 
       els.audioEmitEvery.value = String(audioEmitEvery);
@@ -764,6 +854,8 @@
 
       if (els.enableAudio.checked) {
         await ensureAudioContext(false);
+      } else {
+        resetAudioQueue();
       }
 
       const commands = [
@@ -771,8 +863,8 @@
           type: "set_camera_stream",
           payload: {
             enabled: !!els.enableVideo.checked,
-            emit_every: 2,
-            jpeg_quality: 60,
+            emit_every: 3,
+            jpeg_quality: 55,
           },
         },
         {
@@ -1006,7 +1098,7 @@
         if (state.ws !== ws || generation !== state.connectGeneration) return;
         state.ws = null;
         state.connected = false;
-        state.audio.nextPlayTime = 0;
+        resetAudioQueue();
         setStatus("desconectado", false);
         stopControlLoop();
         updateMediaStatus();

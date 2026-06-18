@@ -780,7 +780,16 @@ def main() -> None:
     args = parse_args()
     runtime = CoreRuntime(args)
 
-    uvicorn.run(runtime.app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(
+        runtime.app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        ws_max_queue=16,
+        ws_ping_interval=15.0,
+        ws_ping_timeout=15.0,
+        ws_per_message_deflate=False,
+    )
 
 
 if __name__ == "__main__":

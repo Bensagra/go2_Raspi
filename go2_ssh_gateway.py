@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
+from av.audio.resampler import AudioResampler
 
 try:
     from unitree_webrtc_connect import (
@@ -116,6 +117,7 @@ class Go2SshGateway:
         self.audio_max_bytes = args.audio_max_bytes
         self.audio_frame_count = 0
         self.last_audio_error_at = 0.0
+        self.audio_resampler = AudioResampler(format="s16", layout="mono", rate=48000)
 
         self.video_task: Optional[asyncio.Task[None]] = None
 
@@ -321,52 +323,26 @@ class Go2SshGateway:
             await self.emit(event)
 
     def _audio_frame_to_pcm_payload(self, frame) -> Dict[str, Any]:
-        array = frame.to_ndarray()
-        if array is None:
-            raise ValueError("Audio frame payload is empty")
+        if int(getattr(frame, "sample_rate", 0) or 0) <= 0:
+            frame.sample_rate = 48000
 
-        array = np.asarray(array)
+        output_frames = self.audio_resampler.resample(frame)
+        chunks: List[bytes] = []
+        samples_per_channel = 0
 
-        layout = getattr(frame, "layout", None)
-        layout_channels = getattr(layout, "channels", None)
-        channels = len(layout_channels) if layout_channels else 1
-        channels = max(channels, 1)
+        for output_frame in output_frames:
+            array = np.asarray(output_frame.to_ndarray())
+            if array.size == 0:
+                continue
+            pcm = np.ascontiguousarray(array.reshape(-1), dtype="<i2")
+            chunks.append(pcm.tobytes())
+            samples_per_channel += int(pcm.size)
 
-        if array.size % channels != 0:
-            raise ValueError(f"Audio samples={array.size} not divisible by channels={channels}")
+        pcm_bytes = b"".join(chunks)
+        if not pcm_bytes:
+            raise ValueError("Audio resampler returned no samples")
 
-        frame_format = getattr(frame, "format", None)
-        is_planar = bool(getattr(frame_format, "is_planar", False))
-
-        if is_planar:
-            array = array.reshape(channels, -1).T
-        else:
-            array = array.reshape(-1, channels)
-
-        if np.issubdtype(array.dtype, np.floating):
-            array = (np.clip(array, -1.0, 1.0) * 32767.0).astype(np.int16)
-        elif array.dtype == np.int16:
-            pass
-        elif array.dtype == np.uint8:
-            array = ((array.astype(np.int16) - 128) << 8).astype(np.int16)
-        elif np.issubdtype(array.dtype, np.unsignedinteger):
-            info = np.iinfo(array.dtype)
-            midpoint = float(info.max + 1) / 2.0
-            normalized = (array.astype(np.float64) - midpoint) / midpoint
-            array = (np.clip(normalized, -1.0, 1.0) * 32767.0).astype(np.int16)
-        elif np.issubdtype(array.dtype, np.integer):
-            info = np.iinfo(array.dtype)
-            scale = float(max(abs(info.min), info.max))
-            normalized = array.astype(np.float64) / scale
-            array = (np.clip(normalized, -1.0, 1.0) * 32767.0).astype(np.int16)
-        else:
-            raise ValueError(f"Unsupported audio dtype: {array.dtype}")
-
-        array = np.ascontiguousarray(array, dtype="<i2")
-
-        samples_per_channel = int(array.shape[0])
-
-        pcm_bytes = array.tobytes()
+        channels = 1
         total_bytes = len(pcm_bytes)
 
         truncated = False
@@ -386,9 +362,9 @@ class Go2SshGateway:
             "pcm_bytes": pcm_bytes,
             "channels": channels,
             "samples_per_channel": samples_per_channel,
-            "sample_rate": int(getattr(frame, "sample_rate", 0) or 48000),
-            "layout": getattr(getattr(frame, "layout", None), "name", "unknown"),
-            "frame_format": getattr(getattr(frame, "format", None), "name", "unknown"),
+            "sample_rate": 48000,
+            "layout": "mono",
+            "frame_format": "s16",
             "total_bytes": total_bytes,
             "truncated": truncated,
         }
@@ -1033,6 +1009,7 @@ class Go2SshGateway:
     async def _connect(self) -> None:
         self.conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip=self.args.ip)
         await self.conn.connect()
+        self.audio_resampler = AudioResampler(format="s16", layout="mono", rate=48000)
 
         self.conn.video.add_track_callback(self._on_video_track)
         self.conn.audio.add_track_callback(self._on_audio_frame)

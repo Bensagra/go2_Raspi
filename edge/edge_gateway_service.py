@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import paho.mqtt.client as mqtt
+from av.audio.resampler import AudioResampler
 
 try:
     import websockets
@@ -88,6 +89,9 @@ class EdgeGatewayService:
         self.audio_max_bytes = args.audio_max_bytes
         self.audio_frame_count = 0
         self.last_audio_error_at = 0.0
+        self.audio_resampler = AudioResampler(format="s16", layout="mono", rate=48000)
+        self.audio_pcm_buffer = bytearray()
+        self.audio_buffered_frames = 0
 
         self.lidar_enabled = args.enable_lidar
         self.last_lidar_media_at = 0.0
@@ -98,6 +102,11 @@ class EdgeGatewayService:
         self.last_move_sent_at = 0.0
 
         self.last_heartbeat_fault_event_at = 0.0
+
+    def _reset_audio_pipeline(self) -> None:
+        self.audio_resampler = AudioResampler(format="s16", layout="mono", rate=48000)
+        self.audio_pcm_buffer.clear()
+        self.audio_buffered_frames = 0
 
     def _resolve_topic(self, topic: str) -> str:
         if topic in TOPIC_ALIAS_TO_VALUE:
@@ -283,6 +292,10 @@ class EdgeGatewayService:
     async def _set_audio(self, enabled: bool) -> None:
         if self.conn is None:
             raise RuntimeError("Robot connection not ready")
+
+        if enabled != self.audio_enabled:
+            self._reset_audio_pipeline()
+
         self.audio_enabled = enabled
         self.conn.audio.switchAudioChannel(enabled)
 
@@ -433,13 +446,8 @@ class EdgeGatewayService:
             if self.camera_frame_count % self.camera_emit_every != 0 and self.camera_frame_count != 1:
                 continue
 
-            image = frame.to_ndarray(format="bgr24")
-            ok, encoded = cv2.imencode(
-                ".jpg",
-                image,
-                [cv2.IMWRITE_JPEG_QUALITY, self.camera_jpeg_quality],
-            )
-            if not ok or encoded is None:
+            encoded = await asyncio.to_thread(self._encode_camera_frame, frame)
+            if encoded is None:
                 continue
 
             await self._enqueue_media(
@@ -452,18 +460,26 @@ class EdgeGatewayService:
                         "width": frame.width,
                         "height": frame.height,
                         "image_format": "jpg",
-                        "image_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+                        "image_base64": base64.b64encode(encoded).decode("ascii"),
                     },
                 }
             )
+
+    def _encode_camera_frame(self, frame) -> Optional[bytes]:
+        image = frame.to_ndarray(format="bgr24")
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [cv2.IMWRITE_JPEG_QUALITY, self.camera_jpeg_quality],
+        )
+        if not ok or encoded is None:
+            return None
+        return encoded.tobytes()
 
     async def _on_audio_frame(self, frame) -> None:
         self.audio_frame_count += 1
 
         if not self.audio_enabled:
-            return
-
-        if self.audio_frame_count % self.audio_emit_every != 0:
             return
 
         try:
@@ -473,6 +489,29 @@ class EdgeGatewayService:
             if now - self.last_audio_error_at >= 2.0:
                 self.last_audio_error_at = now
                 self._publish_event("audio_encode_error", {"error": str(exc)})
+            return
+
+        if not raw:
+            return
+
+        self.audio_pcm_buffer.extend(raw)
+        self.audio_buffered_frames += 1
+
+        target_frames = max(1, self.audio_emit_every)
+        target_bytes = int(sample_rate * channels * 2 * 0.1)
+        if self.audio_buffered_frames < target_frames and len(self.audio_pcm_buffer) < target_bytes:
+            return
+
+        packet = bytes(self.audio_pcm_buffer)
+        self.audio_pcm_buffer.clear()
+        self.audio_buffered_frames = 0
+
+        if self.audio_max_bytes > 0 and len(packet) > self.audio_max_bytes:
+            packet = packet[: self.audio_max_bytes]
+
+        bytes_per_frame = channels * 2
+        packet = packet[: len(packet) - (len(packet) % bytes_per_frame)]
+        if not packet:
             return
 
         await self._enqueue_media(
@@ -485,67 +524,28 @@ class EdgeGatewayService:
                     "audio_format": "pcm_s16le",
                     "sample_rate": sample_rate,
                     "channels": channels,
-                    "audio_base64": base64.b64encode(raw).decode("ascii"),
+                    "audio_base64": base64.b64encode(packet).decode("ascii"),
                 },
             }
         )
 
     def _audio_frame_to_pcm(self, frame) -> Tuple[bytes, int, int]:
-        array = frame.to_ndarray()
-        if array is None:
-            raise ValueError("empty audio frame")
+        if int(getattr(frame, "sample_rate", 0) or 0) <= 0:
+            frame.sample_rate = 48000
 
-        array = np.asarray(array)
+        output_frames = self.audio_resampler.resample(frame)
+        if not output_frames:
+            return b"", 48000, 1
 
-        layout = getattr(frame, "layout", None)
-        layout_channels = getattr(layout, "channels", None)
-        channels = len(layout_channels) if layout_channels else 1
-        channels = max(channels, 1)
+        chunks: List[bytes] = []
+        for output_frame in output_frames:
+            array = np.asarray(output_frame.to_ndarray())
+            if array.size == 0:
+                continue
+            pcm = np.ascontiguousarray(array.reshape(-1), dtype="<i2")
+            chunks.append(pcm.tobytes())
 
-        if array.size % channels != 0:
-            raise ValueError(f"audio samples={array.size} not divisible by channels={channels}")
-
-        frame_format = getattr(frame, "format", None)
-        is_planar = bool(getattr(frame_format, "is_planar", False))
-
-        if is_planar:
-            array = array.reshape(channels, -1).T
-        else:
-            array = array.reshape(-1, channels)
-
-        if np.issubdtype(array.dtype, np.floating):
-            array = (np.clip(array, -1.0, 1.0) * 32767.0).astype(np.int16)
-        elif array.dtype == np.int16:
-            pass
-        elif array.dtype == np.uint8:
-            array = ((array.astype(np.int16) - 128) << 8).astype(np.int16)
-        elif np.issubdtype(array.dtype, np.unsignedinteger):
-            info = np.iinfo(array.dtype)
-            midpoint = float(info.max + 1) / 2.0
-            normalized = (array.astype(np.float64) - midpoint) / midpoint
-            array = (np.clip(normalized, -1.0, 1.0) * 32767.0).astype(np.int16)
-        elif np.issubdtype(array.dtype, np.integer):
-            info = np.iinfo(array.dtype)
-            scale = float(max(abs(info.min), info.max))
-            normalized = array.astype(np.float64) / scale
-            array = (np.clip(normalized, -1.0, 1.0) * 32767.0).astype(np.int16)
-        else:
-            raise ValueError(f"unsupported audio dtype: {array.dtype}")
-
-        array = np.ascontiguousarray(array, dtype="<i2")
-        raw = array.tobytes()
-        if self.audio_max_bytes > 0 and len(raw) > self.audio_max_bytes:
-            raw = raw[: self.audio_max_bytes]
-
-        bytes_per_frame = channels * 2
-        if len(raw) % bytes_per_frame != 0:
-            raw = raw[: len(raw) - (len(raw) % bytes_per_frame)]
-
-        if not raw:
-            raise ValueError("empty PCM payload")
-
-        sample_rate = int(getattr(frame, "sample_rate", 0) or 48000)
-        return raw, sample_rate, channels
+        return b"".join(chunks), 48000, 1
 
     async def _enqueue_media(self, payload: Dict[str, Any]) -> None:
         if not self.args.media_ws_url:
@@ -687,16 +687,8 @@ class EdgeGatewayService:
         if points is None:
             return
 
-        preview = self._render_lidar_preview(points)
-        if preview is None:
-            return
-
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            preview,
-            [cv2.IMWRITE_JPEG_QUALITY, self.args.lidar_preview_jpeg_quality],
-        )
-        if not ok or encoded is None:
+        encoded = await asyncio.to_thread(self._encode_lidar_preview, points)
+        if encoded is None:
             return
 
         await self._enqueue_media(
@@ -706,11 +698,25 @@ class EdgeGatewayService:
                 "stream": "lidar",
                 "data": {
                     "image_format": "jpg",
-                    "image_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+                    "image_base64": base64.b64encode(encoded).decode("ascii"),
                     "point_count": int(points.shape[0]),
                 },
             }
         )
+
+    def _encode_lidar_preview(self, points: np.ndarray) -> Optional[bytes]:
+        preview = self._render_lidar_preview(points)
+        if preview is None:
+            return None
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            preview,
+            [cv2.IMWRITE_JPEG_QUALITY, self.args.lidar_preview_jpeg_quality],
+        )
+        if not ok or encoded is None:
+            return None
+        return encoded.tobytes()
 
     def _telemetry_from_low_state(self) -> Dict[str, Any]:
         topic = TOPIC_ALIAS_TO_VALUE.get("LOW_STATE", "")
@@ -1093,9 +1099,14 @@ class EdgeGatewayService:
             try:
                 async with websockets.connect(
                     ws_url,
+                    compression=None,
+                    open_timeout=10,
+                    close_timeout=2,
                     ping_interval=15,
                     ping_timeout=15,
                     max_size=self.args.media_ws_max_size,
+                    max_queue=4,
+                    write_limit=64 * 1024,
                 ) as ws:
                     self._publish_event("media_uplink_connected", {"url": ws_url})
 
@@ -1145,6 +1156,7 @@ class EdgeGatewayService:
         self.robot_connected_at = time.monotonic()
         self.subscribed_topics.clear()
         self.latest_by_topic.clear()
+        self._reset_audio_pipeline()
 
         self.conn.video.add_track_callback(self._on_video_track)
         self.conn.audio.add_track_callback(self._on_audio_frame)
@@ -1211,6 +1223,7 @@ class EdgeGatewayService:
         self.traffic_saving_disabled = False
         self.subscribed_topics.clear()
         self.latest_by_topic.clear()
+        self._reset_audio_pipeline()
 
         if connection is None:
             return
@@ -1360,16 +1373,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-angular-speed", type=float, default=0.8)
     parser.add_argument("--turn-ms-per-degree", type=float, default=15.0)
 
-    parser.add_argument("--camera-emit-every", type=int, default=1)
-    parser.add_argument("--camera-jpeg-quality", type=int, default=70)
+    parser.add_argument("--camera-emit-every", type=int, default=3)
+    parser.add_argument("--camera-jpeg-quality", type=int, default=55)
 
-    parser.add_argument("--audio-emit-every", type=int, default=1)
+    parser.add_argument("--audio-emit-every", type=int, default=2)
     parser.add_argument("--audio-max-bytes", type=int, default=24576)
 
-    parser.add_argument("--lidar-media-hz", type=float, default=3.0)
-    parser.add_argument("--lidar-preview-size", type=int, default=480)
-    parser.add_argument("--lidar-preview-max-points", type=int, default=25000)
-    parser.add_argument("--lidar-preview-jpeg-quality", type=int, default=65)
+    parser.add_argument("--lidar-media-hz", type=float, default=2.0)
+    parser.add_argument("--lidar-preview-size", type=int, default=420)
+    parser.add_argument("--lidar-preview-max-points", type=int, default=15000)
+    parser.add_argument("--lidar-preview-jpeg-quality", type=int, default=60)
 
     parser.add_argument(
         "--media-ws-url",
@@ -1378,7 +1391,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--media-ws-token", default="")
     parser.add_argument("--media-queue-size", type=int, default=64)
-    parser.add_argument("--media-audio-batch-size", type=int, default=8)
+    parser.add_argument("--media-audio-batch-size", type=int, default=4)
     parser.add_argument("--media-ws-reconnect-s", type=float, default=2.0)
     parser.add_argument("--media-ws-send-timeout-s", type=float, default=2.0)
     parser.add_argument("--media-ws-max-size", type=int, default=8 * 1024 * 1024)

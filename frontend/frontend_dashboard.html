@@ -271,9 +271,67 @@
       width: 86px;
     }
 
+    .saved-map-panel {
+      grid-column: 1 / -1;
+    }
+
+    .map3d-shell {
+      position: relative;
+      margin-top: 10px;
+      min-height: 520px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 50% 40%, rgba(37, 71, 98, 0.35), transparent 55%),
+        #070c12;
+    }
+
+    .map3d-shell.fullscreen {
+      position: fixed;
+      inset: 12px;
+      z-index: 1200;
+      margin: 0;
+      min-height: 0;
+      border-color: #52789a;
+      box-shadow: 0 20px 80px rgba(0, 0, 0, 0.75);
+    }
+
+    .map3d-viewer {
+      display: block;
+      width: 100%;
+      height: 520px;
+      cursor: grab;
+      touch-action: none;
+      outline: none;
+    }
+
+    .map3d-shell.fullscreen .map3d-viewer {
+      height: 100%;
+    }
+
+    .map3d-overlay {
+      position: absolute;
+      left: 10px;
+      bottom: 10px;
+      max-width: calc(100% - 20px);
+      padding: 6px 9px;
+      border-radius: 7px;
+      background: rgba(5, 11, 17, 0.82);
+      color: #b8cad8;
+      font-size: 11px;
+      pointer-events: none;
+    }
+
+    .map-select {
+      min-width: min(480px, 100%);
+      flex: 1 1 320px;
+    }
+
     @media (max-width: 1080px) {
       .wrap { grid-template-columns: 1fr; }
       .grid2 { grid-template-columns: 1fr; }
+      .map3d-viewer { height: 400px; }
     }
   </style>
 </head>
@@ -384,6 +442,31 @@
       <h2 class="title" style="margin-top: 12px;">Eventos / ACK / Predicciones</h2>
       <ul id="events" class="events"></ul>
     </div>
+
+    <div class="panel saved-map-panel">
+      <h2 class="title">Biblioteca de mapas 3D · guardada en el servidor</h2>
+      <div class="row">
+        <select id="savedMapSelect" class="map-select" aria-label="mapas guardados">
+          <option value="">Todavía no se consultaron mapas</option>
+        </select>
+        <button id="refreshMapsBtn" type="button">Actualizar lista</button>
+        <button id="saveMapBtn" type="button" class="primary">Guardar snapshot ahora</button>
+        <button id="loadMapBtn" type="button">Abrir mapa</button>
+        <button id="resetMapViewBtn" type="button">Centrar vista</button>
+        <button id="fullscreenMapBtn" type="button">Pantalla completa</button>
+        <span id="savedMapStatus" class="status">sin mapa cargado</span>
+      </div>
+      <div id="savedMapShell" class="map3d-shell">
+        <canvas id="savedMapCanvas" class="map3d-viewer" tabindex="0" aria-label="visor 3D de mapas guardados"></canvas>
+        <div id="savedMapOverlay" class="map3d-overlay">
+          Arrastrar: rotar · Shift/segundo botón: desplazar · Rueda: zoom
+        </div>
+      </div>
+      <p class="hint">
+        “Mapa actual” se guarda automáticamente mientras llegan puntos. “Guardar snapshot” crea una copia fechada que no cambia.
+        Los mapas se pueden abrir aunque el robot o el WebSocket estén desconectados.
+      </p>
+    </div>
   </div>
 
   <div id="mediaModal" class="media-modal" hidden role="dialog" aria-modal="true" aria-label="visor ampliado">
@@ -492,6 +575,28 @@
         sourcePoints: 0,
         processingMs: 0,
       },
+      savedMaps: [],
+      savedMapViewer: {
+        gl: null,
+        program: null,
+        positionBuffer: null,
+        colorBuffer: null,
+        pathPositionBuffer: null,
+        pathColorBuffer: null,
+        pointCount: 0,
+        pathPointCount: 0,
+        yaw: -0.75,
+        pitch: 0.55,
+        distance: 10,
+        radius: 1,
+        target: [0, 0, 0],
+        dragging: false,
+        dragMode: "orbit",
+        lastX: 0,
+        lastY: 0,
+        renderPending: false,
+        metadata: null,
+      },
       audio: {
         ctx: null,
         unlocked: false,
@@ -543,6 +648,16 @@
       unlockAudioBtn: document.getElementById("unlockAudioBtn"),
       mediaStatus: document.getElementById("mediaStatus"),
       audioStatus: document.getElementById("audioStatus"),
+      savedMapSelect: document.getElementById("savedMapSelect"),
+      refreshMapsBtn: document.getElementById("refreshMapsBtn"),
+      saveMapBtn: document.getElementById("saveMapBtn"),
+      loadMapBtn: document.getElementById("loadMapBtn"),
+      resetMapViewBtn: document.getElementById("resetMapViewBtn"),
+      fullscreenMapBtn: document.getElementById("fullscreenMapBtn"),
+      savedMapStatus: document.getElementById("savedMapStatus"),
+      savedMapShell: document.getElementById("savedMapShell"),
+      savedMapCanvas: document.getElementById("savedMapCanvas"),
+      savedMapOverlay: document.getElementById("savedMapOverlay"),
     };
 
     function clamp(value, min, max) {
@@ -825,6 +940,552 @@
         out[i] = bin.charCodeAt(i);
       }
       return out;
+    }
+
+    function syncMapApiInputs() {
+      const apiBase = normalizeApiBase(els.apiBase.value);
+      const token = els.token.value.trim();
+      const robotId = els.robotId.value.trim();
+      if (!apiBase || !token || !robotId) {
+        throw new Error("Completá API, token y robot para consultar mapas");
+      }
+      state.apiBase = apiBase;
+      state.token = token;
+      state.robotId = robotId;
+      els.apiBase.value = apiBase;
+    }
+
+    function formatMapDate(timestamp) {
+      const value = Number(timestamp);
+      if (!Number.isFinite(value)) return "fecha desconocida";
+      return new Date(value * 1000).toLocaleString();
+    }
+
+    function formatMapOption(metadata) {
+      const points = Number(metadata.point_count || 0).toLocaleString();
+      if (metadata.is_latest) {
+        return `Mapa actual · ${points} puntos · actualizado ${formatMapDate(metadata.updated_at)}`;
+      }
+      return `${formatMapDate(metadata.created_at)} · ${points} puntos`;
+    }
+
+    async function loadSavedMapList(preferredMapId = "") {
+      try {
+        syncMapApiInputs();
+        setBadge(els.savedMapStatus, "consultando servidor…", "warn");
+        const res = await fetchOrThrow(
+          api(`/api/maps?robot_id=${encodeURIComponent(state.robotId)}`),
+          { headers: { "Authorization": "Bearer " + state.token } },
+          8000
+        );
+        const payload = await res.json();
+        state.savedMaps = Array.isArray(payload.maps) ? payload.maps : [];
+        els.savedMapSelect.replaceChildren();
+
+        if (!state.savedMaps.length) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "No hay mapas guardados para este robot";
+          els.savedMapSelect.appendChild(option);
+          setBadge(els.savedMapStatus, "sin mapas guardados", "warn");
+          return;
+        }
+
+        for (const metadata of state.savedMaps) {
+          const option = document.createElement("option");
+          option.value = String(metadata.map_id || "");
+          option.textContent = formatMapOption(metadata);
+          els.savedMapSelect.appendChild(option);
+        }
+        const target = preferredMapId
+          || (state.savedMapViewer.metadata && state.savedMapViewer.metadata.map_id)
+          || "latest";
+        if ([...els.savedMapSelect.options].some(option => option.value === target)) {
+          els.savedMapSelect.value = target;
+        }
+        setBadge(
+          els.savedMapStatus,
+          `${state.savedMaps.length} mapa${state.savedMaps.length === 1 ? "" : "s"} en servidor`,
+          "ok"
+        );
+      } catch (err) {
+        setBadge(els.savedMapStatus, normalizeError(err), "err");
+        addEvent("maps_list_error", normalizeError(err));
+      }
+    }
+
+    async function saveCurrentMapSnapshot() {
+      try {
+        syncMapApiInputs();
+        setBadge(els.savedMapStatus, "guardando snapshot…", "warn");
+        const res = await fetchOrThrow(
+          api(`/api/robots/${encodeURIComponent(state.robotId)}/maps/snapshot`),
+          {
+            method: "POST",
+            headers: { "Authorization": "Bearer " + state.token },
+          },
+          20000
+        );
+        const payload = await res.json();
+        const metadata = payload.map || {};
+        setBadge(
+          els.savedMapStatus,
+          `snapshot guardado · ${Number(metadata.point_count || 0).toLocaleString()} puntos`,
+          "ok"
+        );
+        addEvent("map_snapshot_saved", metadata);
+        await loadSavedMapList(String(metadata.map_id || ""));
+      } catch (err) {
+        setBadge(els.savedMapStatus, normalizeError(err), "err");
+        addEvent("map_snapshot_error", normalizeError(err));
+      }
+    }
+
+    async function inflateZlib(bytes) {
+      if (typeof DecompressionStream !== "function") {
+        throw new Error("Este navegador no soporta descompresión de mapas");
+      }
+      const stream = new Blob([bytes])
+        .stream()
+        .pipeThrough(new DecompressionStream("deflate"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    async function decodeFloatPayload(base64, format, components, declaredCount) {
+      let bytes = base64ToBytes(base64 || "");
+      if (String(format || "").endsWith("_zlib")) {
+        bytes = await inflateZlib(bytes);
+      }
+      const expectedBytes = Number(declaredCount || 0) * components * 4;
+      if (bytes.byteLength !== expectedBytes || bytes.byteLength % 4 !== 0) {
+        throw new Error("El archivo del mapa tiene una longitud inválida");
+      }
+      const aligned = bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength
+      );
+      return new Float32Array(aligned);
+    }
+
+    function compileMapShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        const message = gl.getShaderInfoLog(shader) || "shader error";
+        gl.deleteShader(shader);
+        throw new Error(message);
+      }
+      return shader;
+    }
+
+    function initSavedMapViewer() {
+      const viewer = state.savedMapViewer;
+      if (viewer.gl) return viewer.gl;
+      const gl = els.savedMapCanvas.getContext("webgl", {
+        antialias: true,
+        alpha: false,
+        depth: true,
+        powerPreference: "high-performance",
+      });
+      if (!gl) {
+        throw new Error("WebGL no está disponible en este navegador");
+      }
+
+      const vertexShader = compileMapShader(gl, gl.VERTEX_SHADER, `
+        attribute vec3 aPosition;
+        attribute vec3 aColor;
+        uniform mat4 uMvp;
+        uniform float uPointSize;
+        varying vec3 vColor;
+        void main() {
+          gl_Position = uMvp * vec4(aPosition, 1.0);
+          float depth = max(1.0, gl_Position.w);
+          gl_PointSize = clamp(uPointSize / sqrt(depth), 1.5, 9.0);
+          vColor = aColor;
+        }
+      `);
+      const fragmentShader = compileMapShader(gl, gl.FRAGMENT_SHADER, `
+        precision mediump float;
+        varying vec3 vColor;
+        uniform float uRoundPoints;
+        void main() {
+          if (uRoundPoints > 0.5) {
+            vec2 delta = gl_PointCoord - vec2(0.5);
+            if (dot(delta, delta) > 0.25) discard;
+          }
+          gl_FragColor = vec4(vColor, 1.0);
+        }
+      `);
+      const program = gl.createProgram();
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+      gl.deleteShader(vertexShader);
+      gl.deleteShader(fragmentShader);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error(gl.getProgramInfoLog(program) || "No se pudo iniciar el visor 3D");
+      }
+
+      viewer.gl = gl;
+      viewer.program = program;
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LEQUAL);
+      gl.clearColor(0.025, 0.045, 0.065, 1.0);
+      return gl;
+    }
+
+    function heightColor(t) {
+      const hue = (1 - clamp(t, 0, 1)) * 0.68;
+      const h = hue * 6;
+      const sector = Math.floor(h);
+      const fraction = h - sector;
+      const q = 1 - fraction;
+      const u = fraction;
+      if (sector === 0) return [1, u, 0.08];
+      if (sector === 1) return [q, 1, 0.08];
+      if (sector === 2) return [0.08, 1, u];
+      if (sector === 3) return [0.08, q, 1];
+      if (sector === 4) return [u, 0.08, 1];
+      return [1, 0.08, q];
+    }
+
+    function replaceGlBuffer(gl, previous, data) {
+      if (previous) gl.deleteBuffer(previous);
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      return buffer;
+    }
+
+    function uploadSavedMap(points, path, metadata) {
+      const gl = initSavedMapViewer();
+      const viewer = state.savedMapViewer;
+      if (points.length < 3 || points.length % 3 !== 0) {
+        throw new Error("El mapa no contiene puntos 3D válidos");
+      }
+
+      const min = [Infinity, Infinity, Infinity];
+      const max = [-Infinity, -Infinity, -Infinity];
+      for (let i = 0; i < points.length; i += 3) {
+        for (let axis = 0; axis < 3; axis += 1) {
+          const value = points[i + axis];
+          min[axis] = Math.min(min[axis], value);
+          max[axis] = Math.max(max[axis], value);
+        }
+      }
+      const center = [
+        (min[0] + max[0]) / 2,
+        (min[1] + max[1]) / 2,
+        (min[2] + max[2]) / 2,
+      ];
+      const centered = new Float32Array(points.length);
+      const colors = new Float32Array(points.length);
+      const zSpan = Math.max(max[2] - min[2], 0.001);
+      let radiusSq = 0;
+      for (let i = 0; i < points.length; i += 3) {
+        const x = points[i] - center[0];
+        const y = points[i + 1] - center[1];
+        const z = points[i + 2] - center[2];
+        centered[i] = x;
+        centered[i + 1] = y;
+        centered[i + 2] = z;
+        radiusSq = Math.max(radiusSq, x * x + y * y + z * z);
+        const color = heightColor((points[i + 2] - min[2]) / zSpan);
+        colors.set(color, i);
+      }
+
+      const pathPositions = new Float32Array((path.length / 2) * 3);
+      const pathColors = new Float32Array(pathPositions.length);
+      const pathZ = clamp(0, min[2], max[2]) - center[2] + 0.04;
+      for (let source = 0, target = 0; source < path.length; source += 2, target += 3) {
+        pathPositions[target] = path[source] - center[0];
+        pathPositions[target + 1] = path[source + 1] - center[1];
+        pathPositions[target + 2] = pathZ;
+        pathColors[target] = 1.0;
+        pathColors[target + 1] = 0.82;
+        pathColors[target + 2] = 0.18;
+      }
+
+      viewer.positionBuffer = replaceGlBuffer(gl, viewer.positionBuffer, centered);
+      viewer.colorBuffer = replaceGlBuffer(gl, viewer.colorBuffer, colors);
+      viewer.pathPositionBuffer = replaceGlBuffer(gl, viewer.pathPositionBuffer, pathPositions);
+      viewer.pathColorBuffer = replaceGlBuffer(gl, viewer.pathColorBuffer, pathColors);
+      viewer.pointCount = points.length / 3;
+      viewer.pathPointCount = path.length / 2;
+      viewer.radius = Math.max(Math.sqrt(radiusSq), 0.5);
+      viewer.metadata = metadata;
+      resetSavedMapView();
+      els.savedMapOverlay.textContent = [
+        `${viewer.pointCount.toLocaleString()} puntos`,
+        `${viewer.pathPointCount.toLocaleString()} posiciones de trayectoria`,
+        `X ${min[0].toFixed(1)}…${max[0].toFixed(1)} m`,
+        `Y ${min[1].toFixed(1)}…${max[1].toFixed(1)} m`,
+        `Z ${min[2].toFixed(1)}…${max[2].toFixed(1)} m`,
+      ].join(" · ");
+    }
+
+    function mat4Perspective(fovY, aspect, near, far) {
+      const f = 1 / Math.tan(fovY / 2);
+      const out = new Float32Array(16);
+      out[0] = f / aspect;
+      out[5] = f;
+      out[10] = (far + near) / (near - far);
+      out[11] = -1;
+      out[14] = (2 * far * near) / (near - far);
+      return out;
+    }
+
+    function normalizeVec3(value) {
+      const length = Math.hypot(value[0], value[1], value[2]) || 1;
+      return [value[0] / length, value[1] / length, value[2] / length];
+    }
+
+    function crossVec3(a, b) {
+      return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+      ];
+    }
+
+    function dotVec3(a, b) {
+      return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    }
+
+    function mat4LookAt(eye, target, up) {
+      const z = normalizeVec3([
+        eye[0] - target[0],
+        eye[1] - target[1],
+        eye[2] - target[2],
+      ]);
+      const x = normalizeVec3(crossVec3(up, z));
+      const y = crossVec3(z, x);
+      return new Float32Array([
+        x[0], y[0], z[0], 0,
+        x[1], y[1], z[1], 0,
+        x[2], y[2], z[2], 0,
+        -dotVec3(x, eye), -dotVec3(y, eye), -dotVec3(z, eye), 1,
+      ]);
+    }
+
+    function mat4Multiply(a, b) {
+      const out = new Float32Array(16);
+      for (let column = 0; column < 4; column += 1) {
+        for (let row = 0; row < 4; row += 1) {
+          let value = 0;
+          for (let index = 0; index < 4; index += 1) {
+            value += a[index * 4 + row] * b[column * 4 + index];
+          }
+          out[column * 4 + row] = value;
+        }
+      }
+      return out;
+    }
+
+    function resizeSavedMapCanvas(gl) {
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = Math.max(1, Math.floor(els.savedMapCanvas.clientWidth * ratio));
+      const height = Math.max(1, Math.floor(els.savedMapCanvas.clientHeight * ratio));
+      if (els.savedMapCanvas.width !== width || els.savedMapCanvas.height !== height) {
+        els.savedMapCanvas.width = width;
+        els.savedMapCanvas.height = height;
+      }
+      gl.viewport(0, 0, width, height);
+      return { width, height, ratio };
+    }
+
+    function bindMapAttributes(gl, program, positionBuffer, colorBuffer) {
+      const positionLocation = gl.getAttribLocation(program, "aPosition");
+      const colorLocation = gl.getAttribLocation(program, "aColor");
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.enableVertexAttribArray(positionLocation);
+      gl.vertexAttribPointer(positionLocation, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+      gl.enableVertexAttribArray(colorLocation);
+      gl.vertexAttribPointer(colorLocation, 3, gl.FLOAT, false, 0, 0);
+    }
+
+    function renderSavedMap() {
+      const viewer = state.savedMapViewer;
+      viewer.renderPending = false;
+      if (!viewer.gl || !viewer.program || !viewer.pointCount) return;
+      const gl = viewer.gl;
+      const size = resizeSavedMapCanvas(gl);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.useProgram(viewer.program);
+
+      const horizontal = Math.cos(viewer.pitch) * viewer.distance;
+      const eye = [
+        viewer.target[0] + Math.cos(viewer.yaw) * horizontal,
+        viewer.target[1] + Math.sin(viewer.yaw) * horizontal,
+        viewer.target[2] + Math.sin(viewer.pitch) * viewer.distance,
+      ];
+      const projection = mat4Perspective(
+        Math.PI / 4,
+        size.width / size.height,
+        Math.max(0.02, viewer.radius / 200),
+        Math.max(100, viewer.radius * 20)
+      );
+      const view = mat4LookAt(eye, viewer.target, [0, 0, 1]);
+      const mvp = mat4Multiply(projection, view);
+      gl.uniformMatrix4fv(gl.getUniformLocation(viewer.program, "uMvp"), false, mvp);
+      gl.uniform1f(
+        gl.getUniformLocation(viewer.program, "uPointSize"),
+        Math.max(5, 9 * size.ratio)
+      );
+
+      bindMapAttributes(gl, viewer.program, viewer.positionBuffer, viewer.colorBuffer);
+      gl.uniform1f(gl.getUniformLocation(viewer.program, "uRoundPoints"), 1);
+      gl.drawArrays(gl.POINTS, 0, viewer.pointCount);
+
+      if (viewer.pathPointCount >= 2) {
+        bindMapAttributes(
+          gl,
+          viewer.program,
+          viewer.pathPositionBuffer,
+          viewer.pathColorBuffer
+        );
+        gl.uniform1f(gl.getUniformLocation(viewer.program, "uRoundPoints"), 0);
+        gl.lineWidth(2);
+        gl.drawArrays(gl.LINE_STRIP, 0, viewer.pathPointCount);
+      }
+    }
+
+    function requestSavedMapRender() {
+      const viewer = state.savedMapViewer;
+      if (viewer.renderPending) return;
+      viewer.renderPending = true;
+      requestAnimationFrame(renderSavedMap);
+    }
+
+    function resetSavedMapView() {
+      const viewer = state.savedMapViewer;
+      viewer.yaw = -0.75;
+      viewer.pitch = 0.55;
+      viewer.distance = Math.max(viewer.radius * 2.4, 2);
+      viewer.target = [0, 0, 0];
+      requestSavedMapRender();
+    }
+
+    async function loadSelectedSavedMap() {
+      const mapId = els.savedMapSelect.value;
+      if (!mapId) {
+        setBadge(els.savedMapStatus, "Elegí un mapa guardado", "warn");
+        return;
+      }
+      try {
+        syncMapApiInputs();
+        setBadge(els.savedMapStatus, "descargando mapa 3D…", "warn");
+        const useCompression = typeof DecompressionStream === "function";
+        const res = await fetchOrThrow(
+          api(
+            `/api/maps/${encodeURIComponent(state.robotId)}/${encodeURIComponent(mapId)}`
+            + `?compressed=${useCompression ? "true" : "false"}`
+          ),
+          { headers: { "Authorization": "Bearer " + state.token } },
+          30000
+        );
+        const payload = await res.json();
+        const points = await decodeFloatPayload(
+          payload.points_base64,
+          payload.point_format,
+          3,
+          payload.point_count
+        );
+        const path = await decodeFloatPayload(
+          payload.path_base64,
+          payload.path_format,
+          2,
+          payload.path_point_count
+        );
+        uploadSavedMap(points, path, payload.metadata || {});
+        setBadge(
+          els.savedMapStatus,
+          `${mapId === "latest" ? "mapa actual" : "snapshot"} abierto`,
+          "ok"
+        );
+      } catch (err) {
+        setBadge(els.savedMapStatus, normalizeError(err), "err");
+        addEvent("map_load_error", normalizeError(err));
+      }
+    }
+
+    function toggleSavedMapFullscreen() {
+      const enabled = !els.savedMapShell.classList.contains("fullscreen");
+      els.savedMapShell.classList.toggle("fullscreen", enabled);
+      els.fullscreenMapBtn.textContent = enabled ? "Salir de pantalla completa" : "Pantalla completa";
+      document.body.style.overflow = enabled ? "hidden" : "";
+      requestSavedMapRender();
+    }
+
+    function setupSavedMapInteraction() {
+      const canvas = els.savedMapCanvas;
+      canvas.addEventListener("contextmenu", event => event.preventDefault());
+      canvas.addEventListener("pointerdown", event => {
+        const viewer = state.savedMapViewer;
+        viewer.dragging = true;
+        viewer.dragMode = event.button === 2 || event.shiftKey ? "pan" : "orbit";
+        viewer.lastX = event.clientX;
+        viewer.lastY = event.clientY;
+        canvas.setPointerCapture(event.pointerId);
+        canvas.style.cursor = "grabbing";
+      });
+      canvas.addEventListener("pointermove", event => {
+        const viewer = state.savedMapViewer;
+        if (!viewer.dragging) return;
+        const dx = event.clientX - viewer.lastX;
+        const dy = event.clientY - viewer.lastY;
+        viewer.lastX = event.clientX;
+        viewer.lastY = event.clientY;
+        if (viewer.dragMode === "orbit") {
+          viewer.yaw -= dx * 0.008;
+          viewer.pitch = clamp(viewer.pitch - dy * 0.008, -1.42, 1.42);
+        } else {
+          const scale = viewer.distance * 0.0018;
+          const right = [-Math.sin(viewer.yaw), Math.cos(viewer.yaw), 0];
+          const up = [
+            -Math.cos(viewer.yaw) * Math.sin(viewer.pitch),
+            -Math.sin(viewer.yaw) * Math.sin(viewer.pitch),
+            Math.cos(viewer.pitch),
+          ];
+          for (let axis = 0; axis < 3; axis += 1) {
+            viewer.target[axis] += (-dx * right[axis] + dy * up[axis]) * scale;
+          }
+        }
+        requestSavedMapRender();
+      });
+      const finishDrag = event => {
+        const viewer = state.savedMapViewer;
+        viewer.dragging = false;
+        canvas.style.cursor = "grab";
+        if (canvas.hasPointerCapture(event.pointerId)) {
+          canvas.releasePointerCapture(event.pointerId);
+        }
+      };
+      canvas.addEventListener("pointerup", finishDrag);
+      canvas.addEventListener("pointercancel", finishDrag);
+      canvas.addEventListener("wheel", event => {
+        event.preventDefault();
+        const viewer = state.savedMapViewer;
+        viewer.distance = clamp(
+          viewer.distance * Math.exp(event.deltaY * 0.001),
+          Math.max(viewer.radius * 0.08, 0.15),
+          Math.max(viewer.radius * 30, 30)
+        );
+        requestSavedMapRender();
+      }, { passive: false });
+      canvas.addEventListener("keydown", event => {
+        if (event.code === "KeyR") {
+          event.preventDefault();
+          resetSavedMapView();
+        }
+      });
+      if (typeof ResizeObserver === "function") {
+        new ResizeObserver(requestSavedMapRender).observe(els.savedMapShell);
+      } else {
+        window.addEventListener("resize", requestSavedMapRender);
+      }
     }
 
     function setupAudioPipeline() {
@@ -1633,6 +2294,7 @@
         await new Promise(resolve => setTimeout(resolve, 200));
         if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
         await applyMediaSettings();
+        void loadSavedMapList();
       };
 
       ws.onclose = (ev) => {
@@ -1705,6 +2367,25 @@
       await ensureAudioContext(true);
     });
 
+    els.refreshMapsBtn.addEventListener("click", async () => {
+      await loadSavedMapList();
+    });
+
+    els.saveMapBtn.addEventListener("click", async () => {
+      await saveCurrentMapSnapshot();
+    });
+
+    els.loadMapBtn.addEventListener("click", async () => {
+      await loadSelectedSavedMap();
+    });
+
+    els.savedMapSelect.addEventListener("dblclick", async () => {
+      await loadSelectedSavedMap();
+    });
+
+    els.resetMapViewBtn.addEventListener("click", resetSavedMapView);
+    els.fullscreenMapBtn.addEventListener("click", toggleSavedMapFullscreen);
+
     els.videoFrame.addEventListener("click", () => {
       openMediaModal("video");
     });
@@ -1764,6 +2445,12 @@
     }
 
     window.addEventListener("keydown", async (ev) => {
+      if (ev.code === "Escape" && els.savedMapShell.classList.contains("fullscreen")) {
+        ev.preventDefault();
+        toggleSavedMapFullscreen();
+        return;
+      }
+
       if (ev.code === "Escape" && !els.mediaModal.hidden) {
         ev.preventDefault();
         closeMediaModal();
@@ -1836,9 +2523,11 @@
     });
 
     els.maxApiToggle.disabled = true;
+    setupSavedMapInteraction();
     updateSpeedUi();
     updateMediaStatus();
     updateMotionReadouts();
+    void loadSavedMapList();
   </script>
 </body>
 </html>

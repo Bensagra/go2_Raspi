@@ -5,6 +5,8 @@ import base64
 import contextlib
 import json
 import math
+import re
+import threading
 import time
 import uuid
 import zlib
@@ -75,6 +77,9 @@ class CommandIn(BaseModel):
     ttl_ms: int = 1500
 
 
+SAFE_STORAGE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
 class CoreRuntime:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -82,6 +87,7 @@ class CoreRuntime:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.stop_event = asyncio.Event()
         self.heartbeat_task: Optional[asyncio.Task[None]] = None
+        self.map_save_task: Optional[asyncio.Task[None]] = None
 
         self.app = FastAPI(title="Go2 Server Core", version="0.1.0")
         self._setup_cors()
@@ -110,6 +116,13 @@ class CoreRuntime:
         self.robot_paths: Dict[str, Deque[Tuple[float, float]]] = defaultdict(
             lambda: deque(maxlen=self.args.lidar_path_max_points)
         )
+        self.map_data_locks: Dict[str, threading.RLock] = defaultdict(threading.RLock)
+        self.map_revisions: Dict[str, int] = defaultdict(int)
+        self.map_saved_revisions: Dict[str, int] = defaultdict(int)
+        self.map_last_save_monotonic: Dict[str, float] = defaultdict(lambda: 0.0)
+        self.persisted_robot_ids: Set[str] = set()
+        self.map_storage_dir = Path(self.args.map_storage_dir).expanduser()
+        self.map_storage_dir.mkdir(parents=True, exist_ok=True)
 
         self.telemetry_history: Dict[str, Deque[Dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=self.args.replay_max_items)
@@ -153,6 +166,8 @@ class CoreRuntime:
         known = set(self.args.robot_id)
         known.update(self.latest_telemetry.keys())
         known.update(self.edge_media_sockets.keys())
+        known.update(self.lidar_voxels.keys())
+        known.update(self.persisted_robot_ids)
         return sorted(known)
 
     def _audit(self, event_type: str, payload: Dict[str, Any]) -> None:
@@ -299,14 +314,15 @@ class CoreRuntime:
         unique_points = points[unique_indices]
         unique_keys = keys[unique_indices]
 
-        voxels = self.lidar_voxels[robot_id]
-        for key_array, point in zip(unique_keys, unique_points):
-            key = (int(key_array[0]), int(key_array[1]), int(key_array[2]))
-            voxels[key] = (float(point[0]), float(point[1]), float(point[2]))
-            voxels.move_to_end(key)
+        with self.map_data_locks[robot_id]:
+            voxels = self.lidar_voxels[robot_id]
+            for key_array, point in zip(unique_keys, unique_points):
+                key = (int(key_array[0]), int(key_array[1]), int(key_array[2]))
+                voxels[key] = (float(point[0]), float(point[1]), float(point[2]))
+                voxels.move_to_end(key)
 
-        while len(voxels) > self.args.lidar_map_max_voxels:
-            voxels.popitem(last=False)
+            while len(voxels) > self.args.lidar_map_max_voxels:
+                voxels.popitem(last=False)
 
     def _robot_pose_for_map(
         self,
@@ -334,11 +350,14 @@ class CoreRuntime:
         robot_id: str,
         source_point_count: int,
     ) -> Optional[Dict[str, Any]]:
-        voxels = self.lidar_voxels.get(robot_id)
-        if not voxels:
-            return None
+        with self.map_data_locks[robot_id]:
+            voxels = self.lidar_voxels.get(robot_id)
+            if not voxels:
+                return None
+            points = np.asarray(list(voxels.values()), dtype=np.float32)
+            voxel_count = len(voxels)
+            path = list(self.robot_paths.get(robot_id, ()))
 
-        points = np.asarray(list(voxels.values()), dtype=np.float32)
         if points.shape[0] > self.args.lidar_render_max_points:
             step = max(
                 int(np.ceil(points.shape[0] / self.args.lidar_render_max_points)),
@@ -411,7 +430,6 @@ class CoreRuntime:
         )
         canvas[py[valid], px[valid]] = colors[valid]
 
-        path = self.robot_paths.get(robot_id, ())
         if path:
             path_array = np.asarray(path, dtype=np.float32)
             path_px = ((path_array[:, 0] - center_x) * top_scale + origin_x).astype(np.int32)
@@ -475,7 +493,7 @@ class CoreRuntime:
         cv2.putText(canvas, "VISTA 3D", (panel_width + 18, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 225, 238), 1, cv2.LINE_AA)
         cv2.putText(
             canvas,
-            f"{len(voxels)} voxels | frame {source_point_count} pts | rango {self.args.lidar_map_range_m:.0f}m",
+            f"{voxel_count} voxels | frame {source_point_count} pts | rango {self.args.lidar_map_range_m:.0f}m",
             (18, height - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.4,
@@ -496,7 +514,7 @@ class CoreRuntime:
             "image_format": "jpg",
             "image_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
             "point_count": int(relative.shape[0]),
-            "map_point_count": len(voxels),
+            "map_point_count": voxel_count,
             "source_point_count": source_point_count,
             "rendered_ts": time.time(),
             "coordinate_frame": "map",
@@ -550,6 +568,7 @@ class CoreRuntime:
                 )
                 continue
 
+            self.map_revisions[robot_id] += 1
             if rendered is None:
                 continue
             self.latest_media[robot_id]["lidar"] = rendered
@@ -562,6 +581,329 @@ class CoreRuntime:
                     "ts": rendered["rendered_ts"],
                 }
             )
+
+    @staticmethod
+    def _validate_storage_component(value: str, label: str) -> str:
+        clean = str(value).strip()
+        if not clean or not SAFE_STORAGE_COMPONENT.fullmatch(clean):
+            raise ValueError(f"invalid {label}")
+        return clean
+
+    def _map_robot_dir(self, robot_id: str, create: bool = False) -> Path:
+        safe_robot_id = self._validate_storage_component(robot_id, "robot id")
+        path = self.map_storage_dir / safe_robot_id
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _copy_map_arrays(self, robot_id: str) -> Tuple[np.ndarray, np.ndarray]:
+        with self.map_data_locks[robot_id]:
+            voxels = self.lidar_voxels.get(robot_id)
+            if voxels:
+                points = np.asarray(list(voxels.values()), dtype="<f4").reshape(-1, 3)
+            else:
+                points = np.empty((0, 3), dtype="<f4")
+
+            path_values = list(self.robot_paths.get(robot_id, ()))
+            if path_values:
+                path = np.asarray(path_values, dtype="<f4").reshape(-1, 2)
+            else:
+                path = np.empty((0, 2), dtype="<f4")
+
+        return points, path
+
+    @staticmethod
+    def _map_bounds(points: np.ndarray) -> Tuple[List[float], List[float]]:
+        if points.size == 0:
+            return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+        return (
+            [round(float(value), 4) for value in np.min(points, axis=0)],
+            [round(float(value), 4) for value in np.max(points, axis=0)],
+        )
+
+    @staticmethod
+    def _read_json_file(path: Path) -> Dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _write_map_files(
+        self,
+        robot_id: str,
+        map_id: str,
+        points: np.ndarray,
+        path: np.ndarray,
+        *,
+        is_latest: bool,
+        created_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        safe_map_id = self._validate_storage_component(map_id, "map id")
+        robot_dir = self._map_robot_dir(robot_id, create=True)
+        data_path = robot_dir / f"{safe_map_id}.npz"
+        metadata_path = robot_dir / f"{safe_map_id}.json"
+        now = time.time()
+
+        if created_at is None and metadata_path.exists():
+            previous = self._read_json_file(metadata_path)
+            with contextlib.suppress(TypeError, ValueError):
+                created_at = float(previous.get("created_at"))
+        if created_at is None or not math.isfinite(created_at):
+            created_at = now
+
+        bounds_min, bounds_max = self._map_bounds(points)
+        metadata = {
+            "map_id": safe_map_id,
+            "robot_id": robot_id,
+            "title": (
+                "Mapa actual (guardado automático)"
+                if is_latest
+                else time.strftime("Mapa %Y-%m-%d %H:%M:%S", time.localtime(created_at))
+            ),
+            "is_latest": is_latest,
+            "created_at": created_at,
+            "updated_at": now,
+            "point_count": int(points.shape[0]),
+            "path_point_count": int(path.shape[0]),
+            "voxel_size_m": float(self.args.lidar_voxel_size),
+            "bounds_min": bounds_min,
+            "bounds_max": bounds_max,
+            "coordinate_frame": "map",
+            "data_file": data_path.name,
+        }
+
+        unique = uuid.uuid4().hex
+        data_tmp = data_path.with_name(f".{data_path.name}.{unique}.tmp")
+        metadata_tmp = metadata_path.with_name(f".{metadata_path.name}.{unique}.tmp")
+        try:
+            with data_tmp.open("wb") as fh:
+                np.savez_compressed(fh, points=points, path=path)
+                fh.flush()
+            data_tmp.replace(data_path)
+
+            metadata_tmp.write_text(
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            metadata_tmp.replace(metadata_path)
+        finally:
+            with contextlib.suppress(OSError):
+                data_tmp.unlink()
+            with contextlib.suppress(OSError):
+                metadata_tmp.unlink()
+
+        self.persisted_robot_ids.add(robot_id)
+        return metadata
+
+    def _save_latest_map_sync(self, robot_id: str) -> Optional[Dict[str, Any]]:
+        points, path = self._copy_map_arrays(robot_id)
+        if points.size == 0:
+            return None
+        return self._write_map_files(
+            robot_id,
+            "latest",
+            points,
+            path,
+            is_latest=True,
+        )
+
+    def _prune_map_snapshots(self, robot_id: str) -> None:
+        if self.args.map_max_snapshots <= 0:
+            return
+        robot_dir = self._map_robot_dir(robot_id)
+        snapshots = sorted(
+            (
+                path
+                for path in robot_dir.glob("*.json")
+                if path.stem != "latest"
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for metadata_path in snapshots[self.args.map_max_snapshots:]:
+            with contextlib.suppress(OSError):
+                metadata_path.unlink()
+            with contextlib.suppress(OSError):
+                metadata_path.with_suffix(".npz").unlink()
+
+    def _create_map_snapshot_sync(self, robot_id: str) -> Dict[str, Any]:
+        points, path = self._copy_map_arrays(robot_id)
+        if points.size == 0:
+            raise ValueError("the robot does not have accumulated LiDAR points")
+
+        self._write_map_files(
+            robot_id,
+            "latest",
+            points,
+            path,
+            is_latest=True,
+        )
+        created_at = time.time()
+        map_id = (
+            time.strftime("%Y%m%d-%H%M%S", time.localtime(created_at))
+            + "-"
+            + uuid.uuid4().hex[:8]
+        )
+        metadata = self._write_map_files(
+            robot_id,
+            map_id,
+            points,
+            path,
+            is_latest=False,
+            created_at=created_at,
+        )
+        self._prune_map_snapshots(robot_id)
+        return metadata
+
+    def _list_maps_sync(self, robot_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        robot_dirs: List[Path]
+        if robot_id:
+            robot_dirs = [self._map_robot_dir(robot_id)]
+        else:
+            robot_dirs = [
+                path
+                for path in self.map_storage_dir.iterdir()
+                if path.is_dir() and SAFE_STORAGE_COMPONENT.fullmatch(path.name)
+            ]
+
+        maps: List[Dict[str, Any]] = []
+        for robot_dir in robot_dirs:
+            if not robot_dir.exists():
+                continue
+            for metadata_path in robot_dir.glob("*.json"):
+                metadata = self._read_json_file(metadata_path)
+                map_id = metadata.get("map_id")
+                if (
+                    not map_id
+                    or not SAFE_STORAGE_COMPONENT.fullmatch(str(map_id))
+                    or not metadata_path.with_suffix(".npz").exists()
+                ):
+                    continue
+                maps.append(metadata)
+
+        maps.sort(
+            key=lambda item: (
+                bool(item.get("is_latest")),
+                float(item.get("updated_at", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        return maps
+
+    def _load_map_files(
+        self,
+        robot_id: str,
+        map_id: str,
+    ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
+        safe_map_id = self._validate_storage_component(map_id, "map id")
+        robot_dir = self._map_robot_dir(robot_id)
+        data_path = robot_dir / f"{safe_map_id}.npz"
+        metadata_path = robot_dir / f"{safe_map_id}.json"
+        if not data_path.exists() or not metadata_path.exists():
+            raise FileNotFoundError("map not found")
+
+        metadata = self._read_json_file(metadata_path)
+        with np.load(data_path, allow_pickle=False) as stored:
+            points = np.asarray(stored["points"], dtype="<f4").reshape(-1, 3)
+            path = np.asarray(stored["path"], dtype="<f4").reshape(-1, 2)
+        finite_points = np.isfinite(points).all(axis=1)
+        finite_path = np.isfinite(path).all(axis=1)
+        return metadata, points[finite_points], path[finite_path]
+
+    def _map_payload_sync(
+        self,
+        robot_id: str,
+        map_id: str,
+        compressed: bool,
+    ) -> Dict[str, Any]:
+        metadata, points, path = self._load_map_files(robot_id, map_id)
+        point_bytes = np.asarray(points, dtype="<f4").tobytes(order="C")
+        path_bytes = np.asarray(path, dtype="<f4").tobytes(order="C")
+        if compressed:
+            point_bytes = zlib.compress(point_bytes, level=6)
+            path_bytes = zlib.compress(path_bytes, level=6)
+        suffix = "_zlib" if compressed else ""
+        return {
+            "metadata": metadata,
+            "point_format": f"f32_xyz{suffix}",
+            "point_count": int(points.shape[0]),
+            "points_base64": base64.b64encode(point_bytes).decode("ascii"),
+            "path_format": f"f32_xy{suffix}",
+            "path_point_count": int(path.shape[0]),
+            "path_base64": base64.b64encode(path_bytes).decode("ascii"),
+        }
+
+    def _restore_persisted_maps_sync(self) -> None:
+        if not self.map_storage_dir.exists():
+            return
+        for robot_dir in self.map_storage_dir.iterdir():
+            if not robot_dir.is_dir() or not SAFE_STORAGE_COMPONENT.fullmatch(robot_dir.name):
+                continue
+            try:
+                _, points, path = self._load_map_files(robot_dir.name, "latest")
+            except (FileNotFoundError, KeyError, OSError, ValueError):
+                continue
+
+            if points.shape[0] > self.args.lidar_map_max_voxels:
+                points = points[-self.args.lidar_map_max_voxels:]
+            keys = np.floor(points / self.args.lidar_voxel_size).astype(np.int32)
+            restored: OrderedDict[
+                Tuple[int, int, int],
+                Tuple[float, float, float],
+            ] = OrderedDict()
+            for key_array, point in zip(keys, points):
+                key = (int(key_array[0]), int(key_array[1]), int(key_array[2]))
+                restored[key] = (float(point[0]), float(point[1]), float(point[2]))
+
+            with self.map_data_locks[robot_dir.name]:
+                self.lidar_voxels[robot_dir.name] = restored
+                restored_path = deque(maxlen=self.args.lidar_path_max_points)
+                restored_path.extend(
+                    (float(point[0]), float(point[1]))
+                    for point in path[-self.args.lidar_path_max_points:]
+                )
+                self.robot_paths[robot_dir.name] = restored_path
+            self.persisted_robot_ids.add(robot_dir.name)
+
+    async def _map_persistence_loop(self) -> None:
+        sleep_s = min(max(self.args.map_autosave_interval_s / 2.0, 0.5), 2.0)
+        while not self.stop_event.is_set():
+            await asyncio.sleep(sleep_s)
+            now = time.monotonic()
+            candidates = [
+                robot_id
+                for robot_id, revision in list(self.map_revisions.items())
+                if revision > self.map_saved_revisions[robot_id]
+                and now - self.map_last_save_monotonic[robot_id]
+                >= self.args.map_autosave_interval_s
+            ]
+            for robot_id in candidates:
+                target_revision = self.map_revisions[robot_id]
+                try:
+                    metadata = await asyncio.to_thread(
+                        self._save_latest_map_sync,
+                        robot_id,
+                    )
+                except Exception as exc:
+                    self._audit(
+                        "map_autosave_error",
+                        {"robot_id": robot_id, "error": str(exc)},
+                    )
+                    continue
+                if metadata is not None:
+                    self.map_saved_revisions[robot_id] = target_revision
+                    self.map_last_save_monotonic[robot_id] = time.monotonic()
+
+    async def _save_all_maps(self) -> None:
+        for robot_id in list(self.lidar_voxels.keys()):
+            try:
+                await asyncio.to_thread(self._save_latest_map_sync, robot_id)
+            except Exception as exc:
+                self._audit(
+                    "map_shutdown_save_error",
+                    {"robot_id": robot_id, "error": str(exc)},
+                )
 
     def _setup_cors(self) -> None:
         origins = [x.strip() for x in self.args.cors_origin if x.strip()]
@@ -641,9 +983,11 @@ class CoreRuntime:
                     x = float(pose.get("x"))
                     y = float(pose.get("y"))
                     if math.isfinite(x) and math.isfinite(y):
-                        path = self.robot_paths[robot_id]
-                        if not path or math.hypot(x - path[-1][0], y - path[-1][1]) >= 0.05:
-                            path.append((x, y))
+                        with self.map_data_locks[robot_id]:
+                            path = self.robot_paths[robot_id]
+                            if not path or math.hypot(x - path[-1][0], y - path[-1][1]) >= 0.05:
+                                path.append((x, y))
+                                self.map_revisions[robot_id] += 1
 
             await self._broadcast({
                 "type": "telemetry",
@@ -980,8 +1324,10 @@ class CoreRuntime:
         @app.on_event("startup")
         async def _startup() -> None:
             self.loop = asyncio.get_running_loop()
+            await asyncio.to_thread(self._restore_persisted_maps_sync)
             self._setup_mqtt()
             self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self.map_save_task = asyncio.create_task(self._map_persistence_loop())
             self._audit("server_start", {"pid": str(uuid.uuid4())})
 
         @app.on_event("shutdown")
@@ -996,6 +1342,12 @@ class CoreRuntime:
                 self.heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.heartbeat_task
+            if self.map_save_task:
+                self.map_save_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.map_save_task
+
+            await self._save_all_maps()
 
             if self.mqtt_client is not None:
                 with contextlib.suppress(Exception):
@@ -1013,6 +1365,7 @@ class CoreRuntime:
                 "known_robots": self._known_robots(),
                 "frontend_clients": len(self.frontend_sockets),
                 "edge_media_clients": len(self.edge_media_sockets),
+                "stored_maps": len(await asyncio.to_thread(self._list_maps_sync)),
             }
 
         @app.get("/api/robots")
@@ -1020,6 +1373,40 @@ class CoreRuntime:
             return {
                 "robots": self._known_robots(),
             }
+
+        @app.get("/api/maps")
+        async def list_maps(
+            robot_id: Optional[str] = Query(default=None),
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            try:
+                maps = await asyncio.to_thread(self._list_maps_sync, robot_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return {
+                "robot_id": robot_id,
+                "maps": maps,
+                "storage": "server",
+            }
+
+        @app.get("/api/maps/{robot_id}/{map_id}")
+        async def get_map(
+            robot_id: str,
+            map_id: str,
+            compressed: bool = Query(default=True),
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            try:
+                return await asyncio.to_thread(
+                    self._map_payload_sync,
+                    robot_id,
+                    map_id,
+                    compressed,
+                )
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="Map not found") from exc
+            except (KeyError, OSError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         @app.get("/api/robots/{robot_id}/state")
         async def robot_state(robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)) -> Dict[str, Any]:
@@ -1051,6 +1438,36 @@ class CoreRuntime:
                 "speed_profiles": self._speed_profiles(),
                 "active_speed_profile": self._active_speed_profile(robot_id),
             }
+
+        @app.post("/api/robots/{robot_id}/maps/snapshot")
+        async def save_map_snapshot(
+            robot_id: str,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            if auth["role"] not in {"operator", "admin"}:
+                raise HTTPException(status_code=403, detail="Viewer role cannot save maps")
+            try:
+                metadata = await asyncio.to_thread(
+                    self._create_map_snapshot_sync,
+                    robot_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail="Could not store map") from exc
+
+            self.map_saved_revisions[robot_id] = self.map_revisions[robot_id]
+            self.map_last_save_monotonic[robot_id] = time.monotonic()
+            self._audit(
+                "map_snapshot_saved",
+                {
+                    "robot_id": robot_id,
+                    "map_id": metadata["map_id"],
+                    "point_count": metadata["point_count"],
+                    "user_id": auth["user_id"],
+                },
+            )
+            return {"ok": True, "map": metadata}
 
         @app.get("/api/robots/{robot_id}/replay")
         async def robot_replay(
@@ -1399,6 +1816,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lidar-render-jpeg-quality", type=int, default=68)
     parser.add_argument("--lidar-grid-step-m", type=int, default=1)
     parser.add_argument("--lidar-path-max-points", type=int, default=1000)
+    parser.add_argument(
+        "--map-storage-dir",
+        default=str(Path(__file__).resolve().parent / "maps"),
+        help="Server directory used to persist accumulated 3D maps.",
+    )
+    parser.add_argument(
+        "--map-autosave-interval-s",
+        type=float,
+        default=5.0,
+        help="Seconds between automatic saves of a changed map.",
+    )
+    parser.add_argument(
+        "--map-max-snapshots",
+        type=int,
+        default=0,
+        help="Maximum snapshots per robot. Use 0 (default) to keep every snapshot.",
+    )
 
     parser.add_argument("--audit-log", default="./server/audit/server_audit.jsonl")
     parser.add_argument("--replay-max-items", type=int, default=2000)
@@ -1490,6 +1924,15 @@ def parse_args() -> argparse.Namespace:
 
     if args.lidar_grid_step_m <= 0 or args.lidar_path_max_points <= 0:
         parser.error("lidar grid/path settings must be > 0")
+
+    if not str(args.map_storage_dir).strip():
+        parser.error("--map-storage-dir must not be empty")
+
+    if args.map_autosave_interval_s <= 0:
+        parser.error("--map-autosave-interval-s must be > 0")
+
+    if args.map_max_snapshots < 0:
+        parser.error("--map-max-snapshots must be >= 0")
 
     return args
 

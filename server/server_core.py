@@ -86,6 +86,7 @@ class CoreRuntime:
         self.frontend_queues: Dict[WebSocket, asyncio.Queue[str]] = {}
         self.frontend_sender_tasks: Dict[WebSocket, asyncio.Task[None]] = {}
         self.edge_media_sockets: Dict[str, WebSocket] = {}
+        self.drive_owners: Dict[str, WebSocket] = {}
 
         self.latest_telemetry: Dict[str, Dict[str, Any]] = {}
         self.latest_media: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
@@ -355,6 +356,61 @@ class CoreRuntime:
         if command_type not in allowed:
             raise HTTPException(status_code=403, detail=f"Role '{role}' cannot send command '{command_type}'")
 
+    def _publish_realtime_drive(
+        self,
+        robot_id: str,
+        user_id: str,
+        payload: Dict[str, Any],
+        sequence: int,
+    ) -> bool:
+        if self.mqtt_client is None:
+            return False
+
+        sanitized = self._sanitize_command("move", payload)
+        sanitized["duration_ms"] = int(
+            clamp(float(payload.get("duration_ms", 360)), 200, 700)
+        )
+
+        wire = {
+            "command_id": f"drive-{user_id}-{sequence}",
+            "robot_id": robot_id,
+            "type": "move",
+            "payload": sanitized,
+            "issued_by": user_id,
+            "ts": time.time(),
+            "ttl_ms": 700,
+            "streaming": True,
+        }
+        self.last_control_activity[robot_id] = time.time()
+        result = self.mqtt_client.publish(
+            self._mqtt_topic(robot_id, "commands/in"),
+            json.dumps(wire, separators=(",", ":")),
+            qos=0,
+        )
+        return getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS
+
+    def _publish_realtime_stop(self, robot_id: str, user_id: str) -> bool:
+        if self.mqtt_client is None:
+            return False
+
+        wire = {
+            "command_id": f"stop-{uuid.uuid4().hex[:12]}",
+            "robot_id": robot_id,
+            "type": "stop",
+            "payload": {},
+            "issued_by": user_id,
+            "ts": time.time(),
+            "ttl_ms": 700,
+            "streaming": True,
+        }
+        self.last_control_activity[robot_id] = time.time()
+        result = self.mqtt_client.publish(
+            self._mqtt_topic(robot_id, "commands/in"),
+            json.dumps(wire, separators=(",", ":")),
+            qos=0,
+        )
+        return getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS
+
     def _sanitize_command(self, command_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         output = dict(payload)
 
@@ -608,6 +664,8 @@ class CoreRuntime:
             self.frontend_queues[ws] = queue
             sender_task = asyncio.create_task(self._frontend_sender_loop(ws, queue))
             self.frontend_sender_tasks[ws] = sender_task
+            driven_robots: Set[str] = set()
+            last_drive_publish: Dict[str, float] = {}
 
             for robot_id, telemetry in self.latest_telemetry.items():
                 self._enqueue_frontend(
@@ -633,13 +691,56 @@ class CoreRuntime:
                     text = await ws.receive_text()
                     with contextlib.suppress(Exception):
                         message = json.loads(text)
-                        if message.get("op") == "heartbeat":
+                        op = str(message.get("op", "")).strip()
+
+                        if op == "heartbeat":
                             robot_id = str(message.get("robot_id", "")).strip()
                             if robot_id:
                                 self.last_control_activity[robot_id] = time.time()
+                            continue
+
+                        if op not in {"drive", "drive_stop"}:
+                            continue
+                        if auth["role"] not in {"operator", "admin"}:
+                            continue
+
+                        robot_id = str(message.get("robot_id", "")).strip()
+                        if not robot_id:
+                            continue
+
+                        if op == "drive":
+                            now = time.monotonic()
+                            if now - last_drive_publish.get(robot_id, 0.0) < 0.03:
+                                continue
+
+                            payload = message.get("payload", {})
+                            if not isinstance(payload, dict):
+                                continue
+
+                            sequence = int(message.get("sequence", 0))
+                            if self._publish_realtime_drive(
+                                robot_id,
+                                auth["user_id"],
+                                payload,
+                                sequence,
+                            ):
+                                last_drive_publish[robot_id] = now
+                                driven_robots.add(robot_id)
+                                self.drive_owners[robot_id] = ws
+                            continue
+
+                        if self._publish_realtime_stop(robot_id, auth["user_id"]):
+                            driven_robots.discard(robot_id)
+                            if self.drive_owners.get(robot_id) is ws:
+                                self.drive_owners.pop(robot_id, None)
             except WebSocketDisconnect:
                 pass
             finally:
+                for robot_id in driven_robots:
+                    if self.drive_owners.get(robot_id) is not ws:
+                        continue
+                    self._publish_realtime_stop(robot_id, auth["user_id"])
+                    self.drive_owners.pop(robot_id, None)
                 self.frontend_sockets.discard(ws)
                 self.frontend_queues.pop(ws, None)
                 sender_task = self.frontend_sender_tasks.pop(ws, None)

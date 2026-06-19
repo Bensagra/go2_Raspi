@@ -251,7 +251,7 @@
         <span id="speedLabel" class="status">50 (Normal)</span>
 
         <label>Loop(ms)</label>
-        <input id="loopMs" class="small" type="number" min="150" max="900" value="200">
+        <input id="loopMs" class="small" type="number" min="50" max="250" value="80">
       </div>
 
       <div class="row" style="margin-top: 8px;">
@@ -274,7 +274,10 @@
         <span id="audioStatus" class="status">audio bloqueado</span>
       </div>
       <p class="hint">
-        Teclado: <span class="kbd">WASD o Flechas</span> mover/girar, <span class="kbd">Q/E</span> lateral, <span class="kbd">Shift</span> boost, <span class="kbd">Space</span> stop, <span class="kbd">L</span> lidar, <span class="kbd">P</span> audio.
+        Movimiento continuo: mantené <span class="kbd">2</span> para avanzar y, sin soltarlo, usá
+        <span class="kbd">1/4</span> para girar a la izquierda o <span class="kbd">3/6</span> para girar a la derecha.
+        También funcionan <span class="kbd">WASD o Flechas</span>, <span class="kbd">Q/E</span> lateral,
+        <span class="kbd">Shift</span> boost y <span class="kbd">Space</span> stop.
       </p>
     </div>
 
@@ -299,8 +302,16 @@
       "KeyW", "KeyA", "KeyS", "KeyD",
       "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight",
       "KeyQ", "KeyE", "KeyZ", "KeyC",
+      "Digit1", "Digit2", "Digit3", "Digit4", "Digit6",
+      "Numpad1", "Numpad2", "Numpad3", "Numpad4", "Numpad6",
       "ShiftLeft", "ShiftRight",
     ]);
+    const FORWARD_KEYS = ["KeyW", "ArrowUp", "Digit2", "Numpad2"];
+    const BACKWARD_KEYS = ["KeyS", "ArrowDown"];
+    const LEFT_KEYS = ["KeyA", "ArrowLeft", "Digit1", "Digit4", "Numpad1", "Numpad4"];
+    const RIGHT_KEYS = ["KeyD", "ArrowRight", "Digit3", "Digit6", "Numpad3", "Numpad6"];
+    const STRAFE_LEFT_KEYS = ["KeyQ", "KeyZ"];
+    const STRAFE_RIGHT_KEYS = ["KeyE", "KeyC"];
 
     const state = {
       ws: null,
@@ -315,6 +326,7 @@
       lastMoveActive: false,
       lastMoveSentAt: 0,
       lastMoveSignature: "",
+      driveSequence: 0,
       keyState: new Set(),
       token: "",
       apiBase: "",
@@ -774,19 +786,19 @@
       let y = 0;
       let z = 0;
 
-      if (state.keyState.has("KeyW") || state.keyState.has("ArrowUp")) x += speed.linear;
-      if (state.keyState.has("KeyS") || state.keyState.has("ArrowDown")) x -= speed.linear;
-      if (state.keyState.has("KeyA") || state.keyState.has("ArrowLeft")) z += speed.angular;
-      if (state.keyState.has("KeyD") || state.keyState.has("ArrowRight")) z -= speed.angular;
-      if (state.keyState.has("KeyQ") || state.keyState.has("KeyZ")) y += speed.lateral;
-      if (state.keyState.has("KeyE") || state.keyState.has("KeyC")) y -= speed.lateral;
+      if (FORWARD_KEYS.some(code => state.keyState.has(code))) x += speed.linear;
+      if (BACKWARD_KEYS.some(code => state.keyState.has(code))) x -= speed.linear;
+      if (LEFT_KEYS.some(code => state.keyState.has(code))) z += speed.angular;
+      if (RIGHT_KEYS.some(code => state.keyState.has(code))) z -= speed.angular;
+      if (STRAFE_LEFT_KEYS.some(code => state.keyState.has(code))) y += speed.lateral;
+      if (STRAFE_RIGHT_KEYS.some(code => state.keyState.has(code))) y -= speed.lateral;
 
       return { x, y, z };
     }
 
     function parseLoopMs() {
-      const parsed = Math.round(parseNum(els.loopMs.value, 200));
-      const loopMs = clamp(parsed, 150, 900);
+      const parsed = Math.round(parseNum(els.loopMs.value, 80));
+      const loopMs = clamp(parsed, 50, 250);
       els.loopMs.value = String(loopMs);
       return loopMs;
     }
@@ -909,53 +921,63 @@
       updateMediaStatus();
     }
 
+    function sendDriveState(force = false) {
+      if (!state.connected || !state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+
+      const m = currentMoveFromKeys();
+      const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
+
+      if (!active) {
+        if (!state.lastMoveActive && !force) return true;
+
+        state.ws.send(JSON.stringify({
+          op: "drive_stop",
+          robot_id: state.robotId,
+          sequence: ++state.driveSequence,
+        }));
+        state.lastMoveActive = false;
+        state.lastMoveSignature = "";
+        state.lastMoveSentAt = Date.now();
+        return true;
+      }
+
+      const signature = `${m.x.toFixed(3)}:${m.y.toFixed(3)}:${m.z.toFixed(3)}`;
+      const now = Date.now();
+      const changed = signature !== state.lastMoveSignature;
+      if (!force && !changed && now - state.lastMoveSentAt < parseLoopMs() - 5) {
+        return true;
+      }
+
+      if (state.ws.bufferedAmount > 64 * 1024) {
+        return false;
+      }
+
+      const loopMs = parseLoopMs();
+      state.ws.send(JSON.stringify({
+        op: "drive",
+        robot_id: state.robotId,
+        sequence: ++state.driveSequence,
+        payload: {
+          linear_x: m.x,
+          lateral_y: m.y,
+          angular_z: m.z,
+          duration_ms: Math.max(260, loopMs * 4),
+        },
+      }));
+      state.lastMoveActive = true;
+      state.lastMoveSignature = signature;
+      state.lastMoveSentAt = now;
+      return true;
+    }
+
     function startControlLoop() {
       stopControlLoop();
       const loopMs = parseLoopMs();
 
-      state.controlLoop = setInterval(async () => {
-        if (!state.connected || state.controlSending) return;
-
-        const m = currentMoveFromKeys();
-        const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
-
-        if (active) {
-          const now = Date.now();
-          const signature = `${m.x.toFixed(3)}:${m.y.toFixed(3)}:${m.z.toFixed(3)}`;
-          if (signature === state.lastMoveSignature && now - state.lastMoveSentAt < 300) {
-            return;
-          }
-
-          state.controlSending = true;
-          try {
-            await sendCommand("move", {
-              linear_x: m.x,
-              lateral_y: m.y,
-              angular_z: m.z,
-              duration_ms: Math.max(260, Math.round(loopMs * 2)),
-            }, 900);
-            state.lastMoveActive = true;
-            state.lastMoveSignature = signature;
-            state.lastMoveSentAt = Date.now();
-          } catch (err) {
-            // Error already recorded in events.
-          } finally {
-            state.controlSending = false;
-          }
-          return;
-        }
-
-        if (state.lastMoveActive) {
-          state.controlSending = true;
-          try {
-            await sendCommand("stop", {}, 900);
-          } catch (err) {
-            // Error already recorded in events.
-          } finally {
-            state.controlSending = false;
-            state.lastMoveActive = false;
-          }
-        }
+      state.controlLoop = setInterval(() => {
+        sendDriveState(false);
       }, loopMs);
 
       state.serverHeartbeatLoop = setInterval(() => {
@@ -996,7 +1018,19 @@
       state.lastMoveSentAt = 0;
 
       try {
-        await sendCommand("stop", {}, 900);
+        if (
+          state.ws
+          && state.ws.readyState === WebSocket.OPEN
+          && state.ws.bufferedAmount <= 64 * 1024
+        ) {
+          state.ws.send(JSON.stringify({
+            op: "drive_stop",
+            robot_id: state.robotId,
+            sequence: ++state.driveSequence,
+          }));
+        } else {
+          await sendCommand("stop", {}, 900);
+        }
       } catch (err) {
         // Error already recorded in events.
       } finally {
@@ -1098,6 +1132,7 @@
         if (state.ws !== ws || generation !== state.connectGeneration) return;
         state.ws = null;
         state.connected = false;
+        state.keyState.clear();
         resetAudioQueue();
         setStatus("desconectado", false);
         stopControlLoop();
@@ -1134,7 +1169,10 @@
         if (cmd === "right") return sendCommand("move", { linear_x: 0.0, angular_z: -speed.angular, duration_ms: 460 });
         if (cmd === "strafeL") return sendCommand("move", { linear_x: 0.0, lateral_y: speed.lateral, duration_ms: 520 });
         if (cmd === "strafeR") return sendCommand("move", { linear_x: 0.0, lateral_y: -speed.lateral, duration_ms: 520 });
-        if (cmd === "stop") return sendCommand("stop", {});
+        if (cmd === "stop") {
+          state.keyState.clear();
+          return stopRobotNow();
+        }
         if (cmd === "modeManual") return sendCommand("enter_mode", { mode: "normal" });
       });
     });
@@ -1180,14 +1218,29 @@
       }
     });
 
+    function isTypingTarget(target) {
+      if (!(target instanceof Element)) return false;
+      return (
+        target.matches("input, textarea, select")
+        || target.isContentEditable
+      );
+    }
+
     window.addEventListener("keydown", async (ev) => {
       if (MOVEMENT_KEYS.has(ev.code)) {
+        if (isTypingTarget(ev.target)) return;
         ev.preventDefault();
+        const changed = !state.keyState.has(ev.code);
         state.keyState.add(ev.code);
+        if (changed) {
+          sendDriveState(true);
+        }
+        return;
       }
 
       if (ev.code === "Space") {
         ev.preventDefault();
+        state.keyState.clear();
         await stopRobotNow();
         return;
       }
@@ -1209,15 +1262,11 @@
       }
     });
 
-    window.addEventListener("keyup", async (ev) => {
+    window.addEventListener("keyup", (ev) => {
       if (MOVEMENT_KEYS.has(ev.code)) {
+        ev.preventDefault();
         state.keyState.delete(ev.code);
-      }
-
-      const m = currentMoveFromKeys();
-      const active = Math.abs(m.x) > 0 || Math.abs(m.y) > 0 || Math.abs(m.z) > 0;
-      if (!active) {
-        await stopRobotNow();
+        sendDriveState(true);
       }
     });
 

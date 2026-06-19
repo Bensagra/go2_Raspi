@@ -230,7 +230,7 @@ class EdgeGatewayService:
                     self.latest_motion_command = payload
 
                     if self.motion_marker_queued:
-                        if previous is not None:
+                        if previous is not None and not previous.get("streaming"):
                             self._send_command_ack(previous, "rejected", "superseded by newer motion command")
                         return
 
@@ -245,7 +245,8 @@ class EdgeGatewayService:
                 if command_type == "stop" and self.latest_motion_command is not None:
                     pending_motion = self.latest_motion_command
                     self.latest_motion_command = None
-                    self._send_command_ack(pending_motion, "rejected", "superseded by stop command")
+                    if not pending_motion.get("streaming"):
+                        self._send_command_ack(pending_motion, "rejected", "superseded by stop command")
 
                 try:
                     self.command_queue.put_nowait(payload)
@@ -417,6 +418,35 @@ class EdgeGatewayService:
             TOPIC_ALIAS_TO_VALUE["SPORT_MOD"],
             api_id,
             parameter,
+        )
+
+    def _sport_send_nowait(self, api_id: int, parameter: Optional[Any] = None) -> None:
+        connection = self.conn
+        if connection is None:
+            raise RuntimeError("Connection not ready")
+
+        channel = getattr(getattr(connection, "datachannel", None), "channel", None)
+        if getattr(channel, "readyState", "closed") != "open":
+            raise RuntimeError("Robot data channel is not open")
+
+        request_payload: Dict[str, Any] = {
+            "header": {
+                "identity": {
+                    "id": self._next_robot_request_id(),
+                    "api_id": api_id,
+                }
+            },
+            "parameter": "",
+        }
+        if parameter is not None:
+            request_payload["parameter"] = (
+                parameter if isinstance(parameter, str) else json.dumps(parameter)
+            )
+
+        connection.datachannel.pub_sub.publish_without_callback(
+            TOPIC_ALIAS_TO_VALUE["SPORT_MOD"],
+            request_payload,
+            DATA_CHANNEL_TYPE["REQUEST"],
         )
 
     async def _set_motion_mode(self, mode_name: str) -> Any:
@@ -871,7 +901,7 @@ class EdgeGatewayService:
         payload = command.get("payload", {}) if isinstance(command.get("payload"), dict) else {}
 
         if cmd_type == "stop":
-            await self._sport_request(int(SPORT_CMD["StopMove"]))
+            self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
             self.move_active = False
             self.pending_stop_deadline = 0.0
             return {"executed": "stop"}
@@ -888,7 +918,7 @@ class EdgeGatewayService:
             if duration_ms > 0:
                 self.pending_stop_deadline = time.monotonic() + (duration_ms / 1000.0)
 
-            await self._sport_request(int(SPORT_CMD["Move"]), {"x": x, "y": y, "z": z})
+            self._sport_send_nowait(int(SPORT_CMD["Move"]), {"x": x, "y": y, "z": z})
 
             return {
                 "executed": "move",
@@ -1026,22 +1056,27 @@ class EdgeGatewayService:
                     continue
 
             command_id = str(command.get("command_id", ""))
+            streaming = bool(command.get("streaming"))
 
             valid, reason = self._validate_command(command)
             if not valid:
-                self._send_command_ack(command, "rejected", reason)
+                if not streaming:
+                    self._send_command_ack(command, "rejected", reason)
                 continue
 
-            self._send_command_ack(command, "accepted")
+            if not streaming:
+                self._send_command_ack(command, "accepted")
 
             try:
                 result = await self._execute_command(command)
             except Exception as exc:
-                self._send_command_ack(command, "error", str(exc))
+                if not streaming:
+                    self._send_command_ack(command, "error", str(exc))
                 self._publish_event("command_error", {"command_id": command_id, "error": str(exc)})
                 continue
 
-            self._send_command_ack(command, "executed", extra={"result": result})
+            if not streaming:
+                self._send_command_ack(command, "executed", extra={"result": result})
 
     async def _watchdog_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -1057,7 +1092,7 @@ class EdgeGatewayService:
 
             if deadline_expired or heartbeat_expired:
                 try:
-                    await self._sport_request(int(SPORT_CMD["StopMove"]))
+                    self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
                 except Exception as exc:
                     self.pending_stop_deadline = time.monotonic() + self.args.stop_retry_interval_s
                     if now - self.last_heartbeat_fault_event_at >= 1.0:

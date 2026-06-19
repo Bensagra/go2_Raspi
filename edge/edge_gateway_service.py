@@ -6,6 +6,7 @@ import contextlib
 import json
 import time
 import uuid
+import zlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -60,6 +61,9 @@ class EdgeGatewayService:
 
         self.conn: Optional[UnitreeWebRTCConnection] = None
         self.video_task: Optional[asyncio.Task[None]] = None
+        self.video_encode_task: Optional[asyncio.Task[None]] = None
+        self.latest_camera_frame = None
+        self.camera_frame_ready = asyncio.Event()
         self.robot_connected_at = 0.0
         self.traffic_saving_disabled = False
 
@@ -82,7 +86,11 @@ class EdgeGatewayService:
         self.camera_enabled = args.enable_camera
         self.camera_emit_every = args.camera_emit_every
         self.camera_jpeg_quality = args.camera_jpeg_quality
+        self.camera_target_fps = args.camera_target_fps
+        self.camera_max_width = args.camera_max_width
         self.camera_frame_count = 0
+        self.camera_encoded_count = 0
+        self.last_camera_emit_at = 0.0
 
         self.audio_enabled = args.enable_audio
         self.audio_emit_every = args.audio_emit_every
@@ -520,8 +528,13 @@ class EdgeGatewayService:
             self.video_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.video_task
+        if self.video_encode_task and not self.video_encode_task.done():
+            self.video_encode_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.video_encode_task
 
         self.video_task = asyncio.create_task(self._consume_video_track(track))
+        self.video_encode_task = asyncio.create_task(self._camera_encode_loop())
         self._publish_event("video_track_received", {})
 
     async def _consume_video_track(self, track) -> None:
@@ -532,38 +545,77 @@ class EdgeGatewayService:
             if not self.camera_enabled:
                 continue
 
-            if self.camera_frame_count % self.camera_emit_every != 0 and self.camera_frame_count != 1:
+            self.latest_camera_frame = frame
+            self.camera_frame_ready.set()
+
+    async def _camera_encode_loop(self) -> None:
+        while not self.stop_event.is_set():
+            await self.camera_frame_ready.wait()
+            self.camera_frame_ready.clear()
+
+            frame = self.latest_camera_frame
+            self.latest_camera_frame = None
+            if frame is None or not self.camera_enabled:
                 continue
 
-            encoded = await asyncio.to_thread(self._encode_camera_frame, frame)
+            min_interval = 1.0 / max(self.camera_target_fps, 1.0)
+            delay = min_interval - (time.monotonic() - self.last_camera_emit_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+                if self.latest_camera_frame is not None:
+                    frame = self.latest_camera_frame
+                    self.latest_camera_frame = None
+                    self.camera_frame_ready.clear()
+
+            encode_started = time.monotonic()
+            encoded, width, height = await asyncio.to_thread(self._encode_camera_frame, frame)
             if encoded is None:
                 continue
+            encoded_at = time.time()
+            self.last_camera_emit_at = time.monotonic()
+            self.camera_encoded_count += 1
 
             await self._enqueue_media(
                 {
                     "robot_id": self.args.robot_id,
-                    "ts": time.time(),
+                    "ts": encoded_at,
                     "stream": "video",
                     "data": {
-                        "frame_index": self.camera_frame_count,
-                        "width": frame.width,
-                        "height": frame.height,
+                        "frame_index": self.camera_encoded_count,
+                        "source_frame_index": self.camera_frame_count,
+                        "width": width,
+                        "height": height,
                         "image_format": "jpg",
                         "image_base64": base64.b64encode(encoded).decode("ascii"),
+                        "encoded_ts": encoded_at,
+                        "encode_ms": round((time.monotonic() - encode_started) * 1000.0, 2),
+                        "target_fps": self.camera_target_fps,
                     },
                 }
             )
 
-    def _encode_camera_frame(self, frame) -> Optional[bytes]:
+    def _encode_camera_frame(self, frame) -> Tuple[Optional[bytes], int, int]:
         image = frame.to_ndarray(format="bgr24")
+        height, width = image.shape[:2]
+        if self.camera_max_width > 0 and width > self.camera_max_width:
+            scale = self.camera_max_width / float(width)
+            width = self.camera_max_width
+            height = max(1, int(round(height * scale)))
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+
         ok, encoded = cv2.imencode(
             ".jpg",
             image,
-            [cv2.IMWRITE_JPEG_QUALITY, self.camera_jpeg_quality],
+            [
+                cv2.IMWRITE_JPEG_QUALITY,
+                self.camera_jpeg_quality,
+                cv2.IMWRITE_JPEG_OPTIMIZE,
+                0,
+            ],
         )
         if not ok or encoded is None:
-            return None
-        return encoded.tobytes()
+            return None, width, height
+        return encoded.tobytes(), width, height
 
     async def _on_audio_frame(self, frame) -> None:
         self.audio_frame_count += 1
@@ -736,36 +788,6 @@ class EdgeGatewayService:
 
         return None
 
-    def _render_lidar_preview(self, points: np.ndarray) -> Optional[np.ndarray]:
-        if points.size == 0:
-            return None
-
-        size = self.args.lidar_preview_size
-        image = np.zeros((size, size, 3), dtype=np.uint8)
-
-        xy = points[:, :2].astype(np.float32)
-        finite = np.isfinite(xy).all(axis=1)
-        xy = xy[finite]
-        if xy.size == 0:
-            return None
-
-        if self.args.lidar_preview_max_points > 0 and xy.shape[0] > self.args.lidar_preview_max_points:
-            step = max(xy.shape[0] // self.args.lidar_preview_max_points, 1)
-            xy = xy[::step]
-
-        max_abs = np.percentile(np.abs(xy), 98, axis=0)
-        span = float(max(max_abs.max(), 0.5))
-        scale = (size * 0.45) / span
-
-        px = (xy[:, 0] * scale + size / 2.0).astype(np.int32)
-        py = (size / 2.0 - xy[:, 1] * scale).astype(np.int32)
-
-        valid = (px >= 0) & (px < size) & (py >= 0) & (py < size)
-        image[py[valid], px[valid]] = (60, 230, 60)
-        cv2.circle(image, (size // 2, size // 2), 3, (0, 0, 255), -1)
-
-        return image
-
     async def _maybe_publish_lidar_media(self, payload: Any) -> None:
         now = time.monotonic()
         if now - self.last_lidar_media_at < (1.0 / max(self.args.lidar_media_hz, 0.01)):
@@ -776,36 +798,52 @@ class EdgeGatewayService:
         if points is None:
             return
 
-        encoded = await asyncio.to_thread(self._encode_lidar_preview, points)
-        if encoded is None:
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 2:
             return
+
+        if points.shape[1] == 2:
+            points = np.column_stack(
+                (points, np.zeros(points.shape[0], dtype=np.float32))
+            )
+        else:
+            points = points[:, :3]
+
+        finite = np.isfinite(points).all(axis=1)
+        points = points[finite]
+        if points.size == 0:
+            return
+
+        max_points = self.args.lidar_uplink_max_points
+        if max_points > 0 and points.shape[0] > max_points:
+            step = max(int(np.ceil(points.shape[0] / max_points)), 1)
+            points = points[::step][:max_points]
+
+        raw = np.ascontiguousarray(points, dtype="<f4").tobytes()
+        compressed = await asyncio.to_thread(
+            zlib.compress,
+            raw,
+            self.args.lidar_compression_level,
+        )
+        mins = points.min(axis=0)
+        maxs = points.max(axis=0)
 
         await self._enqueue_media(
             {
                 "robot_id": self.args.robot_id,
                 "ts": time.time(),
-                "stream": "lidar",
+                "stream": "lidar_points",
                 "data": {
-                    "image_format": "jpg",
-                    "image_base64": base64.b64encode(encoded).decode("ascii"),
+                    "point_format": "f32_xyz_zlib",
+                    "points_base64": base64.b64encode(compressed).decode("ascii"),
                     "point_count": int(points.shape[0]),
+                    "uncompressed_bytes": len(raw),
+                    "bounds_min": mins.tolist(),
+                    "bounds_max": maxs.tolist(),
+                    "coordinate_frame": "map",
                 },
             }
         )
-
-    def _encode_lidar_preview(self, points: np.ndarray) -> Optional[bytes]:
-        preview = self._render_lidar_preview(points)
-        if preview is None:
-            return None
-
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            preview,
-            [cv2.IMWRITE_JPEG_QUALITY, self.args.lidar_preview_jpeg_quality],
-        )
-        if not ok or encoded is None:
-            return None
-        return encoded.tobytes()
 
     def _telemetry_from_low_state(self) -> Dict[str, Any]:
         topic = TOPIC_ALIAS_TO_VALUE.get("LOW_STATE", "")
@@ -922,6 +960,9 @@ class EdgeGatewayService:
                 "lidar_enabled": self.lidar_enabled,
                 "audio_enabled": self.audio_enabled,
                 "camera_emit_every": self.camera_emit_every,
+                "camera_target_fps": self.camera_target_fps,
+                "camera_max_width": self.camera_max_width,
+                "camera_encoded_frames": self.camera_encoded_count,
                 "audio_emit_every": self.audio_emit_every,
                 "audio_max_bytes": self.audio_max_bytes,
                 "audio_queue_depth": self.media_queue.qsize(),
@@ -1097,6 +1138,18 @@ class EdgeGatewayService:
                     raise ValueError("jpeg_quality must be between 1 and 100")
                 self.camera_jpeg_quality = quality
 
+            if "target_fps" in payload:
+                target_fps = float(payload.get("target_fps", self.camera_target_fps))
+                if target_fps < 1 or target_fps > 30:
+                    raise ValueError("target_fps must be between 1 and 30")
+                self.camera_target_fps = target_fps
+
+            if "max_width" in payload:
+                max_width = int(payload.get("max_width", self.camera_max_width))
+                if max_width < 0 or (0 < max_width < 320):
+                    raise ValueError("max_width must be 0 or >= 320")
+                self.camera_max_width = max_width
+
             if "enabled" in payload:
                 await self._set_video(bool(payload.get("enabled")))
 
@@ -1105,6 +1158,8 @@ class EdgeGatewayService:
                 "camera_enabled": self.camera_enabled,
                 "emit_every": self.camera_emit_every,
                 "jpeg_quality": self.camera_jpeg_quality,
+                "target_fps": self.camera_target_fps,
+                "max_width": self.camera_max_width,
             }
 
         if cmd_type == "set_audio":
@@ -1298,16 +1353,19 @@ class EdgeGatewayService:
 
                         batch: List[Dict[str, Any]] = []
 
+                        video = self.latest_media_by_stream.pop("video", None)
+                        if video is not None:
+                            batch.append(video)
+
                         for _ in range(self.args.media_audio_batch_size):
                             try:
                                 batch.append(self.media_queue.get_nowait())
                             except asyncio.QueueEmpty:
                                 break
 
-                        for stream in ("lidar", "video"):
-                            payload = self.latest_media_by_stream.pop(stream, None)
-                            if payload is not None:
-                                batch.append(payload)
+                        lidar_points = self.latest_media_by_stream.pop("lidar_points", None)
+                        if lidar_points is not None:
+                            batch.append(lidar_points)
 
                         for stream in list(self.latest_media_by_stream):
                             payload = self.latest_media_by_stream.pop(stream, None)
@@ -1406,8 +1464,15 @@ class EdgeGatewayService:
             self.video_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.video_task
+        if self.video_encode_task and not self.video_encode_task.done():
+            self.video_encode_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.video_encode_task
 
         self.video_task = None
+        self.video_encode_task = None
+        self.latest_camera_frame = None
+        self.camera_frame_ready.clear()
 
         connection = self.conn
         if connection is not None:
@@ -1580,16 +1645,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-angular-speed", type=float, default=0.8)
     parser.add_argument("--turn-ms-per-degree", type=float, default=15.0)
 
-    parser.add_argument("--camera-emit-every", type=int, default=3)
-    parser.add_argument("--camera-jpeg-quality", type=int, default=55)
+    parser.add_argument("--camera-emit-every", type=int, default=1)
+    parser.add_argument("--camera-jpeg-quality", type=int, default=45)
+    parser.add_argument("--camera-target-fps", type=float, default=15.0)
+    parser.add_argument("--camera-max-width", type=int, default=960)
 
     parser.add_argument("--audio-emit-every", type=int, default=2)
     parser.add_argument("--audio-max-bytes", type=int, default=24576)
 
-    parser.add_argument("--lidar-media-hz", type=float, default=2.0)
-    parser.add_argument("--lidar-preview-size", type=int, default=420)
-    parser.add_argument("--lidar-preview-max-points", type=int, default=15000)
-    parser.add_argument("--lidar-preview-jpeg-quality", type=int, default=60)
+    parser.add_argument("--lidar-media-hz", type=float, default=5.0)
+    parser.add_argument("--lidar-uplink-max-points", type=int, default=30000)
+    parser.add_argument("--lidar-compression-level", type=int, default=1)
 
     parser.add_argument(
         "--media-ws-url",
@@ -1620,6 +1686,12 @@ def parse_args() -> argparse.Namespace:
 
     if args.camera_jpeg_quality < 1 or args.camera_jpeg_quality > 100:
         parser.error("--camera-jpeg-quality must be between 1 and 100")
+
+    if args.camera_target_fps < 1 or args.camera_target_fps > 30:
+        parser.error("--camera-target-fps must be between 1 and 30")
+
+    if args.camera_max_width < 0 or (0 < args.camera_max_width < 320):
+        parser.error("--camera-max-width must be 0 or >= 320")
 
     if args.audio_emit_every <= 0:
         parser.error("--audio-emit-every must be > 0")
@@ -1684,11 +1756,11 @@ def parse_args() -> argparse.Namespace:
     if args.lidar_media_hz <= 0:
         parser.error("--lidar-media-hz must be > 0")
 
-    if args.lidar_preview_size < 200:
-        parser.error("--lidar-preview-size must be >= 200")
+    if args.lidar_uplink_max_points <= 0:
+        parser.error("--lidar-uplink-max-points must be > 0")
 
-    if args.lidar_preview_jpeg_quality < 1 or args.lidar_preview_jpeg_quality > 100:
-        parser.error("--lidar-preview-jpeg-quality must be between 1 and 100")
+    if args.lidar_compression_level < 0 or args.lidar_compression_level > 9:
+        parser.error("--lidar-compression-level must be between 0 and 9")
 
     if args.mqtt_port <= 0 or args.mqtt_port > 65535:
         parser.error("--mqtt-port must be between 1 and 65535")

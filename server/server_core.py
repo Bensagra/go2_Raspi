@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import base64
 import contextlib
 import json
+import math
 import time
 import uuid
-from collections import defaultdict, deque
+import zlib
+from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import paho.mqtt.client as mqtt
+import cv2
+import numpy as np
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -86,6 +91,8 @@ class CoreRuntime:
 
         self.frontend_sockets: Set[WebSocket] = set()
         self.frontend_queues: Dict[WebSocket, asyncio.Queue[str]] = {}
+        self.frontend_latest_media: Dict[WebSocket, Dict[str, str]] = {}
+        self.frontend_ready: Dict[WebSocket, asyncio.Event] = {}
         self.frontend_sender_tasks: Dict[WebSocket, asyncio.Task[None]] = {}
         self.edge_media_sockets: Dict[str, WebSocket] = {}
         self.drive_owners: Dict[str, WebSocket] = {}
@@ -93,6 +100,16 @@ class CoreRuntime:
 
         self.latest_telemetry: Dict[str, Dict[str, Any]] = {}
         self.latest_media: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        self.lidar_voxels: Dict[
+            str,
+            OrderedDict[Tuple[int, int, int], Tuple[float, float, float]],
+        ] = defaultdict(OrderedDict)
+        self.lidar_latest_packets: Dict[str, Dict[str, Any]] = {}
+        self.lidar_events: Dict[str, asyncio.Event] = {}
+        self.lidar_tasks: Dict[str, asyncio.Task[None]] = {}
+        self.robot_paths: Dict[str, Deque[Tuple[float, float]]] = defaultdict(
+            lambda: deque(maxlen=self.args.lidar_path_max_points)
+        )
 
         self.telemetry_history: Dict[str, Deque[Dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=self.args.replay_max_items)
@@ -152,13 +169,28 @@ class CoreRuntime:
             return
 
         text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-        for queue in list(self.frontend_queues.values()):
-            if queue.full():
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
+        is_latest_media = (
+            payload.get("type") == "media"
+            and payload.get("stream") in {"video", "lidar"}
+        )
 
-            with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(text)
+        for ws, queue in list(self.frontend_queues.items()):
+            if is_latest_media:
+                robot_id = str(payload.get("robot_id", ""))
+                stream = str(payload.get("stream", ""))
+                self.frontend_latest_media.setdefault(ws, {})[
+                    f"{robot_id}:{stream}"
+                ] = text
+            else:
+                if queue.full():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        queue.get_nowait()
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait(text)
+
+            ready = self.frontend_ready.get(ws)
+            if ready is not None:
+                ready.set()
 
     def _enqueue_frontend(self, ws: WebSocket, payload: Dict[str, Any]) -> None:
         queue = self.frontend_queues.get(ws)
@@ -166,21 +198,52 @@ class CoreRuntime:
             return
 
         text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-        if queue.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                queue.get_nowait()
+        if payload.get("type") == "media" and payload.get("stream") in {"video", "lidar"}:
+            robot_id = str(payload.get("robot_id", ""))
+            stream = str(payload.get("stream", ""))
+            self.frontend_latest_media.setdefault(ws, {})[
+                f"{robot_id}:{stream}"
+            ] = text
+        else:
+            if queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(text)
 
-        with contextlib.suppress(asyncio.QueueFull):
-            queue.put_nowait(text)
+        ready = self.frontend_ready.get(ws)
+        if ready is not None:
+            ready.set()
 
     async def _frontend_sender_loop(self, ws: WebSocket, queue: asyncio.Queue[str]) -> None:
         try:
             while True:
-                text = await queue.get()
-                await asyncio.wait_for(
-                    ws.send_text(text),
-                    timeout=self.args.frontend_send_timeout_s,
-                )
+                ready = self.frontend_ready[ws]
+                latest = self.frontend_latest_media[ws]
+                batch: List[str] = []
+
+                video_keys = [key for key in latest if key.endswith(":video")]
+                if video_keys:
+                    batch.append(latest.pop(video_keys[-1]))
+
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    batch.append(queue.get_nowait())
+
+                lidar_keys = [key for key in latest if key.endswith(":lidar")]
+                if lidar_keys:
+                    batch.append(latest.pop(lidar_keys[-1]))
+
+                if not batch:
+                    ready.clear()
+                    if queue.empty() and not latest:
+                        await ready.wait()
+                    continue
+
+                for text in batch:
+                    await asyncio.wait_for(
+                        ws.send_text(text),
+                        timeout=self.args.frontend_send_timeout_s,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -188,11 +251,317 @@ class CoreRuntime:
         finally:
             self.frontend_sockets.discard(ws)
             self.frontend_queues.pop(ws, None)
+            self.frontend_latest_media.pop(ws, None)
+            self.frontend_ready.pop(ws, None)
             current_task = asyncio.current_task()
             if self.frontend_sender_tasks.get(ws) is current_task:
                 self.frontend_sender_tasks.pop(ws, None)
             with contextlib.suppress(Exception):
                 await ws.close()
+
+    def _decode_lidar_points(self, data: Dict[str, Any]) -> np.ndarray:
+        if str(data.get("point_format", "")) != "f32_xyz_zlib":
+            raise ValueError("unsupported lidar point format")
+
+        encoded = data.get("points_base64")
+        if not isinstance(encoded, str) or not encoded:
+            raise ValueError("missing lidar points")
+
+        compressed = base64.b64decode(encoded, validate=True)
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(
+            compressed,
+            self.args.lidar_max_packet_bytes + 1,
+        )
+        if decompressor.unconsumed_tail:
+            raise ValueError("lidar packet exceeds server limit")
+        raw += decompressor.flush()
+        if len(raw) > self.args.lidar_max_packet_bytes:
+            raise ValueError("lidar packet exceeds server limit")
+        if len(raw) % 12 != 0:
+            raise ValueError("invalid float32 xyz payload length")
+
+        points = np.frombuffer(raw, dtype="<f4").reshape(-1, 3)
+        declared_count = int(data.get("point_count", points.shape[0]))
+        if declared_count != points.shape[0]:
+            raise ValueError("lidar point count mismatch")
+
+        finite = np.isfinite(points).all(axis=1)
+        return np.asarray(points[finite], dtype=np.float32)
+
+    def _update_lidar_voxels(self, robot_id: str, points: np.ndarray) -> None:
+        if points.size == 0:
+            return
+
+        resolution = self.args.lidar_voxel_size
+        keys = np.floor(points / resolution).astype(np.int32)
+        _, unique_indices = np.unique(keys, axis=0, return_index=True)
+        unique_points = points[unique_indices]
+        unique_keys = keys[unique_indices]
+
+        voxels = self.lidar_voxels[robot_id]
+        for key_array, point in zip(unique_keys, unique_points):
+            key = (int(key_array[0]), int(key_array[1]), int(key_array[2]))
+            voxels[key] = (float(point[0]), float(point[1]), float(point[2]))
+            voxels.move_to_end(key)
+
+        while len(voxels) > self.args.lidar_map_max_voxels:
+            voxels.popitem(last=False)
+
+    def _robot_pose_for_map(
+        self,
+        robot_id: str,
+        points: np.ndarray,
+    ) -> Tuple[float, float, float]:
+        telemetry = self.latest_telemetry.get(robot_id, {})
+        pose = telemetry.get("pose", {}) if isinstance(telemetry, dict) else {}
+        try:
+            x = float(pose.get("x"))
+            y = float(pose.get("y"))
+            yaw = float(pose.get("yaw", 0.0) or 0.0)
+            if math.isfinite(x) and math.isfinite(y) and math.isfinite(yaw):
+                return x, y, yaw
+        except (TypeError, ValueError):
+            pass
+
+        if points.size:
+            center = np.median(points[:, :2], axis=0)
+            return float(center[0]), float(center[1]), 0.0
+        return 0.0, 0.0, 0.0
+
+    def _render_lidar_map(
+        self,
+        robot_id: str,
+        source_point_count: int,
+    ) -> Optional[Dict[str, Any]]:
+        voxels = self.lidar_voxels.get(robot_id)
+        if not voxels:
+            return None
+
+        points = np.asarray(list(voxels.values()), dtype=np.float32)
+        if points.shape[0] > self.args.lidar_render_max_points:
+            step = max(
+                int(np.ceil(points.shape[0] / self.args.lidar_render_max_points)),
+                1,
+            )
+            points = points[::step]
+
+        center_x, center_y, yaw = self._robot_pose_for_map(robot_id, points)
+        half_range = self.args.lidar_map_range_m / 2.0
+        relative = points.copy()
+        relative[:, 0] -= center_x
+        relative[:, 1] -= center_y
+        visible = (
+            (np.abs(relative[:, 0]) <= half_range)
+            & (np.abs(relative[:, 1]) <= half_range)
+            & (relative[:, 2] >= self.args.lidar_min_z)
+            & (relative[:, 2] <= self.args.lidar_max_z)
+        )
+        relative = relative[visible]
+        if relative.size == 0:
+            return None
+
+        height = self.args.lidar_render_height
+        width = self.args.lidar_render_width
+        panel_width = width // 2
+        canvas = np.full((height, width, 3), (12, 18, 25), dtype=np.uint8)
+
+        z_low, z_high = np.percentile(relative[:, 2], [2, 98])
+        if z_high - z_low < 0.1:
+            z_high = z_low + 0.1
+        z_norm = np.clip((relative[:, 2] - z_low) / (z_high - z_low), 0, 1)
+        colors = cv2.applyColorMap(
+            (z_norm * 255).astype(np.uint8).reshape(-1, 1),
+            cv2.COLORMAP_TURBO,
+        ).reshape(-1, 3)
+
+        top_size = min(panel_width, height) - 34
+        origin_x = 17 + top_size // 2
+        origin_y = 17 + top_size // 2
+        top_scale = top_size / self.args.lidar_map_range_m
+
+        for meter in range(
+            -int(half_range),
+            int(half_range) + 1,
+            max(1, self.args.lidar_grid_step_m),
+        ):
+            offset = int(round(meter * top_scale))
+            cv2.line(
+                canvas,
+                (origin_x + offset, 17),
+                (origin_x + offset, 17 + top_size),
+                (38, 49, 60),
+                1,
+            )
+            cv2.line(
+                canvas,
+                (17, origin_y - offset),
+                (17 + top_size, origin_y - offset),
+                (38, 49, 60),
+                1,
+            )
+
+        px = (relative[:, 0] * top_scale + origin_x).astype(np.int32)
+        py = (origin_y - relative[:, 1] * top_scale).astype(np.int32)
+        valid = (
+            (px >= 17)
+            & (px < 17 + top_size)
+            & (py >= 17)
+            & (py < 17 + top_size)
+        )
+        canvas[py[valid], px[valid]] = colors[valid]
+
+        path = self.robot_paths.get(robot_id, ())
+        if path:
+            path_array = np.asarray(path, dtype=np.float32)
+            path_px = ((path_array[:, 0] - center_x) * top_scale + origin_x).astype(np.int32)
+            path_py = (origin_y - (path_array[:, 1] - center_y) * top_scale).astype(np.int32)
+            path_points = np.column_stack((path_px, path_py))
+            inside = (
+                (path_px >= 17)
+                & (path_px < 17 + top_size)
+                & (path_py >= 17)
+                & (path_py < 17 + top_size)
+            )
+            path_points = path_points[inside]
+            if path_points.shape[0] >= 2:
+                cv2.polylines(
+                    canvas,
+                    [path_points.reshape(-1, 1, 2)],
+                    False,
+                    (60, 210, 255),
+                    2,
+                )
+
+        robot_center = (origin_x, origin_y)
+        direction = (
+            int(round(math.cos(yaw) * 15)),
+            int(round(-math.sin(yaw) * 15)),
+        )
+        cv2.circle(canvas, robot_center, 6, (30, 30, 255), -1)
+        cv2.arrowedLine(
+            canvas,
+            robot_center,
+            (robot_center[0] + direction[0], robot_center[1] + direction[1]),
+            (255, 255, 255),
+            2,
+            tipLength=0.4,
+        )
+
+        iso_origin_x = panel_width + panel_width // 2
+        iso_origin_y = int(height * 0.72)
+        iso_scale = min(panel_width, height) / (self.args.lidar_map_range_m * 1.45)
+        iso_x = (
+            (relative[:, 0] - relative[:, 1]) * 0.707 * iso_scale
+            + iso_origin_x
+        ).astype(np.int32)
+        iso_y = (
+            (relative[:, 0] + relative[:, 1]) * 0.34 * iso_scale
+            - relative[:, 2] * iso_scale * 1.8
+            + iso_origin_y
+        ).astype(np.int32)
+        iso_valid = (
+            (iso_x >= panel_width + 4)
+            & (iso_x < width - 4)
+            & (iso_y >= 20)
+            & (iso_y < height - 8)
+        )
+        order = np.argsort(relative[:, 0] + relative[:, 1])
+        order = order[iso_valid[order]]
+        canvas[iso_y[order], iso_x[order]] = colors[order]
+
+        cv2.line(canvas, (panel_width, 0), (panel_width, height), (58, 72, 86), 1)
+        cv2.putText(canvas, "MAPA SUPERIOR", (18, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 225, 238), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "VISTA 3D", (panel_width + 18, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 225, 238), 1, cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            f"{len(voxels)} voxels | frame {source_point_count} pts | rango {self.args.lidar_map_range_m:.0f}m",
+            (18, height - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (145, 170, 190),
+            1,
+            cv2.LINE_AA,
+        )
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            canvas,
+            [cv2.IMWRITE_JPEG_QUALITY, self.args.lidar_render_jpeg_quality],
+        )
+        if not ok or encoded is None:
+            return None
+
+        return {
+            "image_format": "jpg",
+            "image_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+            "point_count": int(relative.shape[0]),
+            "map_point_count": len(voxels),
+            "source_point_count": source_point_count,
+            "rendered_ts": time.time(),
+            "coordinate_frame": "map",
+        }
+
+    def _process_lidar_packet_sync(
+        self,
+        robot_id: str,
+        data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        started = time.monotonic()
+        points = self._decode_lidar_points(data)
+        self._update_lidar_voxels(robot_id, points)
+        rendered = self._render_lidar_map(robot_id, int(points.shape[0]))
+        if rendered is not None:
+            rendered["processing_ms"] = round(
+                (time.monotonic() - started) * 1000.0,
+                2,
+            )
+        return rendered
+
+    def _schedule_lidar_packet(self, robot_id: str, data: Dict[str, Any]) -> None:
+        self.lidar_latest_packets[robot_id] = data
+        event = self.lidar_events.setdefault(robot_id, asyncio.Event())
+        event.set()
+        task = self.lidar_tasks.get(robot_id)
+        if task is None or task.done():
+            self.lidar_tasks[robot_id] = asyncio.create_task(
+                self._lidar_worker(robot_id)
+            )
+
+    async def _lidar_worker(self, robot_id: str) -> None:
+        event = self.lidar_events[robot_id]
+        while not self.stop_event.is_set():
+            await event.wait()
+            event.clear()
+            data = self.lidar_latest_packets.pop(robot_id, None)
+            if data is None:
+                continue
+
+            try:
+                rendered = await asyncio.to_thread(
+                    self._process_lidar_packet_sync,
+                    robot_id,
+                    data,
+                )
+            except Exception as exc:
+                self._audit(
+                    "lidar_processing_error",
+                    {"robot_id": robot_id, "error": str(exc)},
+                )
+                continue
+
+            if rendered is None:
+                continue
+            self.latest_media[robot_id]["lidar"] = rendered
+            await self._broadcast(
+                {
+                    "type": "media",
+                    "robot_id": robot_id,
+                    "stream": "lidar",
+                    "data": rendered,
+                    "ts": rendered["rendered_ts"],
+                }
+            )
 
     def _setup_cors(self) -> None:
         origins = [x.strip() for x in self.args.cors_origin if x.strip()]
@@ -266,6 +635,15 @@ class CoreRuntime:
         if suffix == "telemetry":
             self.latest_telemetry[robot_id] = payload
             self.telemetry_history[robot_id].append(payload)
+            pose = payload.get("pose", {}) if isinstance(payload, dict) else {}
+            if isinstance(pose, dict):
+                with contextlib.suppress(TypeError, ValueError):
+                    x = float(pose.get("x"))
+                    y = float(pose.get("y"))
+                    if math.isfinite(x) and math.isfinite(y):
+                        path = self.robot_paths[robot_id]
+                        if not path or math.hypot(x - path[-1][0], y - path[-1][1]) >= 0.05:
+                            path.append((x, y))
 
             await self._broadcast({
                 "type": "telemetry",
@@ -535,6 +913,13 @@ class CoreRuntime:
             if "jpeg_quality" in output:
                 output["jpeg_quality"] = int(clamp(float(output["jpeg_quality"]), 1, 100))
 
+            if "target_fps" in output:
+                output["target_fps"] = clamp(float(output["target_fps"]), 1, 30)
+
+            if "max_width" in output:
+                max_width = int(output["max_width"])
+                output["max_width"] = 0 if max_width <= 0 else max(320, max_width)
+
         if command_type == "set_audio":
             if "enabled" in output:
                 output["enabled"] = bool(output["enabled"])
@@ -602,6 +987,11 @@ class CoreRuntime:
         @app.on_event("shutdown")
         async def _shutdown() -> None:
             self.stop_event.set()
+            for task in self.lidar_tasks.values():
+                task.cancel()
+            for task in self.lidar_tasks.values():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             if self.heartbeat_task:
                 self.heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -770,6 +1160,8 @@ class CoreRuntime:
             queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self.args.frontend_queue_size)
             self.frontend_sockets.add(ws)
             self.frontend_queues[ws] = queue
+            self.frontend_latest_media[ws] = {}
+            self.frontend_ready[ws] = asyncio.Event()
             sender_task = asyncio.create_task(self._frontend_sender_loop(ws, queue))
             self.frontend_sender_tasks[ws] = sender_task
             driven_robots: Set[str] = set()
@@ -900,6 +1292,8 @@ class CoreRuntime:
                     self.speed_profile_owners.pop(robot_id, None)
                 self.frontend_sockets.discard(ws)
                 self.frontend_queues.pop(ws, None)
+                self.frontend_latest_media.pop(ws, None)
+                self.frontend_ready.pop(ws, None)
                 sender_task = self.frontend_sender_tasks.pop(ws, None)
                 if sender_task is not None and not sender_task.done():
                     sender_task.cancel()
@@ -927,6 +1321,14 @@ class CoreRuntime:
                         payload = json.loads(text)
                         stream = str(payload.get("stream", "")).strip() or "unknown"
                         data = payload.get("data", {})
+
+                        if stream == "lidar_points" and isinstance(data, dict):
+                            self._schedule_lidar_packet(robot_id, data)
+                            continue
+
+                        if stream == "video" and isinstance(data, dict):
+                            data = dict(data)
+                            data["server_received_ts"] = time.time()
 
                         if isinstance(data, dict) and stream != "audio":
                             self.latest_media[robot_id][stream] = data
@@ -984,6 +1386,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--edge-media-token", default="edge-media-dev-token")
     parser.add_argument("--frontend-queue-size", type=int, default=16)
     parser.add_argument("--frontend-send-timeout-s", type=float, default=2.0)
+
+    parser.add_argument("--lidar-voxel-size", type=float, default=0.08)
+    parser.add_argument("--lidar-map-max-voxels", type=int, default=120000)
+    parser.add_argument("--lidar-render-max-points", type=int, default=50000)
+    parser.add_argument("--lidar-max-packet-bytes", type=int, default=4 * 1024 * 1024)
+    parser.add_argument("--lidar-map-range-m", type=float, default=20.0)
+    parser.add_argument("--lidar-min-z", type=float, default=-1.5)
+    parser.add_argument("--lidar-max-z", type=float, default=3.5)
+    parser.add_argument("--lidar-render-width", type=int, default=960)
+    parser.add_argument("--lidar-render-height", type=int, default=480)
+    parser.add_argument("--lidar-render-jpeg-quality", type=int, default=68)
+    parser.add_argument("--lidar-grid-step-m", type=int, default=1)
+    parser.add_argument("--lidar-path-max-points", type=int, default=1000)
 
     parser.add_argument("--audit-log", default="./server/audit/server_audit.jsonl")
     parser.add_argument("--replay-max-items", type=int, default=2000)
@@ -1051,6 +1466,30 @@ def parse_args() -> argparse.Namespace:
 
     if args.frontend_send_timeout_s <= 0:
         parser.error("--frontend-send-timeout-s must be > 0")
+
+    if args.lidar_voxel_size <= 0:
+        parser.error("--lidar-voxel-size must be > 0")
+
+    if args.lidar_map_max_voxels <= 0 or args.lidar_render_max_points <= 0:
+        parser.error("lidar point limits must be > 0")
+
+    if args.lidar_max_packet_bytes <= 0:
+        parser.error("--lidar-max-packet-bytes must be > 0")
+
+    if args.lidar_map_range_m <= 1:
+        parser.error("--lidar-map-range-m must be > 1")
+
+    if args.lidar_min_z >= args.lidar_max_z:
+        parser.error("--lidar-min-z must be lower than --lidar-max-z")
+
+    if args.lidar_render_width < 640 or args.lidar_render_height < 320:
+        parser.error("lidar render size must be at least 640x320")
+
+    if args.lidar_render_jpeg_quality < 1 or args.lidar_render_jpeg_quality > 100:
+        parser.error("--lidar-render-jpeg-quality must be between 1 and 100")
+
+    if args.lidar_grid_step_m <= 0 or args.lidar_path_max_points <= 0:
+        parser.error("lidar grid/path settings must be > 0")
 
     return args
 

@@ -114,6 +114,11 @@
       object-fit: cover;
     }
 
+    .media.map {
+      aspect-ratio: 2/1;
+      object-fit: contain;
+    }
+
     .mono {
       white-space: pre-wrap;
       margin: 0;
@@ -236,11 +241,11 @@
       <div class="grid2" style="margin-top: 12px;">
         <div>
           <h2 class="title">Video</h2>
-          <img id="videoFrame" class="media" alt="video">
+          <img id="videoFrame" class="media" alt="video" decoding="async">
         </div>
         <div>
-          <h2 class="title">Lidar Preview</h2>
-          <img id="lidarFrame" class="media" alt="lidar">
+          <h2 class="title">Mapa LiDAR 3D · procesado en servidor</h2>
+          <img id="lidarFrame" class="media map" alt="mapa lidar" decoding="async">
         </div>
       </div>
 
@@ -279,6 +284,15 @@
         <label class="inline-check"><input id="enableVideo" type="checkbox" checked>Video</label>
         <label class="inline-check"><input id="enableLidar" type="checkbox" checked>Lidar</label>
         <label class="inline-check"><input id="enableAudio" type="checkbox" checked>Audio</label>
+
+        <label>Cam FPS</label>
+        <input id="cameraFps" class="small" type="number" min="1" max="30" value="15">
+
+        <label>JPEG %</label>
+        <input id="cameraQuality" class="small" type="number" min="25" max="85" value="45">
+
+        <label>Cam ancho</label>
+        <input id="cameraWidth" style="width:100px" type="number" min="320" max="1920" value="960">
 
         <label>Audio every</label>
         <input id="audioEmitEvery" class="small" type="number" min="1" max="10" value="2">
@@ -381,6 +395,21 @@
       lastVideoAt: 0,
       lastLidarAt: 0,
       lastAudioAt: 0,
+      mediaObjectUrls: {
+        video: "",
+        lidar: "",
+      },
+      videoStats: {
+        frameTimes: [],
+        fps: 0,
+        latencyMs: 0,
+        encodeMs: 0,
+      },
+      lidarStats: {
+        mapPoints: 0,
+        sourcePoints: 0,
+        processingMs: 0,
+      },
       audio: {
         ctx: null,
         unlocked: false,
@@ -419,6 +448,9 @@
       enableVideo: document.getElementById("enableVideo"),
       enableLidar: document.getElementById("enableLidar"),
       enableAudio: document.getElementById("enableAudio"),
+      cameraFps: document.getElementById("cameraFps"),
+      cameraQuality: document.getElementById("cameraQuality"),
+      cameraWidth: document.getElementById("cameraWidth"),
       audioEmitEvery: document.getElementById("audioEmitEvery"),
       audioMaxBytes: document.getElementById("audioMaxBytes"),
       applyMediaBtn: document.getElementById("applyMediaBtn"),
@@ -594,10 +626,24 @@
       return "image/jpeg";
     }
 
-    function renderMediaImage(imgEl, data) {
+    function renderMediaImage(imgEl, data, stream) {
       if (!data || !data.image_base64) return;
-      const mime = formatImageMime(data.image_format);
-      imgEl.src = `data:${mime};base64,${data.image_base64}`;
+      try {
+        const bytes = base64ToBytes(data.image_base64);
+        const blob = new Blob([bytes], { type: formatImageMime(data.image_format) });
+        const nextUrl = URL.createObjectURL(blob);
+        const previousUrl = state.mediaObjectUrls[stream];
+        state.mediaObjectUrls[stream] = nextUrl;
+        imgEl.src = nextUrl;
+        if (previousUrl) {
+          URL.revokeObjectURL(previousUrl);
+        }
+      } catch (err) {
+        addEvent("media_decode_error", {
+          stream,
+          error: normalizeError(err),
+        });
+      }
     }
 
     function base64ToBytes(base64) {
@@ -677,6 +723,14 @@
       state.audio.queue.length = 0;
       state.audio.queueOffset = 0;
       state.audio.queuedSamples = 0;
+    }
+
+    function releaseMediaUrls() {
+      for (const stream of Object.keys(state.mediaObjectUrls)) {
+        const url = state.mediaObjectUrls[stream];
+        if (url) URL.revokeObjectURL(url);
+        state.mediaObjectUrls[stream] = "";
+      }
     }
 
     function resampleMono(samples, sourceRate, targetRate) {
@@ -928,14 +982,31 @@
         const data = msg.data || {};
 
         if (stream === "video") {
-          renderMediaImage(els.videoFrame, data);
-          state.lastVideoAt = Date.now();
+          const now = Date.now();
+          renderMediaImage(els.videoFrame, data, "video");
+          state.lastVideoAt = now;
+          state.videoStats.frameTimes.push(now);
+          while (
+            state.videoStats.frameTimes.length > 0
+            && state.videoStats.frameTimes[0] < now - 1000
+          ) {
+            state.videoStats.frameTimes.shift();
+          }
+          state.videoStats.fps = state.videoStats.frameTimes.length;
+          state.videoStats.encodeMs = parseNum(data.encode_ms, 0);
+          const encodedTs = parseNum(data.encoded_ts, 0);
+          state.videoStats.latencyMs = encodedTs > 0
+            ? Math.max(0, now - encodedTs * 1000)
+            : 0;
           return;
         }
 
         if (stream === "lidar") {
-          renderMediaImage(els.lidarFrame, data);
+          renderMediaImage(els.lidarFrame, data, "lidar");
           state.lastLidarAt = Date.now();
+          state.lidarStats.mapPoints = Math.round(parseNum(data.map_point_count, 0));
+          state.lidarStats.sourcePoints = Math.round(parseNum(data.source_point_count, 0));
+          state.lidarStats.processingMs = parseNum(data.processing_ms, 0);
           return;
         }
 
@@ -1043,7 +1114,12 @@
 
         setBadge(
           els.mediaStatus,
-          `V ${ageText(state.lastVideoAt)} | L ${ageText(state.lastLidarAt)} | A ${ageText(state.lastAudioAt)}`,
+          (
+            `CAM ${state.videoStats.fps}fps ${state.videoStats.latencyMs.toFixed(0)}ms `
+            + `(enc ${state.videoStats.encodeMs.toFixed(0)}ms) | `
+            + `MAP ${state.lidarStats.mapPoints} vox ${state.lidarStats.processingMs.toFixed(0)}ms | `
+            + `A ${ageText(state.lastAudioAt)}`
+          ),
           stale ? "err" : "ok"
         );
       }
@@ -1068,9 +1144,15 @@
 
       const audioEmitEvery = Math.max(1, Math.min(10, Math.round(parseNum(els.audioEmitEvery.value, 2))));
       const audioMaxBytes = Math.max(0, Math.round(parseNum(els.audioMaxBytes.value, 24576)));
+      const cameraFps = clamp(Math.round(parseNum(els.cameraFps.value, 15)), 1, 30);
+      const cameraQuality = clamp(Math.round(parseNum(els.cameraQuality.value, 45)), 25, 85);
+      const cameraWidth = clamp(Math.round(parseNum(els.cameraWidth.value, 960)), 320, 1920);
 
       els.audioEmitEvery.value = String(audioEmitEvery);
       els.audioMaxBytes.value = String(audioMaxBytes);
+      els.cameraFps.value = String(cameraFps);
+      els.cameraQuality.value = String(cameraQuality);
+      els.cameraWidth.value = String(cameraWidth);
 
       if (els.enableAudio.checked) {
         await ensureAudioContext(false);
@@ -1083,8 +1165,10 @@
           type: "set_camera_stream",
           payload: {
             enabled: !!els.enableVideo.checked,
-            emit_every: 3,
-            jpeg_quality: 55,
+            emit_every: 1,
+            jpeg_quality: cameraQuality,
+            target_fps: cameraFps,
+            max_width: cameraWidth,
           },
         },
         {
@@ -1121,6 +1205,9 @@
 
       addEvent("media_config_applied", {
         video: !!els.enableVideo.checked,
+        camera_fps: cameraFps,
+        camera_quality: cameraQuality,
+        camera_width: cameraWidth,
         lidar: !!els.enableLidar.checked,
         audio: !!els.enableAudio.checked,
         audio_emit_every: audioEmitEvery,
@@ -1385,6 +1472,7 @@
         setBadge(els.speedProfileStatus, "perfil normal · offline", "err");
         updateSpeedUi();
         resetAudioQueue();
+        releaseMediaUrls();
         setStatus("desconectado", false);
         stopControlLoop();
         updateMediaStatus();
@@ -1533,6 +1621,7 @@
     });
 
     window.addEventListener("beforeunload", () => {
+      releaseMediaUrls();
       if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
       state.ws.send(JSON.stringify({
         op: "drive_stop",

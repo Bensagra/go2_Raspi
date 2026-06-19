@@ -100,6 +100,9 @@ class EdgeGatewayService:
         self.pending_stop_deadline = 0.0
         self.last_move_command: Dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.last_move_sent_at = 0.0
+        self.speed_profile = "normal"
+        self.speed_level = 0
+        self.last_speed_profile_reset_attempt = 0.0
 
         self.last_heartbeat_fault_event_at = 0.0
 
@@ -150,6 +153,7 @@ class EdgeGatewayService:
         payload: Dict[str, Any] = {
             "command_id": str(command.get("command_id", "")),
             "robot_id": self.args.robot_id,
+            "command_type": str(command.get("type", "")),
             "status": status,
             "reason": reason,
             "edge_ts": time.time(),
@@ -209,9 +213,12 @@ class EdgeGatewayService:
             return
 
         if topic.endswith("/control/heartbeat"):
-            self.last_heartbeat_monotonic = time.monotonic()
             if isinstance(payload, dict):
                 self.last_heartbeat_payload = payload
+                if bool(payload.get("session_active", False)):
+                    self.last_heartbeat_monotonic = time.monotonic()
+                else:
+                    self.last_heartbeat_monotonic = 0.0
             return
 
         if topic.endswith("/commands/in"):
@@ -419,6 +426,58 @@ class EdgeGatewayService:
             api_id,
             parameter,
         )
+
+    def _speed_profiles(self) -> Dict[str, Dict[str, float]]:
+        return {
+            "normal": {
+                "forward": min(
+                    self.args.normal_forward_speed,
+                    self.args.max_forward_speed,
+                ),
+                "reverse": self.args.max_reverse_speed * self.args.normal_speed_scale,
+                "lateral": self.args.max_lateral_speed * self.args.normal_speed_scale,
+                "angular": self.args.max_angular_speed * self.args.normal_speed_scale,
+            },
+            "max_api": {
+                "forward": self.args.max_forward_speed,
+                "reverse": self.args.max_reverse_speed,
+                "lateral": self.args.max_lateral_speed,
+                "angular": self.args.max_angular_speed,
+            },
+        }
+
+    async def _set_speed_profile(self, profile: str, stop_first: bool = True) -> Any:
+        normalized = str(profile).strip().lower()
+        if normalized not in self._speed_profiles():
+            raise ValueError("profile must be 'normal' or 'max_api'")
+
+        if stop_first:
+            self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
+            self.move_active = False
+            self.pending_stop_deadline = 0.0
+
+        level = 1 if normalized == "max_api" else 0
+        response = await self._sport_request(
+            int(SPORT_CMD["SpeedLevel"]),
+            {"data": level},
+        )
+        if isinstance(response, dict):
+            response_data = response.get("data", {})
+            header = response_data.get("header", {}) if isinstance(response_data, dict) else {}
+            status = header.get("status", {}) if isinstance(header, dict) else {}
+            code = status.get("code") if isinstance(status, dict) else None
+            if isinstance(code, (int, float)) and int(code) != 0:
+                raise RuntimeError(f"SpeedLevel rejected by robot with code {int(code)}")
+        self.speed_profile = normalized
+        self.speed_level = level
+        self._publish_event(
+            "speed_profile_changed",
+            {
+                "profile": normalized,
+                "speed_level": level,
+            },
+        )
+        return response
 
     def _sport_send_nowait(self, api_id: int, parameter: Optional[Any] = None) -> None:
         connection = self.conn
@@ -789,13 +848,24 @@ class EdgeGatewayService:
         if isinstance(rpy, (list, tuple)) and len(rpy) >= 3:
             pose_out["yaw"] = rpy[2]
 
-        velocity_out = {"linear": None, "angular": None}
+        velocity_out = {
+            "x": None,
+            "y": None,
+            "z": None,
+            "linear": None,
+            "angular": None,
+        }
         if isinstance(velocity, dict):
-            velocity_out["linear"] = velocity.get("x", velocity.get("linear"))
-            velocity_out["angular"] = velocity.get("z", velocity.get("angular"))
+            velocity_out["x"] = velocity.get("x", velocity.get("linear"))
+            velocity_out["y"] = velocity.get("y", velocity.get("lateral"))
+            velocity_out["z"] = velocity.get("z", velocity.get("angular"))
         elif isinstance(velocity, (list, tuple)) and len(velocity) >= 3:
-            velocity_out["linear"] = velocity[0]
-            velocity_out["angular"] = velocity[2]
+            velocity_out["x"] = velocity[0]
+            velocity_out["y"] = velocity[1]
+            velocity_out["z"] = velocity[2]
+
+        velocity_out["linear"] = velocity_out["x"]
+        velocity_out["angular"] = velocity_out["z"]
 
         return {
             "pose": pose_out,
@@ -825,6 +895,15 @@ class EdgeGatewayService:
             "mode": self.last_heartbeat_payload.get("mode", "manual"),
             "pose": sport.get("pose", {}),
             "velocity": sport.get("velocity", {}),
+            "speed_control": {
+                "profile": self.speed_profile,
+                "speed_level": self.speed_level,
+                "limits": self._speed_profiles().get(
+                    self.speed_profile,
+                    self._speed_profiles()["normal"],
+                ),
+                "requested": dict(self.last_move_command),
+            },
             "battery": battery,
             "power_v": low.get("power_v"),
             "robot_link": {
@@ -880,6 +959,7 @@ class EdgeGatewayService:
             "set_audio",
             "set_lidar",
             "set_lidar_decoder",
+            "set_speed_profile",
         }:
             return False, f"unsupported command type: {cmd_type}"
 
@@ -890,7 +970,15 @@ class EdgeGatewayService:
             return False, "command expired"
 
         heartbeat_age = time.monotonic() - self.last_heartbeat_monotonic
-        requires_live_heartbeat = cmd_type in {"move", "turn", "enter_mode", "follow_target", "go_to"}
+        requested_profile = str(
+            command.get("payload", {}).get("profile", "normal")
+            if isinstance(command.get("payload"), dict)
+            else "normal"
+        )
+        requires_live_heartbeat = (
+            cmd_type in {"move", "turn", "enter_mode", "follow_target", "go_to"}
+            or (cmd_type == "set_speed_profile" and requested_profile == "max_api")
+        )
         if requires_live_heartbeat and heartbeat_age > self.args.heartbeat_timeout_s:
             return False, "no recent server heartbeat"
 
@@ -907,9 +995,25 @@ class EdgeGatewayService:
             return {"executed": "stop"}
 
         if cmd_type == "move":
-            x = clamp(float(payload.get("linear_x", 0.0)), -self.args.max_linear_speed, self.args.max_linear_speed)
-            y = clamp(float(payload.get("lateral_y", 0.0)), -self.args.max_lateral_speed, self.args.max_lateral_speed)
-            z = clamp(float(payload.get("angular_z", 0.0)), -self.args.max_angular_speed, self.args.max_angular_speed)
+            limits = self._speed_profiles().get(
+                self.speed_profile,
+                self._speed_profiles()["normal"],
+            )
+            x = clamp(
+                float(payload.get("linear_x", 0.0)),
+                -limits["reverse"],
+                limits["forward"],
+            )
+            y = clamp(
+                float(payload.get("lateral_y", 0.0)),
+                -limits["lateral"],
+                limits["lateral"],
+            )
+            z = clamp(
+                float(payload.get("angular_z", 0.0)),
+                -limits["angular"],
+                limits["angular"],
+            )
             duration_ms = int(payload.get("duration_ms", self.args.default_move_duration_ms))
 
             self.move_active = True
@@ -931,7 +1035,15 @@ class EdgeGatewayService:
         if cmd_type == "turn":
             angle_deg = float(payload.get("angle_deg", 0.0))
             direction = 1.0 if angle_deg >= 0 else -1.0
-            z = direction * clamp(abs(float(payload.get("angular_z", self.args.turn_angular_speed))), 0.05, self.args.max_angular_speed)
+            active_angular_limit = self._speed_profiles().get(
+                self.speed_profile,
+                self._speed_profiles()["normal"],
+            )["angular"]
+            z = direction * clamp(
+                abs(float(payload.get("angular_z", self.args.turn_angular_speed))),
+                0.05,
+                active_angular_limit,
+            )
             duration_ms = int(payload.get("duration_ms", abs(angle_deg) * self.args.turn_ms_per_degree))
 
             self.move_active = True
@@ -952,6 +1064,17 @@ class EdgeGatewayService:
             mode = str(payload.get("mode", "normal"))
             response = await self._set_motion_mode(mode)
             return {"executed": "enter_mode", "mode": mode, "response": response}
+
+        if cmd_type == "set_speed_profile":
+            profile = str(payload.get("profile", "normal")).strip().lower()
+            response = await self._set_speed_profile(profile, stop_first=True)
+            return {
+                "executed": "set_speed_profile",
+                "profile": self.speed_profile,
+                "speed_level": self.speed_level,
+                "limits": self._speed_profiles()[self.speed_profile],
+                "response": response,
+            }
 
         if cmd_type == "set_video":
             enabled = bool(payload.get("enabled", True))
@@ -1089,6 +1212,10 @@ class EdgeGatewayService:
                 and now >= self.pending_stop_deadline
             )
             heartbeat_expired = self.move_active and heartbeat_age > self.args.heartbeat_timeout_s
+            profile_heartbeat_expired = (
+                self.speed_profile == "max_api"
+                and heartbeat_age > self.args.heartbeat_timeout_s
+            )
 
             if deadline_expired or heartbeat_expired:
                 try:
@@ -1111,6 +1238,26 @@ class EdgeGatewayService:
                         "safe_stop_executed",
                         {
                             "reason": "heartbeat_timeout" if heartbeat_expired else "duration_timeout",
+                            "heartbeat_age_s": round(heartbeat_age, 3),
+                        },
+                    )
+
+            if (
+                profile_heartbeat_expired
+                and now - self.last_speed_profile_reset_attempt >= 1.0
+            ):
+                self.last_speed_profile_reset_attempt = now
+                try:
+                    self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
+                    self.move_active = False
+                    self.pending_stop_deadline = 0.0
+                    await self._set_speed_profile("normal", stop_first=False)
+                except Exception as exc:
+                    self._publish_event(
+                        "speed_profile_reset_retry",
+                        {
+                            "reason": "heartbeat_timeout",
+                            "error": str(exc),
                             "heartbeat_age_s": round(heartbeat_age, 3),
                         },
                     )
@@ -1196,6 +1343,16 @@ class EdgeGatewayService:
         self.conn.video.add_track_callback(self._on_video_track)
         self.conn.audio.add_track_callback(self._on_audio_frame)
 
+        try:
+            await self._set_speed_profile("normal", stop_first=True)
+        except Exception as exc:
+            self.speed_profile = "normal"
+            self.speed_level = 0
+            self._publish_event(
+                "speed_profile_init_warning",
+                {"error": str(exc)},
+            )
+
         if self.args.disable_traffic_saving:
             with contextlib.suppress(Exception):
                 disabled = await asyncio.wait_for(
@@ -1253,12 +1410,24 @@ class EdgeGatewayService:
         self.video_task = None
 
         connection = self.conn
+        if connection is not None:
+            with contextlib.suppress(Exception):
+                self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
+            if self.speed_profile != "normal":
+                with contextlib.suppress(Exception):
+                    await self._set_speed_profile("normal", stop_first=False)
+
         self.conn = None
         self.robot_connected_at = 0.0
         self.traffic_saving_disabled = False
         self.subscribed_topics.clear()
         self.latest_by_topic.clear()
         self._reset_audio_pipeline()
+        self.speed_profile = "normal"
+        self.speed_level = 0
+        self.move_active = False
+        self.pending_stop_deadline = 0.0
+        self.last_move_command = {"x": 0.0, "y": 0.0, "z": 0.0}
 
         if connection is None:
             return
@@ -1401,9 +1570,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--default-command-ttl-ms", type=int, default=1500)
     parser.add_argument("--command-queue-size", type=int, default=256)
 
-    parser.add_argument("--max-linear-speed", type=float, default=0.45)
-    parser.add_argument("--max-lateral-speed", type=float, default=0.25)
-    parser.add_argument("--max-angular-speed", type=float, default=1.0)
+    parser.add_argument("--max-forward-speed", type=float, default=3.8)
+    parser.add_argument("--max-reverse-speed", type=float, default=2.5)
+    parser.add_argument("--max-lateral-speed", type=float, default=1.0)
+    parser.add_argument("--max-angular-speed", type=float, default=4.0)
+    parser.add_argument("--normal-forward-speed", type=float, default=3.5)
+    parser.add_argument("--normal-speed-scale", type=float, default=0.92)
     parser.add_argument("--default-move-duration-ms", type=int, default=700)
     parser.add_argument("--turn-angular-speed", type=float, default=0.8)
     parser.add_argument("--turn-ms-per-degree", type=float, default=15.0)
@@ -1463,6 +1635,24 @@ def parse_args() -> argparse.Namespace:
 
     if args.command_queue_size <= 0:
         parser.error("--command-queue-size must be > 0")
+
+    if args.max_forward_speed <= 0:
+        parser.error("--max-forward-speed must be > 0")
+
+    if args.max_reverse_speed <= 0:
+        parser.error("--max-reverse-speed must be > 0")
+
+    if args.max_lateral_speed <= 0:
+        parser.error("--max-lateral-speed must be > 0")
+
+    if args.max_angular_speed <= 0:
+        parser.error("--max-angular-speed must be > 0")
+
+    if args.normal_forward_speed <= 0 or args.normal_forward_speed > args.max_forward_speed:
+        parser.error("--normal-forward-speed must be > 0 and <= --max-forward-speed")
+
+    if args.normal_speed_scale <= 0 or args.normal_speed_scale > 1:
+        parser.error("--normal-speed-scale must be > 0 and <= 1")
 
     if args.media_queue_size <= 0:
         parser.error("--media-queue-size must be > 0")

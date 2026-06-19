@@ -28,6 +28,7 @@ ROLE_ALLOWED_COMMANDS = {
         "set_audio",
         "set_lidar",
         "set_lidar_decoder",
+        "set_speed_profile",
     },
     "admin": {
         "move",
@@ -41,6 +42,7 @@ ROLE_ALLOWED_COMMANDS = {
         "set_audio",
         "set_lidar",
         "set_lidar_decoder",
+        "set_speed_profile",
     },
 }
 
@@ -87,6 +89,7 @@ class CoreRuntime:
         self.frontend_sender_tasks: Dict[WebSocket, asyncio.Task[None]] = {}
         self.edge_media_sockets: Dict[str, WebSocket] = {}
         self.drive_owners: Dict[str, WebSocket] = {}
+        self.speed_profile_owners: Dict[str, WebSocket] = {}
 
         self.latest_telemetry: Dict[str, Dict[str, Any]] = {}
         self.latest_media: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
@@ -284,17 +287,21 @@ class CoreRuntime:
             return
 
         if suffix == "commands/ack":
-            self.ack_history[robot_id].append(payload)
+            ack = dict(payload)
             command_id = str(payload.get("command_id", ""))
-            if command_id in self.pending_commands:
-                self.pending_commands.pop(command_id, None)
+            pending = self.pending_commands.pop(command_id, None)
+            if pending:
+                ack.setdefault("command_type", pending.get("type"))
+                ack.setdefault("issued_by", pending.get("issued_by"))
+
+            self.ack_history[robot_id].append(ack)
 
             await self._broadcast({
                 "type": "command_ack",
                 "robot_id": robot_id,
-                "data": payload,
+                "data": ack,
             })
-            self._audit("command_ack", {"robot_id": robot_id, "data": payload})
+            self._audit("command_ack", {"robot_id": robot_id, "data": ack})
             return
 
         if suffix == "topic_events":
@@ -356,6 +363,69 @@ class CoreRuntime:
         if command_type not in allowed:
             raise HTTPException(status_code=403, detail=f"Role '{role}' cannot send command '{command_type}'")
 
+    def _speed_profiles(self) -> Dict[str, Dict[str, float]]:
+        return {
+            "normal": {
+                "forward": min(
+                    self.args.normal_forward_speed,
+                    self.args.max_forward_speed,
+                ),
+                "reverse": self.args.max_reverse_speed * self.args.normal_speed_scale,
+                "lateral": self.args.max_lateral_speed * self.args.normal_speed_scale,
+                "angular": self.args.max_angular_speed * self.args.normal_speed_scale,
+            },
+            "max_api": {
+                "forward": self.args.max_forward_speed,
+                "reverse": self.args.max_reverse_speed,
+                "lateral": self.args.max_lateral_speed,
+                "angular": self.args.max_angular_speed,
+            },
+        }
+
+    def _active_speed_profile(self, robot_id: str) -> str:
+        telemetry = self.latest_telemetry.get(robot_id, {})
+        speed_control = telemetry.get("speed_control", {}) if isinstance(telemetry, dict) else {}
+        profile = str(speed_control.get("profile", "normal"))
+        return profile if profile in self._speed_profiles() else "normal"
+
+    def _publish_speed_profile_command(
+        self,
+        robot_id: str,
+        user_id: str,
+        profile: str,
+    ) -> Optional[str]:
+        if self.mqtt_client is None or profile not in self._speed_profiles():
+            return None
+
+        command_id = f"profile-{uuid.uuid4().hex[:12]}"
+        wire = {
+            "command_id": command_id,
+            "robot_id": robot_id,
+            "type": "set_speed_profile",
+            "payload": {"profile": profile},
+            "issued_by": user_id,
+            "ts": time.time(),
+            "ttl_ms": 1500,
+        }
+        self.last_control_activity[robot_id] = time.time()
+        self.pending_commands[command_id] = {
+            "command_id": command_id,
+            "robot_id": robot_id,
+            "issued_by": user_id,
+            "type": "set_speed_profile",
+            "ts": time.time(),
+        }
+        result = self.mqtt_client.publish(
+            self._mqtt_topic(robot_id, "commands/in"),
+            json.dumps(wire, separators=(",", ":")),
+            qos=1,
+        )
+        if getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) != mqtt.MQTT_ERR_SUCCESS:
+            self.pending_commands.pop(command_id, None)
+            return None
+        self._audit("speed_profile_requested", wire)
+        return command_id
+
     def _publish_realtime_drive(
         self,
         robot_id: str,
@@ -366,7 +436,11 @@ class CoreRuntime:
         if self.mqtt_client is None:
             return False
 
-        sanitized = self._sanitize_command("move", payload)
+        sanitized = self._sanitize_command(
+            "move",
+            payload,
+            speed_profile=self._active_speed_profile(robot_id),
+        )
         sanitized["duration_ms"] = int(
             clamp(float(payload.get("duration_ms", 360)), 200, 700)
         )
@@ -411,13 +485,34 @@ class CoreRuntime:
         )
         return getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS
 
-    def _sanitize_command(self, command_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _sanitize_command(
+        self,
+        command_type: str,
+        payload: Dict[str, Any],
+        speed_profile: str = "normal",
+    ) -> Dict[str, Any]:
         output = dict(payload)
 
         if command_type == "move":
-            output["linear_x"] = clamp(float(output.get("linear_x", 0.0)), -self.args.max_linear_speed, self.args.max_linear_speed)
-            output["lateral_y"] = clamp(float(output.get("lateral_y", 0.0)), -self.args.max_lateral_speed, self.args.max_lateral_speed)
-            output["angular_z"] = clamp(float(output.get("angular_z", 0.0)), -self.args.max_angular_speed, self.args.max_angular_speed)
+            limits = self._speed_profiles().get(
+                speed_profile,
+                self._speed_profiles()["normal"],
+            )
+            output["linear_x"] = clamp(
+                float(output.get("linear_x", 0.0)),
+                -limits["reverse"],
+                limits["forward"],
+            )
+            output["lateral_y"] = clamp(
+                float(output.get("lateral_y", 0.0)),
+                -limits["lateral"],
+                limits["lateral"],
+            )
+            output["angular_z"] = clamp(
+                float(output.get("angular_z", 0.0)),
+                -limits["angular"],
+                limits["angular"],
+            )
             output["duration_ms"] = int(output.get("duration_ms", self.args.default_move_duration_ms))
 
         if command_type == "turn":
@@ -459,6 +554,12 @@ class CoreRuntime:
             if decoder not in {"libvoxel", "native"}:
                 raise HTTPException(status_code=400, detail="set_lidar_decoder supports only 'libvoxel' or 'native'")
             output["decoder"] = decoder
+
+        if command_type == "set_speed_profile":
+            profile = str(output.get("profile", "normal")).strip().lower()
+            if profile not in self._speed_profiles():
+                raise HTTPException(status_code=400, detail="profile must be 'normal' or 'max_api'")
+            output = {"profile": profile}
 
         return output
 
@@ -549,13 +650,16 @@ class CoreRuntime:
                 "role": role,
                 "allowed_commands": sorted(ROLE_ALLOWED_COMMANDS.get(role, set())),
                 "limits": {
-                    "max_linear_speed": self.args.max_linear_speed,
+                    "max_forward_speed": self.args.max_forward_speed,
+                    "max_reverse_speed": self.args.max_reverse_speed,
                     "max_lateral_speed": self.args.max_lateral_speed,
                     "max_angular_speed": self.args.max_angular_speed,
                     "default_move_duration_ms": self.args.default_move_duration_ms,
                     "command_rate_max": self.args.command_rate_max,
                     "command_rate_window_s": self.args.command_rate_window_s,
                 },
+                "speed_profiles": self._speed_profiles(),
+                "active_speed_profile": self._active_speed_profile(robot_id),
             }
 
         @app.get("/api/robots/{robot_id}/replay")
@@ -589,7 +693,11 @@ class CoreRuntime:
                 raise HTTPException(status_code=503, detail="MQTT broker is not connected")
 
             cmd_id = command.command_id or f"cmd-{uuid.uuid4().hex[:12]}"
-            sanitized_payload = self._sanitize_command(command_type, command.payload)
+            sanitized_payload = self._sanitize_command(
+                command_type,
+                command.payload,
+                speed_profile=self._active_speed_profile(robot_id),
+            )
 
             wire = {
                 "command_id": cmd_id,
@@ -665,6 +773,7 @@ class CoreRuntime:
             sender_task = asyncio.create_task(self._frontend_sender_loop(ws, queue))
             self.frontend_sender_tasks[ws] = sender_task
             driven_robots: Set[str] = set()
+            max_profile_robots: Set[str] = set()
             last_drive_publish: Dict[str, float] = {}
 
             for robot_id, telemetry in self.latest_telemetry.items():
@@ -699,13 +808,55 @@ class CoreRuntime:
                                 self.last_control_activity[robot_id] = time.time()
                             continue
 
-                        if op not in {"drive", "drive_stop"}:
+                        if op not in {"drive", "drive_stop", "set_speed_profile"}:
                             continue
                         if auth["role"] not in {"operator", "admin"}:
                             continue
 
                         robot_id = str(message.get("robot_id", "")).strip()
                         if not robot_id:
+                            continue
+
+                        if op == "set_speed_profile":
+                            profile = str(message.get("profile", "normal")).strip().lower()
+                            if profile not in self._speed_profiles():
+                                self._enqueue_frontend(
+                                    ws,
+                                    {
+                                        "type": "speed_profile_status",
+                                        "robot_id": robot_id,
+                                        "ok": False,
+                                        "pending": False,
+                                        "profile": profile,
+                                        "error": "invalid speed profile",
+                                    },
+                                )
+                                continue
+
+                            self._publish_realtime_stop(robot_id, auth["user_id"])
+                            driven_robots.discard(robot_id)
+                            command_id = self._publish_speed_profile_command(
+                                robot_id,
+                                auth["user_id"],
+                                profile,
+                            )
+                            if command_id:
+                                if profile == "max_api":
+                                    max_profile_robots.add(robot_id)
+                                    self.speed_profile_owners[robot_id] = ws
+
+                            self._enqueue_frontend(
+                                ws,
+                                {
+                                    "type": "speed_profile_status",
+                                    "robot_id": robot_id,
+                                    "ok": bool(command_id),
+                                    "pending": bool(command_id),
+                                    "profile": profile,
+                                    "command_id": command_id or "",
+                                    "error": "" if command_id else "MQTT broker is not connected",
+                                },
+                            )
                             continue
 
                         if op == "drive":
@@ -741,6 +892,12 @@ class CoreRuntime:
                         continue
                     self._publish_realtime_stop(robot_id, auth["user_id"])
                     self.drive_owners.pop(robot_id, None)
+                for robot_id in max_profile_robots:
+                    if self.speed_profile_owners.get(robot_id) is not ws:
+                        continue
+                    self._publish_realtime_stop(robot_id, auth["user_id"])
+                    self._publish_speed_profile_command(robot_id, auth["user_id"], "normal")
+                    self.speed_profile_owners.pop(robot_id, None)
                 self.frontend_sockets.discard(ws)
                 self.frontend_queues.pop(ws, None)
                 sender_task = self.frontend_sender_tasks.pop(ws, None)
@@ -834,9 +991,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command-rate-max", type=int, default=120)
     parser.add_argument("--command-rate-window-s", type=float, default=10.0)
 
-    parser.add_argument("--max-linear-speed", type=float, default=0.45)
-    parser.add_argument("--max-lateral-speed", type=float, default=0.25)
-    parser.add_argument("--max-angular-speed", type=float, default=1.0)
+    parser.add_argument("--max-forward-speed", type=float, default=3.8)
+    parser.add_argument("--max-reverse-speed", type=float, default=2.5)
+    parser.add_argument("--max-lateral-speed", type=float, default=1.0)
+    parser.add_argument("--max-angular-speed", type=float, default=4.0)
+    parser.add_argument("--normal-forward-speed", type=float, default=3.5)
+    parser.add_argument("--normal-speed-scale", type=float, default=0.92)
     parser.add_argument("--default-move-duration-ms", type=int, default=700)
     parser.add_argument("--default-turn-duration-ms", type=int, default=400)
 
@@ -861,6 +1021,24 @@ def parse_args() -> argparse.Namespace:
 
     if args.command_rate_window_s <= 0:
         parser.error("--command-rate-window-s must be > 0")
+
+    if args.max_forward_speed <= 0:
+        parser.error("--max-forward-speed must be > 0")
+
+    if args.max_reverse_speed <= 0:
+        parser.error("--max-reverse-speed must be > 0")
+
+    if args.max_lateral_speed <= 0:
+        parser.error("--max-lateral-speed must be > 0")
+
+    if args.max_angular_speed <= 0:
+        parser.error("--max-angular-speed must be > 0")
+
+    if args.normal_forward_speed <= 0 or args.normal_forward_speed > args.max_forward_speed:
+        parser.error("--normal-forward-speed must be > 0 and <= --max-forward-speed")
+
+    if args.normal_speed_scale <= 0 or args.normal_speed_scale > 1:
+        parser.error("--normal-speed-scale must be > 0 and <= 1")
 
     if args.heartbeat_publish_interval_s <= 0:
         parser.error("--heartbeat-publish-interval-s must be > 0")

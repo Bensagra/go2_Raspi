@@ -87,6 +87,17 @@
 
     .status.ok { color: var(--ok); border-color: #285a41; }
     .status.err { color: var(--err); border-color: #663338; }
+    .status.warn { color: var(--warn); border-color: #73552d; }
+
+    .inline-check.experimental {
+      border-color: #663338;
+      color: var(--err);
+      background: #25151a;
+    }
+
+    .inline-check.experimental input[type="checkbox"] {
+      accent-color: var(--err);
+    }
 
     .grid2 {
       display: grid;
@@ -247,11 +258,21 @@
 
       <div class="row" style="margin-top: 10px;">
         <label>Velocidad</label>
-        <input id="speedSlider" class="range" type="range" min="1" max="100" value="50" style="width: 200px;">
+        <input id="speedSlider" class="range" type="range" min="0" max="100" value="50" style="width: 200px;">
         <span id="speedLabel" class="status">50 (Normal)</span>
+        <label class="inline-check experimental">
+          <input id="maxApiToggle" type="checkbox">
+          Máximo API
+        </label>
+        <span id="speedProfileStatus" class="status">perfil normal</span>
 
         <label>Loop(ms)</label>
         <input id="loopMs" class="small" type="number" min="50" max="250" value="80">
+      </div>
+
+      <div class="row" style="margin-top: 8px;">
+        <span id="requestedSpeedStatus" class="status">pedido vx 0.00 · vy 0.00 · yaw 0.00</span>
+        <span id="measuredSpeedStatus" class="status">medido vx -- · vy -- · yaw --</span>
       </div>
 
       <div class="row" style="margin-top: 8px;">
@@ -277,7 +298,7 @@
         Movimiento continuo: mantené <span class="kbd">2</span> para avanzar y, sin soltarlo, usá
         <span class="kbd">1/4</span> para girar a la izquierda o <span class="kbd">3/6</span> para girar a la derecha.
         También funcionan <span class="kbd">WASD o Flechas</span>, <span class="kbd">Q/E</span> lateral,
-        <span class="kbd">Shift</span> boost y <span class="kbd">Space</span> stop.
+        y <span class="kbd">Space</span> stop. El último tramo rojo requiere activar Máximo API.
       </p>
     </div>
 
@@ -292,10 +313,25 @@
 
   <script>
     const DEFAULT_LIMITS = Object.freeze({
-      max_linear_speed: 0.45,
-      max_lateral_speed: 0.25,
-      max_angular_speed: 1.0,
+      max_forward_speed: 3.8,
+      max_reverse_speed: 2.5,
+      max_lateral_speed: 1.0,
+      max_angular_speed: 4.0,
       default_move_duration_ms: 700,
+    });
+    const DEFAULT_SPEED_PROFILES = Object.freeze({
+      normal: Object.freeze({
+        forward: 3.5,
+        reverse: 2.3,
+        lateral: 0.92,
+        angular: 3.68,
+      }),
+      max_api: Object.freeze({
+        forward: 3.8,
+        reverse: 2.5,
+        lateral: 1.0,
+        angular: 4.0,
+      }),
     });
 
     const MOVEMENT_KEYS = new Set([
@@ -304,7 +340,6 @@
       "KeyQ", "KeyE", "KeyZ", "KeyC",
       "Digit1", "Digit2", "Digit3", "Digit4", "Digit6",
       "Numpad1", "Numpad2", "Numpad3", "Numpad4", "Numpad6",
-      "ShiftLeft", "ShiftRight",
     ]);
     const FORWARD_KEYS = ["KeyW", "ArrowUp", "Digit2", "Numpad2"];
     const BACKWARD_KEYS = ["KeyS", "ArrowDown"];
@@ -334,6 +369,15 @@
       connected: false,
       speedValue: 50,
       serverLimits: { ...DEFAULT_LIMITS },
+      speedProfiles: {
+        normal: { ...DEFAULT_SPEED_PROFILES.normal },
+        max_api: { ...DEFAULT_SPEED_PROFILES.max_api },
+      },
+      speedProfile: "normal",
+      speedProfilePending: null,
+      speedProfileCommandId: "",
+      lastRequestedMove: { x: 0, y: 0, z: 0 },
+      lastMeasuredMove: { x: null, y: null, z: null },
       lastVideoAt: 0,
       lastLidarAt: 0,
       lastAudioAt: 0,
@@ -367,6 +411,10 @@
       lidarFrame: document.getElementById("lidarFrame"),
       speedSlider: document.getElementById("speedSlider"),
       speedLabel: document.getElementById("speedLabel"),
+      maxApiToggle: document.getElementById("maxApiToggle"),
+      speedProfileStatus: document.getElementById("speedProfileStatus"),
+      requestedSpeedStatus: document.getElementById("requestedSpeedStatus"),
+      measuredSpeedStatus: document.getElementById("measuredSpeedStatus"),
       loopMs: document.getElementById("loopMs"),
       enableVideo: document.getElementById("enableVideo"),
       enableLidar: document.getElementById("enableLidar"),
@@ -494,10 +542,27 @@
             ...DEFAULT_LIMITS,
             ...json.limits,
           };
+          if (json.speed_profiles && typeof json.speed_profiles === "object") {
+            state.speedProfiles = {
+              normal: {
+                ...DEFAULT_SPEED_PROFILES.normal,
+                ...(json.speed_profiles.normal || {}),
+              },
+              max_api: {
+                ...DEFAULT_SPEED_PROFILES.max_api,
+                ...(json.speed_profiles.max_api || {}),
+              },
+            };
+          }
+          if (!state.speedProfilePending && json.active_speed_profile) {
+            applyConfirmedSpeedProfile(String(json.active_speed_profile));
+          }
           addEvent("capabilities", {
             role: json.role,
             limits: state.serverLimits,
+            speed_profiles: state.speedProfiles,
           });
+          updateSpeedUi();
         }
       } catch (err) {
         addEvent("capabilities_error", normalizeError(err));
@@ -724,12 +789,136 @@
       }
     }
 
+    function applyConfirmedSpeedProfile(profile) {
+      const normalized = profile === "max_api" ? "max_api" : "normal";
+      state.speedProfile = normalized;
+      state.speedProfilePending = null;
+      state.speedProfileCommandId = "";
+      els.maxApiToggle.checked = normalized === "max_api";
+      els.maxApiToggle.disabled = !state.connected;
+      setBadge(
+        els.speedProfileStatus,
+        normalized === "max_api" ? "MÁXIMO API activo" : "perfil normal",
+        normalized === "max_api" ? "err" : "ok"
+      );
+      updateSpeedUi();
+    }
+
+    function updateMotionReadouts() {
+      const requested = state.lastRequestedMove;
+      const measured = state.lastMeasuredMove;
+      setBadge(
+        els.requestedSpeedStatus,
+        `pedido vx ${requested.x.toFixed(2)} · vy ${requested.y.toFixed(2)} · yaw ${requested.z.toFixed(2)}`,
+        state.speedProfile === "max_api" ? "warn" : ""
+      );
+
+      const fmt = value => Number.isFinite(value) ? Number(value).toFixed(2) : "--";
+      setBadge(
+        els.measuredSpeedStatus,
+        `medido vx ${fmt(measured.x)} · vy ${fmt(measured.y)} · yaw ${fmt(measured.z)}`,
+        ""
+      );
+    }
+
+    function updateMeasuredMotion(telemetry) {
+      const velocity = telemetry && typeof telemetry.velocity === "object"
+        ? telemetry.velocity
+        : {};
+      state.lastMeasuredMove = {
+        x: parseNum(velocity.x ?? velocity.linear, NaN),
+        y: parseNum(velocity.y, NaN),
+        z: parseNum(velocity.z ?? velocity.angular, NaN),
+      };
+
+      const speedControl = telemetry && typeof telemetry.speed_control === "object"
+        ? telemetry.speed_control
+        : {};
+      if (
+        !state.speedProfilePending
+        && (speedControl.profile === "normal" || speedControl.profile === "max_api")
+        && speedControl.profile !== state.speedProfile
+      ) {
+        applyConfirmedSpeedProfile(speedControl.profile);
+      }
+      updateMotionReadouts();
+    }
+
+    function handleSpeedProfileAck(data) {
+      if (!data || data.command_type !== "set_speed_profile") return false;
+      if (
+        state.speedProfileCommandId
+        && data.command_id
+        && data.command_id !== state.speedProfileCommandId
+      ) {
+        return true;
+      }
+
+      if (data.status === "accepted") {
+        setBadge(
+          els.speedProfileStatus,
+          `activando ${state.speedProfilePending || "perfil"}...`,
+          "warn"
+        );
+        return true;
+      }
+
+      if (data.status === "executed") {
+        const result = data.result && typeof data.result === "object" ? data.result : {};
+        applyConfirmedSpeedProfile(result.profile || state.speedProfilePending || "normal");
+        addEvent("speed_profile_active", result);
+        return true;
+      }
+
+      if (data.status === "error" || data.status === "rejected") {
+        const previous = state.speedProfile;
+        state.speedProfilePending = null;
+        state.speedProfileCommandId = "";
+        els.maxApiToggle.checked = previous === "max_api";
+        els.maxApiToggle.disabled = !state.connected;
+        setBadge(
+          els.speedProfileStatus,
+          `perfil rechazado: ${data.reason || data.status}`,
+          "err"
+        );
+        addEvent("speed_profile_error", data);
+        return true;
+      }
+
+      return true;
+    }
+
     function handleWsMessage(msg) {
       const type = msg.type;
 
       if (type === "telemetry") {
         if (msg.robot_id !== state.robotId) return;
-        els.telemetryBox.textContent = JSON.stringify(msg.data || {}, null, 2);
+        const telemetry = msg.data || {};
+        els.telemetryBox.textContent = JSON.stringify(telemetry, null, 2);
+        updateMeasuredMotion(telemetry);
+        return;
+      }
+
+      if (type === "speed_profile_status") {
+        if (msg.robot_id !== state.robotId) return;
+        if (!msg.ok) {
+          state.speedProfilePending = null;
+          state.speedProfileCommandId = "";
+          els.maxApiToggle.checked = state.speedProfile === "max_api";
+          els.maxApiToggle.disabled = !state.connected;
+          setBadge(
+            els.speedProfileStatus,
+            msg.error || "no se pudo solicitar el perfil",
+            "err"
+          );
+          return;
+        }
+        state.speedProfileCommandId = String(msg.command_id || "");
+        setBadge(
+          els.speedProfileStatus,
+          `activando ${msg.profile}...`,
+          "warn"
+        );
         return;
       }
 
@@ -758,24 +947,27 @@
         return;
       }
 
+      if (type === "command_ack" && handleSpeedProfileAck(msg.data || {})) {
+        return;
+      }
+
       if (type === "event" || type === "prediction" || type === "command_ack" || type === "command_out") {
         addEvent(type, msg.data || msg);
       }
     }
 
     function currentPreset() {
-      const speedVal = clamp(parseNum(state.speedValue, 50), 1, 100);
-      const boost = state.keyState.has("ShiftLeft") || state.keyState.has("ShiftRight") ? 1.3 : 1.0;
+      const speedVal = clamp(parseNum(state.speedValue, 50), 0, 100);
       const scale = speedVal / 100;
-
-      const maxLinear = parseNum(state.serverLimits.max_linear_speed, DEFAULT_LIMITS.max_linear_speed);
-      const maxLateral = parseNum(state.serverLimits.max_lateral_speed, DEFAULT_LIMITS.max_lateral_speed);
-      const maxAngular = parseNum(state.serverLimits.max_angular_speed, DEFAULT_LIMITS.max_angular_speed);
+      const profile = state.speedProfiles[state.speedProfile]
+        || state.speedProfiles.normal
+        || DEFAULT_SPEED_PROFILES.normal;
 
       return {
-        linear: clamp(maxLinear * scale * boost, 0, maxLinear),
-        lateral: clamp(maxLateral * scale * boost, 0, maxLateral),
-        angular: clamp(maxAngular * scale * boost, 0, maxAngular),
+        forward: parseNum(profile.forward, DEFAULT_SPEED_PROFILES.normal.forward) * scale,
+        reverse: parseNum(profile.reverse, DEFAULT_SPEED_PROFILES.normal.reverse) * scale,
+        lateral: parseNum(profile.lateral, DEFAULT_SPEED_PROFILES.normal.lateral) * scale,
+        angular: parseNum(profile.angular, DEFAULT_SPEED_PROFILES.normal.angular) * scale,
       };
     }
 
@@ -786,8 +978,8 @@
       let y = 0;
       let z = 0;
 
-      if (FORWARD_KEYS.some(code => state.keyState.has(code))) x += speed.linear;
-      if (BACKWARD_KEYS.some(code => state.keyState.has(code))) x -= speed.linear;
+      if (FORWARD_KEYS.some(code => state.keyState.has(code))) x += speed.forward;
+      if (BACKWARD_KEYS.some(code => state.keyState.has(code))) x -= speed.reverse;
       if (LEFT_KEYS.some(code => state.keyState.has(code))) z += speed.angular;
       if (RIGHT_KEYS.some(code => state.keyState.has(code))) z -= speed.angular;
       if (STRAFE_LEFT_KEYS.some(code => state.keyState.has(code))) y += speed.lateral;
@@ -804,15 +996,31 @@
     }
 
     function updateSpeedUi() {
-      state.speedValue = Math.max(1, Math.min(100, parseNum(els.speedSlider.value, 50)));
+      state.speedValue = Math.max(0, Math.min(100, parseNum(els.speedSlider.value, 50)));
       els.speedSlider.value = state.speedValue;
+      const preset = currentPreset();
 
       let label = "Lento";
-      if (state.speedValue >= 75) label = "Rápido";
+      if (state.speedProfile === "max_api" && preset.forward > 3.5) label = "MÁXIMO API";
+      else if (state.speedValue >= 75) label = "Rápido";
       else if (state.speedValue >= 50) label = "Normal";
       else if (state.speedValue >= 25) label = "Medio-Lento";
 
-      els.speedLabel.textContent = `${state.speedValue} (${label})`;
+      els.speedLabel.textContent = `${state.speedValue}% · ${preset.forward.toFixed(2)} m/s (${label})`;
+
+      if (state.speedProfile === "max_api") {
+        const threshold = clamp(3.5 / state.speedProfiles.max_api.forward * 100, 0, 100);
+        els.speedSlider.style.background = (
+          `linear-gradient(90deg, #24577d 0%, #24577d ${threshold}%, `
+          + `#7d2630 ${threshold}%, #7d2630 100%)`
+        );
+        els.speedSlider.style.accentColor = preset.forward > 3.5 ? "#ff6f6f" : "#59a8ff";
+      } else {
+        els.speedSlider.style.background = "";
+        els.speedSlider.style.accentColor = "#59a8ff";
+      }
+
+      updateMotionReadouts();
     }
 
     function ageText(tsMs) {
@@ -940,6 +1148,8 @@
         state.lastMoveActive = false;
         state.lastMoveSignature = "";
         state.lastMoveSentAt = Date.now();
+        state.lastRequestedMove = { x: 0, y: 0, z: 0 };
+        updateMotionReadouts();
         return true;
       }
 
@@ -969,6 +1179,8 @@
       state.lastMoveActive = true;
       state.lastMoveSignature = signature;
       state.lastMoveSentAt = now;
+      state.lastRequestedMove = { x: m.x, y: m.y, z: m.z };
+      updateMotionReadouts();
       return true;
     }
 
@@ -1005,6 +1217,8 @@
       state.lastMoveActive = false;
       state.lastMoveSignature = "";
       state.lastMoveSentAt = 0;
+      state.lastRequestedMove = { x: 0, y: 0, z: 0 };
+      updateMotionReadouts();
       state.controlSending = false;
       state.stopSending = false;
     }
@@ -1036,6 +1250,35 @@
       } finally {
         state.stopSending = false;
       }
+    }
+
+    async function requestSpeedProfile(profile) {
+      const normalized = profile === "max_api" ? "max_api" : "normal";
+      if (
+        !state.connected
+        || !state.ws
+        || state.ws.readyState !== WebSocket.OPEN
+        || state.speedProfilePending
+      ) {
+        els.maxApiToggle.checked = state.speedProfile === "max_api";
+        return;
+      }
+
+      state.keyState.clear();
+      await stopRobotNow();
+      state.speedProfilePending = normalized;
+      state.speedProfileCommandId = "";
+      els.maxApiToggle.disabled = true;
+      setBadge(
+        els.speedProfileStatus,
+        `solicitando ${normalized}...`,
+        "warn"
+      );
+      state.ws.send(JSON.stringify({
+        op: "set_speed_profile",
+        robot_id: state.robotId,
+        profile: normalized,
+      }));
     }
 
     function clearReconnectTimer() {
@@ -1119,6 +1362,7 @@
         clearReconnectTimer();
         state.reconnectAttempt = 0;
         state.connected = true;
+        els.maxApiToggle.disabled = false;
         setStatus("conectado", true);
         startControlLoop();
         addEvent("ws_open", { robot_id: state.robotId });
@@ -1133,6 +1377,13 @@
         state.ws = null;
         state.connected = false;
         state.keyState.clear();
+        state.speedProfile = "normal";
+        state.speedProfilePending = null;
+        state.speedProfileCommandId = "";
+        els.maxApiToggle.checked = false;
+        els.maxApiToggle.disabled = true;
+        setBadge(els.speedProfileStatus, "perfil normal · offline", "err");
+        updateSpeedUi();
         resetAudioQueue();
         setStatus("desconectado", false);
         stopControlLoop();
@@ -1163,8 +1414,8 @@
         if (!state.connected) return;
 
         const speed = currentPreset();
-        if (cmd === "forward") return sendCommand("move", { linear_x: speed.linear, angular_z: 0.0, duration_ms: 520 });
-        if (cmd === "back") return sendCommand("move", { linear_x: -speed.linear, angular_z: 0.0, duration_ms: 520 });
+        if (cmd === "forward") return sendCommand("move", { linear_x: speed.forward, angular_z: 0.0, duration_ms: 520 });
+        if (cmd === "back") return sendCommand("move", { linear_x: -speed.reverse, angular_z: 0.0, duration_ms: 520 });
         if (cmd === "left") return sendCommand("move", { linear_x: 0.0, angular_z: speed.angular, duration_ms: 460 });
         if (cmd === "right") return sendCommand("move", { linear_x: 0.0, angular_z: -speed.angular, duration_ms: 460 });
         if (cmd === "strafeL") return sendCommand("move", { linear_x: 0.0, lateral_y: speed.lateral, duration_ms: 520 });
@@ -1209,6 +1460,12 @@
 
     els.speedSlider.addEventListener("input", () => {
       updateSpeedUi();
+      if (state.lastMoveActive) {
+        sendDriveState(true);
+      }
+    });
+    els.maxApiToggle.addEventListener("change", async () => {
+      await requestSpeedProfile(els.maxApiToggle.checked ? "max_api" : "normal");
     });
     els.loopMs.addEventListener("change", () => {
       if (state.connected) {
@@ -1275,8 +1532,26 @@
       void stopRobotNow();
     });
 
+    window.addEventListener("beforeunload", () => {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      state.ws.send(JSON.stringify({
+        op: "drive_stop",
+        robot_id: state.robotId,
+        sequence: ++state.driveSequence,
+      }));
+      if (state.speedProfile === "max_api" || state.speedProfilePending === "max_api") {
+        state.ws.send(JSON.stringify({
+          op: "set_speed_profile",
+          robot_id: state.robotId,
+          profile: "normal",
+        }));
+      }
+    });
+
+    els.maxApiToggle.disabled = true;
     updateSpeedUi();
     updateMediaStatus();
+    updateMotionReadouts();
   </script>
 </body>
 </html>

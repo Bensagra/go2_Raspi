@@ -84,6 +84,7 @@ class EdgeGatewayService:
         self.latest_by_topic: Dict[str, Any] = {}
 
         self.camera_enabled = args.enable_camera
+        self.camera_channel_active = False
         self.camera_emit_every = args.camera_emit_every
         self.camera_jpeg_quality = args.camera_jpeg_quality
         self.camera_target_fps = args.camera_target_fps
@@ -303,7 +304,9 @@ class EdgeGatewayService:
         if self.conn is None:
             raise RuntimeError("Robot connection not ready")
         self.camera_enabled = enabled
-        self.conn.video.switchVideoChannel(enabled)
+        if enabled != self.camera_channel_active:
+            self.conn.video.switchVideoChannel(enabled)
+            self.camera_channel_active = enabled
 
     async def _set_audio(self, enabled: bool) -> None:
         if self.conn is None:
@@ -1493,6 +1496,7 @@ class EdgeGatewayService:
         self.move_active = False
         self.pending_stop_deadline = 0.0
         self.last_move_command = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self.camera_channel_active = False
 
         if connection is None:
             return

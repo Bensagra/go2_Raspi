@@ -106,17 +106,74 @@
     }
 
     .media {
+      display: block;
       width: 100%;
       aspect-ratio: 16/9;
       border: 1px solid var(--border);
       border-radius: 10px;
       background: #0b1118;
-      object-fit: cover;
+      cursor: zoom-in;
     }
 
     .media.map {
       aspect-ratio: 2/1;
+    }
+
+    .media-shell {
+      position: relative;
+    }
+
+    .media-shell::after {
+      content: "clic para ampliar";
+      position: absolute;
+      right: 8px;
+      bottom: 8px;
+      padding: 4px 7px;
+      border-radius: 6px;
+      background: rgba(4, 10, 16, 0.76);
+      color: #c8d6e2;
+      font-size: 10px;
+      pointer-events: none;
+    }
+
+    .media-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(3, 8, 13, 0.94);
+      backdrop-filter: blur(5px);
+    }
+
+    .media-modal[hidden] {
+      display: none;
+    }
+
+    .media-modal-content {
+      width: min(96vw, 1800px);
+      max-height: 94vh;
+      display: grid;
+      gap: 10px;
+    }
+
+    .media-modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .media-modal canvas {
+      display: block;
+      width: 100%;
+      max-height: calc(94vh - 58px);
       object-fit: contain;
+      border: 1px solid #45617a;
+      border-radius: 12px;
+      background: #050a0f;
+      cursor: zoom-out;
     }
 
     .mono {
@@ -241,11 +298,15 @@
       <div class="grid2" style="margin-top: 12px;">
         <div>
           <h2 class="title">Video</h2>
-          <img id="videoFrame" class="media" alt="video" decoding="async">
+          <div class="media-shell">
+            <canvas id="videoFrame" class="media" width="960" height="540" aria-label="video"></canvas>
+          </div>
         </div>
         <div>
           <h2 class="title">Mapa LiDAR 3D · procesado en servidor</h2>
-          <img id="lidarFrame" class="media map" alt="mapa lidar" decoding="async">
+          <div class="media-shell">
+            <canvas id="lidarFrame" class="media map" width="960" height="480" aria-label="mapa lidar"></canvas>
+          </div>
         </div>
       </div>
 
@@ -325,6 +386,16 @@
     </div>
   </div>
 
+  <div id="mediaModal" class="media-modal" hidden role="dialog" aria-modal="true" aria-label="visor ampliado">
+    <div class="media-modal-content">
+      <div class="media-modal-header">
+        <h2 id="mediaModalTitle" class="title" style="margin:0">Visor ampliado</h2>
+        <button id="closeMediaModal" type="button">Cerrar ×</button>
+      </div>
+      <canvas id="expandedMediaCanvas" width="960" height="540"></canvas>
+    </div>
+  </div>
+
   <script>
     const DEFAULT_LIMITS = Object.freeze({
       max_forward_speed: 3.8,
@@ -395,10 +466,21 @@
       lastVideoAt: 0,
       lastLidarAt: 0,
       lastAudioAt: 0,
-      mediaObjectUrls: {
-        video: "",
-        lidar: "",
+      mediaRender: {
+        video: {
+          busy: false,
+          pending: null,
+          bitmap: null,
+          generation: 0,
+        },
+        lidar: {
+          busy: false,
+          pending: null,
+          bitmap: null,
+          generation: 0,
+        },
       },
+      expandedStream: "",
       videoStats: {
         frameTimes: [],
         fps: 0,
@@ -438,6 +520,10 @@
       events: document.getElementById("events"),
       videoFrame: document.getElementById("videoFrame"),
       lidarFrame: document.getElementById("lidarFrame"),
+      mediaModal: document.getElementById("mediaModal"),
+      mediaModalTitle: document.getElementById("mediaModalTitle"),
+      closeMediaModal: document.getElementById("closeMediaModal"),
+      expandedMediaCanvas: document.getElementById("expandedMediaCanvas"),
       speedSlider: document.getElementById("speedSlider"),
       speedLabel: document.getElementById("speedLabel"),
       maxApiToggle: document.getElementById("maxApiToggle"),
@@ -626,24 +712,110 @@
       return "image/jpeg";
     }
 
-    function renderMediaImage(imgEl, data, stream) {
-      if (!data || !data.image_base64) return;
+    function drawBitmap(canvas, bitmap) {
+      if (!canvas || !bitmap) return;
+      if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+      }
+      const ctx = canvas.getContext("2d", {
+        alpha: false,
+        desynchronized: true,
+      });
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    }
+
+    function streamCanvas(stream) {
+      return stream === "video" ? els.videoFrame : els.lidarFrame;
+    }
+
+    async function decodeMediaBlob(blob) {
+      if (typeof createImageBitmap === "function") {
+        return createImageBitmap(blob);
+      }
+
+      const image = new Image();
+      const url = URL.createObjectURL(blob);
       try {
-        const bytes = base64ToBytes(data.image_base64);
-        const blob = new Blob([bytes], { type: formatImageMime(data.image_format) });
-        const nextUrl = URL.createObjectURL(blob);
-        const previousUrl = state.mediaObjectUrls[stream];
-        state.mediaObjectUrls[stream] = nextUrl;
-        imgEl.src = nextUrl;
-        if (previousUrl) {
-          URL.revokeObjectURL(previousUrl);
+        await new Promise((resolve, reject) => {
+          image.onload = resolve;
+          image.onerror = () => reject(new Error("No se pudo decodificar el cuadro"));
+          image.src = url;
+        });
+        return image;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+
+    async function processMediaFrames(stream) {
+      const renderer = state.mediaRender[stream];
+      if (!renderer || renderer.busy) return;
+      renderer.busy = true;
+
+      try {
+        while (renderer.pending) {
+          const data = renderer.pending;
+          renderer.pending = null;
+          const generation = renderer.generation;
+
+          const bytes = base64ToBytes(data.image_base64);
+          const blob = new Blob([bytes], {
+            type: formatImageMime(data.image_format),
+          });
+          const bitmap = await decodeMediaBlob(blob);
+          if (generation !== renderer.generation) {
+            if (typeof bitmap.close === "function") bitmap.close();
+            continue;
+          }
+
+          drawBitmap(streamCanvas(stream), bitmap);
+          if (state.expandedStream === stream) {
+            drawBitmap(els.expandedMediaCanvas, bitmap);
+          }
+
+          const previous = renderer.bitmap;
+          renderer.bitmap = bitmap;
+          if (previous && typeof previous.close === "function") {
+            previous.close();
+          }
         }
       } catch (err) {
         addEvent("media_decode_error", {
           stream,
           error: normalizeError(err),
         });
+      } finally {
+        renderer.busy = false;
+        if (renderer.pending) {
+          void processMediaFrames(stream);
+        }
       }
+    }
+
+    function renderMediaImage(data, stream) {
+      if (!data || !data.image_base64 || !state.mediaRender[stream]) return;
+      // Conserva sólo el cuadro más nuevo mientras el navegador decodifica.
+      state.mediaRender[stream].pending = data;
+      void processMediaFrames(stream);
+    }
+
+    function openMediaModal(stream) {
+      const renderer = state.mediaRender[stream];
+      if (!renderer || !renderer.bitmap) return;
+      state.expandedStream = stream;
+      els.mediaModalTitle.textContent = stream === "video"
+        ? "Cámara ampliada"
+        : "Mapa LiDAR 3D ampliado";
+      drawBitmap(els.expandedMediaCanvas, renderer.bitmap);
+      els.mediaModal.hidden = false;
+      document.body.style.overflow = "hidden";
+    }
+
+    function closeMediaModal() {
+      state.expandedStream = "";
+      els.mediaModal.hidden = true;
+      document.body.style.overflow = "";
     }
 
     function base64ToBytes(base64) {
@@ -725,11 +897,15 @@
       state.audio.queuedSamples = 0;
     }
 
-    function releaseMediaUrls() {
-      for (const stream of Object.keys(state.mediaObjectUrls)) {
-        const url = state.mediaObjectUrls[stream];
-        if (url) URL.revokeObjectURL(url);
-        state.mediaObjectUrls[stream] = "";
+    function releaseMediaFrames() {
+      closeMediaModal();
+      for (const renderer of Object.values(state.mediaRender)) {
+        renderer.generation += 1;
+        renderer.pending = null;
+        if (renderer.bitmap && typeof renderer.bitmap.close === "function") {
+          renderer.bitmap.close();
+        }
+        renderer.bitmap = null;
       }
     }
 
@@ -983,7 +1159,7 @@
 
         if (stream === "video") {
           const now = Date.now();
-          renderMediaImage(els.videoFrame, data, "video");
+          renderMediaImage(data, "video");
           state.lastVideoAt = now;
           state.videoStats.frameTimes.push(now);
           while (
@@ -1002,7 +1178,7 @@
         }
 
         if (stream === "lidar") {
-          renderMediaImage(els.lidarFrame, data, "lidar");
+          renderMediaImage(data, "lidar");
           state.lastLidarAt = Date.now();
           state.lidarStats.mapPoints = Math.round(parseNum(data.map_point_count, 0));
           state.lidarStats.sourcePoints = Math.round(parseNum(data.source_point_count, 0));
@@ -1472,7 +1648,7 @@
         setBadge(els.speedProfileStatus, "perfil normal · offline", "err");
         updateSpeedUi();
         resetAudioQueue();
-        releaseMediaUrls();
+        releaseMediaFrames();
         setStatus("desconectado", false);
         stopControlLoop();
         updateMediaStatus();
@@ -1529,6 +1705,22 @@
       await ensureAudioContext(true);
     });
 
+    els.videoFrame.addEventListener("click", () => {
+      openMediaModal("video");
+    });
+
+    els.lidarFrame.addEventListener("click", () => {
+      openMediaModal("lidar");
+    });
+
+    els.closeMediaModal.addEventListener("click", closeMediaModal);
+    els.expandedMediaCanvas.addEventListener("click", closeMediaModal);
+    els.mediaModal.addEventListener("click", (ev) => {
+      if (ev.target === els.mediaModal) {
+        closeMediaModal();
+      }
+    });
+
     els.enableVideo.addEventListener("change", async () => {
       if (state.connected) await applyMediaSettings();
     });
@@ -1572,6 +1764,12 @@
     }
 
     window.addEventListener("keydown", async (ev) => {
+      if (ev.code === "Escape" && !els.mediaModal.hidden) {
+        ev.preventDefault();
+        closeMediaModal();
+        return;
+      }
+
       if (MOVEMENT_KEYS.has(ev.code)) {
         if (isTypingTarget(ev.target)) return;
         ev.preventDefault();
@@ -1621,7 +1819,7 @@
     });
 
     window.addEventListener("beforeunload", () => {
-      releaseMediaUrls();
+      releaseMediaFrames();
       if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
       state.ws.send(JSON.stringify({
         op: "drive_stop",

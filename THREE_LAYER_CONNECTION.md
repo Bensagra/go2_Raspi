@@ -97,10 +97,19 @@ python edge/edge_gateway_service.py \
 
 Los valores por defecto están preparados para una red débil:
 
-- Cámara: WebP, 640 px, 12 FPS y calidad objetivo 55% con ajuste automático por cuadro.
+- Cámara: **H.264 inter-cuadro** (compresión temporal real), 640 px, 30 FPS y techo de bitrate 700 kbps.
+  Reemplaza al MJPEG (WebP por cuadro): mismo cuadro, ~7-15x menos ancho de banda, así entran 30-40 FPS
+  en ~2 Mbps sin ahogar el control ni el LiDAR. Se decodifica en el navegador con WebCodecs (Chrome/Edge).
+  El bitstream H.264 se entrega de forma confiable y en orden (nunca se descartan deltas); si no hay WebCodecs
+  el dashboard cae automáticamente a MJPEG (WebP).
 - LiDAR: 0.7 actualizaciones/s, hasta 2500 puntos, cuantización de 2 cm y zlib nivel 6.
 - Audio: 16 kHz en el edge y apagado por defecto en el dashboard.
-- Uplink de media: techo de 2200 kbps; al superarlo se descartan frames viejos en vez de acumular latencia.
+- Uplink de media: techo de 2200 kbps; el video H.264 tiene prioridad (su propio control de bitrate) y los
+  streams descartables (LiDAR/audio) ceden ancho de banda al superarse el presupuesto.
+
+Encoder del edge: `--camera-h264-encoder auto` prueba el encoder por hardware del Pi (`h264_v4l2m2m`) y, si la
+build de PyAV/ffmpeg no lo trae, cae a `libx264` (`ultrafast`/`zerolatency`), suficiente para 640×480@30 en un Pi 4.
+Ajustables: `--camera-format {h264,webp,jpg}`, `--camera-bitrate-kbps`, `--camera-gop` (0 = keyframe cada 2 s).
 
 El dashboard ofrece perfiles `Débil`, `Balanceada` y `Alta calidad`. Para priorizar la respuesta de
 los comandos y evitar tener que apagar la cámara, dejar seleccionado `Débil`.

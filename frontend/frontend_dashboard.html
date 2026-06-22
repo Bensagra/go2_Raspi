@@ -420,6 +420,9 @@
         <label>Cam ancho</label>
         <input id="cameraWidth" style="width:100px" type="number" min="320" max="1920" value="640">
 
+        <label>Bitrate kbps</label>
+        <input id="cameraBitrate" style="width:100px" type="number" min="100" max="12000" value="900">
+
         <label>Audio every</label>
         <input id="audioEmitEvery" class="small" type="number" min="1" max="10" value="2">
 
@@ -526,10 +529,14 @@
     const RIGHT_KEYS = ["KeyD", "ArrowRight", "Digit3", "Digit6", "Numpad3", "Numpad6"];
     const STRAFE_LEFT_KEYS = ["KeyQ", "KeyZ"];
     const STRAFE_RIGHT_KEYS = ["KeyE", "KeyC"];
+    // cameraFormat es ahora H.264 (compresión inter-cuadro). cameraBitrateKbps fija
+    // el techo real del video; cameraQuality/cameraMinQuality solo se usan en el
+    // fallback MJPEG (webp) para navegadores sin WebCodecs.
     const NETWORK_PROFILES = Object.freeze({
       weak: Object.freeze({
-        cameraFps: 12,
-        cameraFormat: "webp",
+        cameraFps: 30,
+        cameraFormat: "h264",
+        cameraBitrateKbps: 700,
         cameraQuality: 55,
         cameraMinQuality: 34,
         cameraWidth: 640,
@@ -540,8 +547,9 @@
         uplinkMaxKbps: 2200,
       }),
       balanced: Object.freeze({
-        cameraFps: 15,
-        cameraFormat: "webp",
+        cameraFps: 30,
+        cameraFormat: "h264",
+        cameraBitrateKbps: 1500,
         cameraQuality: 62,
         cameraMinQuality: 38,
         cameraWidth: 960,
@@ -553,7 +561,8 @@
       }),
       quality: Object.freeze({
         cameraFps: 40,
-        cameraFormat: "webp",
+        cameraFormat: "h264",
+        cameraBitrateKbps: 4000,
         cameraQuality: 68,
         cameraMinQuality: 45,
         cameraWidth: 1280,
@@ -613,6 +622,16 @@
         },
       },
       expandedStream: "",
+      videoMode: "h264",
+      videoDecoder: {
+        decoder: null,
+        codec: "",
+        configured: false,
+        needKeyframe: true,
+        frameCount: 0,
+        lastFrame: null,
+        unsupportedLogged: false,
+      },
       videoStats: {
         frameTimes: [],
         fps: 0,
@@ -692,6 +711,7 @@
       cameraFps: document.getElementById("cameraFps"),
       cameraQuality: document.getElementById("cameraQuality"),
       cameraWidth: document.getElementById("cameraWidth"),
+      cameraBitrate: document.getElementById("cameraBitrate"),
       audioEmitEvery: document.getElementById("audioEmitEvery"),
       audioMaxBytes: document.getElementById("audioMaxBytes"),
       applyMediaBtn: document.getElementById("applyMediaBtn"),
@@ -966,14 +986,141 @@
       void processMediaFrames(stream);
     }
 
+    // ----- Video H.264 (WebCodecs) -----
+    // Una sola imagen completa (keyframe) cada ~GOP y, en el medio, sólo los cambios
+    // (delta frames). Eso baja el ancho de banda ~7-15x frente a MJPEG. El edge emite
+    // Annex-B; el navegador lo decodifica por hardware vía VideoDecoder.
+    function webCodecsAvailable() {
+      return typeof window.VideoDecoder === "function"
+        && typeof window.EncodedVideoChunk === "function";
+    }
+
+    function drawVideoFrame(canvas, frame) {
+      if (!canvas || !frame) return;
+      const width = frame.displayWidth || frame.codedWidth;
+      const height = frame.displayHeight || frame.codedHeight;
+      if (width && height && (canvas.width !== width || canvas.height !== height)) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    }
+
+    function handleDecodedVideoFrame(frame) {
+      try {
+        drawVideoFrame(els.videoFrame, frame);
+        if (state.expandedStream === "video") {
+          drawVideoFrame(els.expandedMediaCanvas, frame);
+        }
+      } catch (err) {
+        addEvent("video_draw_error", normalizeError(err));
+      } finally {
+        frame.close();
+      }
+    }
+
+    function resetVideoDecoder() {
+      const vd = state.videoDecoder;
+      if (vd.decoder) {
+        try { vd.decoder.close(); } catch (e) { /* ignore */ }
+      }
+      vd.decoder = null;
+      vd.configured = false;
+      vd.codec = "";
+      vd.needKeyframe = true;
+      vd.frameCount = 0;
+    }
+
+    function ensureVideoDecoder(codecString) {
+      const vd = state.videoDecoder;
+      if (vd.decoder && vd.configured && vd.codec === codecString) return true;
+      if (vd.decoder) {
+        try { vd.decoder.close(); } catch (e) { /* ignore */ }
+      }
+      vd.decoder = new VideoDecoder({
+        output: handleDecodedVideoFrame,
+        error: (err) => {
+          addEvent("video_decode_error", normalizeError(err));
+          resetVideoDecoder();
+        },
+      });
+      try {
+        vd.decoder.configure({
+          codec: codecString,
+          optimizeForLatency: true,
+        });
+      } catch (err) {
+        addEvent("video_configure_error", { codec: codecString, error: normalizeError(err) });
+        resetVideoDecoder();
+        return false;
+      }
+      vd.codec = codecString;
+      vd.configured = true;
+      vd.needKeyframe = true;
+      vd.frameCount = 0;
+      return true;
+    }
+
+    function decodeH264Chunk(data) {
+      if (!webCodecsAvailable()) {
+        const vd = state.videoDecoder;
+        if (!vd.unsupportedLogged) {
+          vd.unsupportedLogged = true;
+          addEvent(
+            "video_unsupported",
+            "Este navegador no soporta WebCodecs (VideoDecoder). Usá Chrome/Edge para ver H.264."
+          );
+        }
+        return;
+      }
+
+      const codecString = String(data.codec || "avc1.42e01e");
+      if (!ensureVideoDecoder(codecString)) return;
+
+      const vd = state.videoDecoder;
+      const isKey = !!data.key;
+      if (vd.needKeyframe) {
+        // No se puede arrancar (ni resincronizar) en un delta: esperá un keyframe.
+        if (!isKey) return;
+        vd.needKeyframe = false;
+      }
+
+      let bytes;
+      try {
+        bytes = base64ToBytes(data.chunk_base64 || "");
+      } catch (err) {
+        return;
+      }
+      if (!bytes.length) return;
+
+      const fps = Math.max(1, parseNum(data.target_fps, 30));
+      const timestamp = Math.round((vd.frameCount++ * 1e6) / fps);
+      try {
+        vd.decoder.decode(new EncodedVideoChunk({
+          type: isKey ? "key" : "delta",
+          timestamp,
+          data: bytes,
+        }));
+      } catch (err) {
+        addEvent("video_decode_error", normalizeError(err));
+        resetVideoDecoder();
+      }
+    }
+
     function openMediaModal(stream) {
       const renderer = state.mediaRender[stream];
-      if (!renderer || !renderer.bitmap) return;
+      const isH264Video = stream === "video" && state.videoMode === "h264";
+      // En H.264 no hay bitmap cacheado: abrimos igual y el próximo cuadro
+      // decodificado se dibuja en el canvas ampliado.
+      if (!isH264Video && (!renderer || !renderer.bitmap)) return;
       state.expandedStream = stream;
       els.mediaModalTitle.textContent = stream === "video"
         ? "Cámara ampliada"
         : "Mapa LiDAR 3D ampliado";
-      drawBitmap(els.expandedMediaCanvas, renderer.bitmap);
+      if (renderer && renderer.bitmap) {
+        drawBitmap(els.expandedMediaCanvas, renderer.bitmap);
+      }
       els.mediaModal.hidden = false;
       document.body.style.overflow = "hidden";
     }
@@ -1611,6 +1758,7 @@
 
     function releaseMediaFrames() {
       closeMediaModal();
+      resetVideoDecoder();
       for (const renderer of Object.values(state.mediaRender)) {
         renderer.generation += 1;
         renderer.pending = null;
@@ -1871,7 +2019,13 @@
 
         if (stream === "video") {
           const now = Date.now();
-          renderMediaImage(data, "video");
+          if (data.image_format === "h264") {
+            state.videoMode = "h264";
+            decodeH264Chunk(data);
+          } else {
+            state.videoMode = "mjpeg";
+            renderMediaImage(data, "video");
+          }
           state.lastVideoAt = now;
           state.videoStats.frameTimes.push(now);
           while (
@@ -2003,7 +2157,7 @@
         setBadge(
           els.mediaStatus,
           (
-            `CAM ${state.videoStats.fps}fps ${state.videoStats.latencyMs.toFixed(0)}ms `
+            `CAM ${state.videoMode} ${state.videoStats.fps}fps ${state.videoStats.latencyMs.toFixed(0)}ms `
             + `(enc ${state.videoStats.encodeMs.toFixed(0)}ms) | `
             + `MAP ${state.lidarStats.mapPoints} vox ${state.lidarStats.processingMs.toFixed(0)}ms | `
             + `A ${ageText(state.lastAudioAt)}`
@@ -2033,6 +2187,7 @@
       els.cameraFps.value = String(profile.cameraFps);
       els.cameraQuality.value = String(profile.cameraQuality);
       els.cameraWidth.value = String(profile.cameraWidth);
+      els.cameraBitrate.value = String(profile.cameraBitrateKbps);
       return profile;
     }
 
@@ -2048,12 +2203,26 @@
       const cameraFps = clamp(Math.round(parseNum(els.cameraFps.value, profile.cameraFps)), 1, 40);
       const cameraQuality = clamp(Math.round(parseNum(els.cameraQuality.value, profile.cameraQuality)), 25, 90);
       const cameraWidth = clamp(Math.round(parseNum(els.cameraWidth.value, profile.cameraWidth)), 320, 1920);
+      const cameraBitrateKbps = clamp(
+        Math.round(parseNum(els.cameraBitrate.value, profile.cameraBitrateKbps)),
+        100,
+        12000
+      );
+      // H.264 sólo si el navegador puede decodificarlo; si no, caemos a MJPEG (webp).
+      const wantH264 = profile.cameraFormat === "h264";
+      const cameraFormat = wantH264 && webCodecsAvailable() ? "h264" : "webp";
 
       els.audioEmitEvery.value = String(audioEmitEvery);
       els.audioMaxBytes.value = String(audioMaxBytes);
       els.cameraFps.value = String(cameraFps);
       els.cameraQuality.value = String(cameraQuality);
       els.cameraWidth.value = String(cameraWidth);
+      els.cameraBitrate.value = String(cameraBitrateKbps);
+
+      if (wantH264 && cameraFormat !== "h264" && !state.videoDecoder.unsupportedLogged) {
+        state.videoDecoder.unsupportedLogged = true;
+        addEvent("video_unsupported", "WebCodecs no disponible: el video usa MJPEG (webp). Usá Chrome/Edge para H.264.");
+      }
 
       if (els.enableAudio.checked) {
         await ensureAudioContext(false);
@@ -2067,7 +2236,8 @@
           payload: {
             enabled: !!els.enableVideo.checked,
             emit_every: 1,
-            format: profile.cameraFormat,
+            format: cameraFormat,
+            bitrate_kbps: cameraBitrateKbps,
             jpeg_quality: cameraQuality,
             min_quality: profile.cameraMinQuality,
             target_fps: cameraFps,
@@ -2114,7 +2284,8 @@
       addEvent("media_config_applied", {
         video: !!els.enableVideo.checked,
         network_profile: els.networkProfile.value,
-        camera_format: profile.cameraFormat,
+        camera_format: cameraFormat,
+        camera_bitrate_kbps: cameraBitrateKbps,
         camera_fps: cameraFps,
         camera_quality: cameraQuality,
         camera_width: cameraWidth,
@@ -2604,6 +2775,7 @@
     });
 
     els.maxApiToggle.disabled = true;
+    applyNetworkProfileValues();
     setupSavedMapInteraction();
     updateSpeedUi();
     updateMediaStatus();

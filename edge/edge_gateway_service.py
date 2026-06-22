@@ -7,8 +7,10 @@ import json
 import time
 import uuid
 import zlib
+from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
+import av
 import cv2
 import numpy as np
 import paho.mqtt.client as mqtt
@@ -96,6 +98,22 @@ class EdgeGatewayService:
         self.camera_frame_count = 0
         self.camera_encoded_count = 0
         self.last_camera_emit_at = 0.0
+
+        # H.264 (inter-frame) encoder state. When camera_format == "h264" the edge
+        # encodes a real video bitstream instead of independent WebP/JPEG frames,
+        # cutting bandwidth ~7-15x for the same picture.
+        self.camera_bitrate_kbps = args.camera_bitrate_kbps
+        self.camera_gop = args.camera_gop
+        self.video_encoder = None
+        self.video_encoder_name = ""
+        self.video_encoder_key: Optional[Tuple[Any, ...]] = None
+        self.video_codec_string = ""
+        self.video_pts = 0
+        self.video_drop_count = 0
+        self.last_video_encode_error_at = 0.0
+        self.video_media_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(
+            maxsize=args.video_queue_size
+        )
 
         self.audio_enabled = args.enable_audio
         self.audio_emit_every = args.audio_emit_every
@@ -320,6 +338,10 @@ class EdgeGatewayService:
         if self.conn is None:
             raise RuntimeError("Robot connection not ready")
         self.camera_enabled = enabled
+        if enabled:
+            # Rebuild the encoder so the stream restarts on a keyframe (IDR),
+            # otherwise late/re-subscribing viewers could not sync.
+            self._reset_video_encoder()
         if enabled != self.camera_channel_active:
             self.conn.video.switchVideoChannel(enabled)
             self.camera_channel_active = enabled
@@ -591,6 +613,10 @@ class EdgeGatewayService:
                     self.latest_camera_frame = None
                     self.camera_frame_ready.clear()
 
+            if self.camera_format == "h264":
+                await self._encode_and_emit_h264(frame)
+                continue
+
             encode_started = time.monotonic()
             encoded, width, height, image_format, used_quality = await asyncio.to_thread(
                 self._encode_camera_frame,
@@ -619,6 +645,185 @@ class EdgeGatewayService:
                         "encoded_ts": encoded_at,
                         "encode_ms": round((time.monotonic() - encode_started) * 1000.0, 2),
                         "target_fps": self.camera_target_fps,
+                    },
+                }
+            )
+
+    def _reset_video_encoder(self) -> None:
+        # Called from the event loop while _encode_camera_frame_h264 may be running
+        # in a worker thread. Only drop the reference here: closing it now could free
+        # the context mid-encode() and crash ffmpeg. The encoder is torn down by GC
+        # once the in-flight thread releases its own local handle.
+        self.video_encoder = None
+        self.video_encoder_key = None
+        self.video_codec_string = ""
+        self.video_pts = 0
+
+    @staticmethod
+    def _h264_codec_string(annexb: bytes) -> str:
+        # Build the WebCodecs "avc1.PPCCLL" identifier from the SPS NAL so the
+        # browser configures its decoder with the exact profile/level we emit.
+        data = annexb
+        length = len(data)
+        index = 0
+        while index + 4 < length:
+            if data[index] == 0 and data[index + 1] == 0 and data[index + 2] == 1:
+                nal_start = index + 3
+            elif (
+                data[index] == 0
+                and data[index + 1] == 0
+                and data[index + 2] == 0
+                and data[index + 3] == 1
+            ):
+                nal_start = index + 4
+            else:
+                index += 1
+                continue
+            if (data[nal_start] & 0x1F) == 7 and nal_start + 4 <= length:
+                return "avc1.%02x%02x%02x" % (
+                    data[nal_start + 1],
+                    data[nal_start + 2],
+                    data[nal_start + 3],
+                )
+            index = nal_start
+        return "avc1.42e01e"
+
+    def _build_video_encoder(self, width: int, height: int, fps: int, bitrate_kbps: int):
+        width -= width % 2
+        height -= height % 2
+        gop = self.camera_gop if self.camera_gop > 0 else max(1, fps) * 2
+        bitrate = max(64, int(bitrate_kbps)) * 1000
+
+        if self.args.camera_h264_encoder == "auto":
+            candidates = ["h264_v4l2m2m", "libx264"]
+        else:
+            candidates = [self.args.camera_h264_encoder]
+
+        last_error: Optional[Exception] = None
+        for name in candidates:
+            try:
+                ctx = av.CodecContext.create(name, "w")
+                ctx.width = width
+                ctx.height = height
+                ctx.pix_fmt = "yuv420p"
+                ctx.bit_rate = bitrate
+                ctx.gop_size = gop
+                ctx.time_base = Fraction(1, fps)
+                with contextlib.suppress(Exception):
+                    ctx.framerate = Fraction(fps, 1)
+                if name == "libx264":
+                    ctx.options = {
+                        "preset": "ultrafast",
+                        "tune": "zerolatency",
+                        "profile": "baseline",
+                        "x264-params": (
+                            f"keyint={gop}:min-keyint={gop}:scenecut=0:bframes=0:"
+                            f"nal-hrd=cbr:vbv-maxrate={bitrate_kbps}:"
+                            f"vbv-bufsize={bitrate_kbps}"
+                        ),
+                    }
+                else:
+                    ctx.options = {"profile": "baseline"}
+                self._publish_event(
+                    "video_encoder_ready",
+                    {
+                        "encoder": name,
+                        "width": width,
+                        "height": height,
+                        "fps": fps,
+                        "bitrate_kbps": bitrate_kbps,
+                        "gop": gop,
+                    },
+                )
+                return ctx, name
+            except Exception as exc:  # noqa: BLE001 - probe next encoder
+                last_error = exc
+                continue
+        raise RuntimeError(f"no usable H.264 encoder: {last_error}")
+
+    def _encode_camera_frame_h264(self, frame) -> List[Tuple[bytes, bool, int, int]]:
+        width = int(frame.width)
+        height = int(frame.height)
+        if self.camera_max_width > 0 and width > self.camera_max_width:
+            scale = self.camera_max_width / float(width)
+            out_w = self.camera_max_width
+            out_h = max(2, int(round(height * scale)))
+        else:
+            out_w, out_h = width, height
+        out_w -= out_w % 2
+        out_h -= out_h % 2
+
+        fps = max(1, int(round(self.camera_target_fps)))
+        key = (out_w, out_h, fps, int(self.camera_bitrate_kbps))
+        encoder = self.video_encoder
+        if encoder is None or self.video_encoder_key != key:
+            encoder, self.video_encoder_name = self._build_video_encoder(
+                out_w, out_h, fps, self.camera_bitrate_kbps
+            )
+            self.video_encoder = encoder
+            self.video_encoder_key = key
+            self.video_codec_string = ""
+            self.video_pts = 0
+
+        # Hold a local handle so a concurrent _reset_video_encoder() on the event
+        # loop can't pull the context out from under encode() mid-call.
+        vframe = frame.reformat(width=out_w, height=out_h, format="yuv420p")
+        vframe.pts = self.video_pts
+        vframe.time_base = encoder.time_base
+        self.video_pts += 1
+
+        results: List[Tuple[bytes, bool, int, int]] = []
+        for packet in encoder.encode(vframe):
+            raw = bytes(packet)
+            if not raw:
+                continue
+            is_key = bool(packet.is_keyframe)
+            if is_key and not self.video_codec_string:
+                self.video_codec_string = self._h264_codec_string(raw)
+            results.append((raw, is_key, out_w, out_h))
+        return results
+
+    async def _encode_and_emit_h264(self, frame) -> None:
+        encode_started = time.monotonic()
+        try:
+            packets = await asyncio.to_thread(self._encode_camera_frame_h264, frame)
+        except Exception as exc:  # noqa: BLE001
+            now = time.monotonic()
+            if now - self.last_video_encode_error_at >= 2.0:
+                self.last_video_encode_error_at = now
+                self._publish_event("video_encode_error", {"error": str(exc)})
+            self._reset_video_encoder()
+            await asyncio.sleep(0.25)
+            return
+
+        if not packets:
+            return
+
+        encoded_at = time.time()
+        self.last_camera_emit_at = time.monotonic()
+        encode_ms = round((time.monotonic() - encode_started) * 1000.0, 2)
+        codec = self.video_codec_string or "avc1.42e01e"
+        for raw, is_key, width, height in packets:
+            self.camera_encoded_count += 1
+            await self._enqueue_media(
+                {
+                    "robot_id": self.args.robot_id,
+                    "ts": encoded_at,
+                    "stream": "video",
+                    "data": {
+                        "frame_index": self.camera_encoded_count,
+                        "source_frame_index": self.camera_frame_count,
+                        "width": width,
+                        "height": height,
+                        "image_format": "h264",
+                        "codec": codec,
+                        "key": is_key,
+                        "chunk_base64": base64.b64encode(raw).decode("ascii"),
+                        "encoded_bytes": len(raw),
+                        "encoded_ts": encoded_at,
+                        "encode_ms": encode_ms,
+                        "target_fps": self.camera_target_fps,
+                        "encoder": self.video_encoder_name,
                     },
                 }
             )
@@ -789,8 +994,25 @@ class EdgeGatewayService:
             return
 
         stream = str(payload.get("stream", "")).strip()
+        data = payload.get("data")
+        is_h264_video = (
+            stream == "video"
+            and isinstance(data, dict)
+            and data.get("image_format") == "h264"
+        )
 
-        if stream == "audio":
+        if is_h264_video:
+            # Inter-frame video must be delivered in order. Never coalesce/replace
+            # a pending frame: dropping a delta would corrupt every following frame
+            # until the next keyframe. Under extreme overflow drop the OLDEST frame
+            # so the decoder resyncs at the next keyframe instead of stalling.
+            if self.video_media_queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self.video_media_queue.get_nowait()
+                    self.video_drop_count += 1
+            with contextlib.suppress(asyncio.QueueFull):
+                self.video_media_queue.put_nowait(payload)
+        elif stream == "audio":
             if self.media_queue.full():
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self.media_queue.get_nowait()
@@ -1246,9 +1468,25 @@ class EdgeGatewayService:
         if cmd_type == "set_camera_stream":
             if "format" in payload:
                 image_format = str(payload.get("format", self.camera_format)).lower()
-                if image_format not in {"jpg", "webp"}:
-                    raise ValueError("format must be 'jpg' or 'webp'")
+                if image_format not in {"jpg", "webp", "h264"}:
+                    raise ValueError("format must be 'jpg', 'webp' or 'h264'")
+                if image_format != self.camera_format:
+                    self._reset_video_encoder()
                 self.camera_format = image_format
+
+            if "bitrate_kbps" in payload:
+                bitrate_kbps = int(payload.get("bitrate_kbps", self.camera_bitrate_kbps))
+                if bitrate_kbps < 64 or bitrate_kbps > 12000:
+                    raise ValueError("bitrate_kbps must be between 64 and 12000")
+                self.camera_bitrate_kbps = bitrate_kbps
+
+            if "gop" in payload:
+                gop = int(payload.get("gop", self.camera_gop))
+                if gop < 0 or gop > 600:
+                    raise ValueError("gop must be between 0 and 600")
+                if gop != self.camera_gop:
+                    self.camera_gop = gop
+                    self._reset_video_encoder()
 
             if "emit_every" in payload:
                 emit_every = int(payload.get("emit_every", 1))
@@ -1302,6 +1540,8 @@ class EdgeGatewayService:
                 "executed": "set_camera_stream",
                 "camera_enabled": self.camera_enabled,
                 "format": self.camera_format,
+                "bitrate_kbps": self.camera_bitrate_kbps,
+                "gop": self.camera_gop,
                 "emit_every": self.camera_emit_every,
                 "jpeg_quality": self.camera_jpeg_quality,
                 "min_quality": self.camera_min_quality,
@@ -1540,6 +1780,14 @@ class EdgeGatewayService:
                         if lidar_points is not None:
                             batch.append(lidar_points)
 
+                        # H.264 frames first and in order: they carry inter-frame
+                        # dependencies and must never be reordered or dropped here.
+                        while True:
+                            try:
+                                batch.append(self.video_media_queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+
                         video = self.latest_media_by_stream.pop("video", None)
                         if video is not None:
                             batch.append(video)
@@ -1555,12 +1803,22 @@ class EdgeGatewayService:
                             if payload is not None:
                                 batch.append(payload)
 
-                        if not self.media_queue.empty() or self.latest_media_by_stream:
+                        if (
+                            not self.media_queue.empty()
+                            or not self.video_media_queue.empty()
+                            or self.latest_media_by_stream
+                        ):
                             self.media_ready.set()
 
                         for payload in batch:
                             text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
                             payload_size = len(text.encode("utf-8"))
+                            payload_data = payload.get("data")
+                            reliable = (
+                                payload.get("stream") == "video"
+                                and isinstance(payload_data, dict)
+                                and payload_data.get("image_format") == "h264"
+                            )
                             max_bytes_per_second = max(self.media_max_kbps, 0) * 125.0
                             if max_bytes_per_second > 0:
                                 now = time.monotonic()
@@ -1570,13 +1828,16 @@ class EdgeGatewayService:
                                     + (now - budget_updated_at) * max_bytes_per_second,
                                 )
                                 budget_updated_at = now
-                                if payload_size > budget_tokens:
+                                # H.264 rides its own encoder rate control; never drop
+                                # it on the byte budget. Still debit the bucket so the
+                                # droppable streams (lidar/audio) yield bandwidth to it.
+                                if not reliable and payload_size > budget_tokens:
                                     stream = str(payload.get("stream", "unknown"))
                                     self.media_budget_drops[stream] = (
                                         self.media_budget_drops.get(stream, 0) + 1
                                     )
                                     continue
-                                budget_tokens -= payload_size
+                                budget_tokens = max(0.0, budget_tokens - payload_size)
                             await asyncio.wait_for(ws.send(text), timeout=self.args.media_ws_send_timeout_s)
 
             except Exception as exc:
@@ -1847,11 +2108,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-ms-per-degree", type=float, default=15.0)
 
     parser.add_argument("--camera-emit-every", type=int, default=1)
-    parser.add_argument("--camera-format", choices=["jpg", "webp"], default="webp")
+    parser.add_argument("--camera-format", choices=["jpg", "webp", "h264"], default="h264")
     parser.add_argument("--camera-jpeg-quality", type=int, default=55)
     parser.add_argument("--camera-min-quality", type=int, default=34)
-    parser.add_argument("--camera-target-fps", type=float, default=12.0)
+    parser.add_argument("--camera-target-fps", type=float, default=30.0)
     parser.add_argument("--camera-max-width", type=int, default=640)
+    # H.264 path (default). Inter-frame compression so 30-40 fps fits a ~2 Mbps link.
+    parser.add_argument("--camera-bitrate-kbps", type=int, default=900)
+    parser.add_argument(
+        "--camera-gop",
+        type=int,
+        default=0,
+        help="keyframe interval in frames; 0 = auto (2 seconds at target fps)",
+    )
+    parser.add_argument(
+        "--camera-h264-encoder",
+        choices=["auto", "h264_v4l2m2m", "libx264"],
+        default="auto",
+        help="auto tries the Pi hardware encoder (h264_v4l2m2m) then falls back to libx264",
+    )
+    parser.add_argument("--video-queue-size", type=int, default=240)
 
     parser.add_argument("--audio-emit-every", type=int, default=2)
     parser.add_argument("--audio-max-bytes", type=int, default=24576)
@@ -1916,6 +2192,15 @@ def parse_args() -> argparse.Namespace:
 
     if args.camera_max_width < 0 or (0 < args.camera_max_width < 320):
         parser.error("--camera-max-width must be 0 or >= 320")
+
+    if args.camera_bitrate_kbps < 64 or args.camera_bitrate_kbps > 12000:
+        parser.error("--camera-bitrate-kbps must be between 64 and 12000")
+
+    if args.camera_gop < 0 or args.camera_gop > 600:
+        parser.error("--camera-gop must be between 0 and 600")
+
+    if args.video_queue_size < 1:
+        parser.error("--video-queue-size must be >= 1")
 
     if args.audio_emit_every <= 0:
         parser.error("--audio-emit-every must be > 0")

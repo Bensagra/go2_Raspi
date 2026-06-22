@@ -58,6 +58,15 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
 
 
+def _is_h264_video(payload: Dict[str, Any]) -> bool:
+    # H.264 carries inter-frame dependencies, so unlike MJPEG/lidar snapshots it
+    # must be relayed reliably and in order (never coalesced "latest-wins").
+    if payload.get("stream") != "video":
+        return False
+    data = payload.get("data")
+    return isinstance(data, dict) and data.get("image_format") == "h264"
+
+
 def extract_token_from_auth_header(authorization: Optional[str]) -> Optional[str]:
     if not authorization:
         return None
@@ -187,6 +196,7 @@ class CoreRuntime:
         is_latest_media = (
             payload.get("type") == "media"
             and payload.get("stream") in {"video", "lidar"}
+            and not _is_h264_video(payload)
         )
 
         for ws, queue in list(self.frontend_queues.items()):
@@ -213,7 +223,11 @@ class CoreRuntime:
             return
 
         text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-        if payload.get("type") == "media" and payload.get("stream") in {"video", "lidar"}:
+        if (
+            payload.get("type") == "media"
+            and payload.get("stream") in {"video", "lidar"}
+            and not _is_h264_video(payload)
+        ):
             robot_id = str(payload.get("robot_id", ""))
             stream = str(payload.get("stream", ""))
             self.frontend_latest_media.setdefault(ws, {})[
@@ -1795,7 +1809,15 @@ class CoreRuntime:
                             data = dict(data)
                             data["server_received_ts"] = time.time()
 
-                        if isinstance(data, dict) and stream != "audio":
+                        # Don't cache H.264 frames as the "latest snapshot" sent to
+                        # new viewers: an out-of-context delta can't be decoded. The
+                        # periodic keyframe (GOP) resyncs fresh clients within ~2s.
+                        is_h264_video = (
+                            stream == "video"
+                            and isinstance(data, dict)
+                            and data.get("image_format") == "h264"
+                        )
+                        if isinstance(data, dict) and stream != "audio" and not is_h264_video:
                             self.latest_media[robot_id][stream] = data
 
                         await self._broadcast(

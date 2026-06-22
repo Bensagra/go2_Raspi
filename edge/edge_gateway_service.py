@@ -21,6 +21,27 @@ try:
 except Exception:
     websockets = None
 
+
+# Binary media frame codec (must match server/server_core.py): magic(1)
+# version(1) header_len(u32 LE) header(JSON) payload(raw bytes). Sending the
+# compressed/encoded blob as-is (no base64) is ~33% lighter and skips the
+# base64 encode on the Pi for every frame.
+MEDIA_FRAME_MAGIC = 0xA7
+MEDIA_FRAME_VERSION = 1
+
+
+def encode_media_frame(header: Dict[str, Any], payload: bytes) -> bytes:
+    header_bytes = json.dumps(
+        header, ensure_ascii=True, separators=(",", ":")
+    ).encode("utf-8")
+    out = bytearray(6 + len(header_bytes) + len(payload))
+    out[0] = MEDIA_FRAME_MAGIC
+    out[1] = MEDIA_FRAME_VERSION
+    out[2:6] = len(header_bytes).to_bytes(4, "little")
+    out[6 : 6 + len(header_bytes)] = header_bytes
+    out[6 + len(header_bytes) :] = payload
+    return bytes(out)
+
 try:
     from unitree_webrtc_connect import (
         DATA_CHANNEL_TYPE,
@@ -630,22 +651,23 @@ class EdgeGatewayService:
 
             await self._enqueue_media(
                 {
-                    "robot_id": self.args.robot_id,
-                    "ts": encoded_at,
                     "stream": "video",
-                    "data": {
+                    "binary": True,
+                    "header": {
+                        "stream": "video",
                         "frame_index": self.camera_encoded_count,
                         "source_frame_index": self.camera_frame_count,
                         "width": width,
                         "height": height,
                         "image_format": image_format,
-                        "image_base64": base64.b64encode(encoded).decode("ascii"),
                         "encoded_bytes": len(encoded),
                         "quality": used_quality,
                         "encoded_ts": encoded_at,
                         "encode_ms": round((time.monotonic() - encode_started) * 1000.0, 2),
                         "target_fps": self.camera_target_fps,
+                        "ts": encoded_at,
                     },
+                    "payload": encoded,
                 }
             )
 
@@ -807,24 +829,25 @@ class EdgeGatewayService:
             self.camera_encoded_count += 1
             await self._enqueue_media(
                 {
-                    "robot_id": self.args.robot_id,
-                    "ts": encoded_at,
                     "stream": "video",
-                    "data": {
+                    "binary": True,
+                    "header": {
+                        "stream": "video",
                         "frame_index": self.camera_encoded_count,
                         "source_frame_index": self.camera_frame_count,
                         "width": width,
                         "height": height,
                         "image_format": "h264",
                         "codec": codec,
-                        "key": is_key,
-                        "chunk_base64": base64.b64encode(raw).decode("ascii"),
+                        "key": bool(is_key),
                         "encoded_bytes": len(raw),
                         "encoded_ts": encoded_at,
                         "encode_ms": encode_ms,
                         "target_fps": self.camera_target_fps,
                         "encoder": self.video_encoder_name,
+                        "ts": encoded_at,
                     },
+                    "payload": raw,
                 }
             )
 
@@ -994,11 +1017,11 @@ class EdgeGatewayService:
             return
 
         stream = str(payload.get("stream", "")).strip()
-        data = payload.get("data")
+        header = payload.get("header") if isinstance(payload.get("header"), dict) else None
         is_h264_video = (
             stream == "video"
-            and isinstance(data, dict)
-            and data.get("image_format") == "h264"
+            and header is not None
+            and header.get("image_format") == "h264"
         )
 
         if is_h264_video:
@@ -1158,20 +1181,19 @@ class EdgeGatewayService:
 
         await self._enqueue_media(
             {
-                "robot_id": self.args.robot_id,
-                "ts": time.time(),
-                "stream": "lidar_points",
-                "data": {
-                    "point_format": "i16_xyz_zlib",
-                    "points_base64": base64.b64encode(compressed).decode("ascii"),
-                    "point_count": int(points.shape[0]),
+                "stream": "lidar",
+                "binary": True,
+                "header": {
+                    "stream": "lidar",
+                    "fmt": "i16_xyz_zlib",
+                    "count": int(points.shape[0]),
                     "uncompressed_bytes": len(raw),
-                    "quantization_scale": quantization_scale,
-                    "quantization_offset": quantization_offset.tolist(),
-                    "bounds_min": bounds_min.tolist(),
-                    "bounds_max": bounds_max.tolist(),
+                    "scale": float(quantization_scale),
+                    "offset": quantization_offset.tolist(),
                     "coordinate_frame": "map",
+                    "ts": time.time(),
                 },
+                "payload": compressed,
             }
         )
 
@@ -1776,7 +1798,7 @@ class EdgeGatewayService:
 
                         batch: List[Dict[str, Any]] = []
 
-                        lidar_points = self.latest_media_by_stream.pop("lidar_points", None)
+                        lidar_points = self.latest_media_by_stream.pop("lidar", None)
                         if lidar_points is not None:
                             batch.append(lidar_points)
 
@@ -1811,14 +1833,22 @@ class EdgeGatewayService:
                             self.media_ready.set()
 
                         for payload in batch:
-                            text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-                            payload_size = len(text.encode("utf-8"))
-                            payload_data = payload.get("data")
-                            reliable = (
-                                payload.get("stream") == "video"
-                                and isinstance(payload_data, dict)
-                                and payload_data.get("image_format") == "h264"
-                            )
+                            header = payload.get("header") if isinstance(payload.get("header"), dict) else None
+                            if payload.get("binary") and header is not None:
+                                # Binary media frame (lidar/video): blob rides raw,
+                                # no base64. ~33% lighter on the wire and on the Pi CPU.
+                                wire: Any = encode_media_frame(header, payload["payload"])
+                                payload_size = len(wire)
+                                reliable = (
+                                    payload.get("stream") == "video"
+                                    and header.get("image_format") == "h264"
+                                )
+                            else:
+                                # JSON streams (audio): keep text on the wire.
+                                wire = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+                                payload_size = len(wire.encode("utf-8"))
+                                reliable = False
+
                             max_bytes_per_second = max(self.media_max_kbps, 0) * 125.0
                             if max_bytes_per_second > 0:
                                 now = time.monotonic()
@@ -1838,7 +1868,7 @@ class EdgeGatewayService:
                                     )
                                     continue
                                 budget_tokens = max(0.0, budget_tokens - payload_size)
-                            await asyncio.wait_for(ws.send(text), timeout=self.args.media_ws_send_timeout_s)
+                            await asyncio.wait_for(ws.send(wire), timeout=self.args.media_ws_send_timeout_s)
 
             except Exception as exc:
                 self._publish_event("media_uplink_retry", {"error": str(exc)})

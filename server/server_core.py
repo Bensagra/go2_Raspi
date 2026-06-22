@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import paho.mqtt.client as mqtt
-import cv2
 import numpy as np
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -67,6 +66,76 @@ def _is_h264_video(payload: Dict[str, Any]) -> bool:
     return isinstance(data, dict) and data.get("image_format") == "h264"
 
 
+# ---------------------------------------------------------------------------
+# Binary media frame codec
+# ---------------------------------------------------------------------------
+# Layout (little-endian):  magic(1) version(1) header_len(u32) header payload
+# The header is compact JSON (metadata); the payload is the raw binary blob
+# (zlib'd int16 point cloud, or H.264/WebP bytes). No base64 => ~33% lighter on
+# the wire and no encode/decode CPU on either end.
+MEDIA_FRAME_MAGIC = 0xA7
+MEDIA_FRAME_VERSION = 1
+
+
+def encode_media_frame(header: Dict[str, Any], payload: bytes) -> bytes:
+    header_bytes = json.dumps(
+        header, ensure_ascii=True, separators=(",", ":")
+    ).encode("utf-8")
+    out = bytearray(6 + len(header_bytes) + len(payload))
+    out[0] = MEDIA_FRAME_MAGIC
+    out[1] = MEDIA_FRAME_VERSION
+    out[2:6] = len(header_bytes).to_bytes(4, "little")
+    out[6 : 6 + len(header_bytes)] = header_bytes
+    out[6 + len(header_bytes) :] = payload
+    return bytes(out)
+
+
+def decode_media_frame(buffer: bytes) -> Tuple[Dict[str, Any], bytes]:
+    if len(buffer) < 6 or buffer[0] != MEDIA_FRAME_MAGIC or buffer[1] != MEDIA_FRAME_VERSION:
+        raise ValueError("invalid media frame")
+    header_len = int.from_bytes(buffer[2:6], "little")
+    end = 6 + header_len
+    if end > len(buffer):
+        raise ValueError("invalid media frame header length")
+    header = json.loads(buffer[6:end].decode("utf-8"))
+    if not isinstance(header, dict):
+        raise ValueError("invalid media frame header")
+    return header, bytes(buffer[end:])
+
+
+def quantize_points_i16(
+    points: np.ndarray,
+    quantization_cm: float,
+    compression_level: int = 6,
+) -> Tuple[bytes, float, List[float], int]:
+    """Quantize an Nx3 float cloud to int16 + zlib. Mirrors the edge encoder so the
+    browser decodes live frames and saved maps through a single path."""
+    points = np.ascontiguousarray(points[:, :3], dtype=np.float32)
+    bounds_min = points.min(axis=0)
+    bounds_max = points.max(axis=0)
+    offset = (bounds_min + bounds_max) / 2.0
+    scale = max(quantization_cm / 100.0, 0.001)
+    max_delta = float(np.max(np.abs(points - offset))) if points.size else 0.0
+    if max_delta > 0:
+        scale = max(scale, max_delta / 32760.0)
+    quantized = np.rint((points - offset) / scale)
+    quantized = np.clip(quantized, -32768, 32767).astype("<i2")
+    raw = np.ascontiguousarray(quantized).tobytes()
+    compressed = zlib.compress(raw, compression_level)
+    return compressed, float(scale), offset.tolist(), int(points.shape[0])
+
+
+def zlib_inflate_limited(compressed: bytes, limit: int) -> bytes:
+    decompressor = zlib.decompressobj()
+    raw = decompressor.decompress(compressed, limit + 1)
+    if decompressor.unconsumed_tail:
+        raise ValueError("compressed payload exceeds limit")
+    raw += decompressor.flush()
+    if len(raw) > limit:
+        raise ValueError("compressed payload exceeds limit")
+    return raw
+
+
 def extract_token_from_auth_header(authorization: Optional[str]) -> Optional[str]:
     if not authorization:
         return None
@@ -105,8 +174,10 @@ class CoreRuntime:
         self.mqtt_client: Optional[mqtt.Client] = None
 
         self.frontend_sockets: Set[WebSocket] = set()
-        self.frontend_queues: Dict[WebSocket, asyncio.Queue[str]] = {}
-        self.frontend_latest_media: Dict[WebSocket, Dict[str, str]] = {}
+        # Queue items are str (JSON telemetry/events/audio) or bytes (binary media
+        # frames). The sender loop dispatches each with send_text / send_bytes.
+        self.frontend_queues: Dict[WebSocket, "asyncio.Queue[Any]"] = {}
+        self.frontend_latest_media: Dict[WebSocket, Dict[str, Any]] = {}
         self.frontend_ready: Dict[WebSocket, asyncio.Event] = {}
         self.frontend_sender_tasks: Dict[WebSocket, asyncio.Task[None]] = {}
         self.edge_media_sockets: Dict[str, WebSocket] = {}
@@ -114,12 +185,15 @@ class CoreRuntime:
         self.speed_profile_owners: Dict[str, WebSocket] = {}
 
         self.latest_telemetry: Dict[str, Dict[str, Any]] = {}
-        self.latest_media: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        # Latest coalesced binary media frame per (robot, stream): replayed to new
+        # clients on connect (e.g. lidar keyframe, MJPEG/WebP video snapshot).
+        self.latest_media_frames: Dict[str, Dict[str, bytes]] = defaultdict(dict)
         self.lidar_voxels: Dict[
             str,
             OrderedDict[Tuple[int, int, int], Tuple[float, float, float]],
         ] = defaultdict(OrderedDict)
-        self.lidar_latest_packets: Dict[str, Dict[str, Any]] = {}
+        self.lidar_latest_packets: Dict[str, np.ndarray] = {}
+        self.lidar_last_keyframe_at: Dict[str, float] = defaultdict(lambda: 0.0)
         self.lidar_events: Dict[str, asyncio.Event] = {}
         self.lidar_tasks: Dict[str, asyncio.Task[None]] = {}
         self.robot_paths: Dict[str, Deque[Tuple[float, float]]] = defaultdict(
@@ -188,79 +262,82 @@ class CoreRuntime:
         with self.audit_log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, ensure_ascii=True, separators=(",", ":")) + "\n")
 
+    def _wake_socket(self, ws: WebSocket) -> None:
+        ready = self.frontend_ready.get(ws)
+        if ready is not None:
+            ready.set()
+
+    def _coalesce_to_socket(self, ws: WebSocket, key: str, message: Any) -> None:
+        """Latest-wins: only the newest message for `key` is kept (snapshots)."""
+        self.frontend_latest_media.setdefault(ws, {})[key] = message
+        self._wake_socket(ws)
+
+    def _queue_to_socket(self, ws: WebSocket, message: Any) -> None:
+        """Ordered delivery; on overflow drop the OLDEST so streams self-heal."""
+        queue = self.frontend_queues.get(ws)
+        if queue is None:
+            return
+        if queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(message)
+        self._wake_socket(ws)
+
     async def _broadcast(self, payload: Dict[str, Any]) -> None:
+        """Broadcast a JSON message (telemetry, events, audio) to every frontend."""
         if not self.frontend_queues:
             return
-
         text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-        is_latest_media = (
-            payload.get("type") == "media"
-            and payload.get("stream") in {"video", "lidar"}
-            and not _is_h264_video(payload)
-        )
+        for ws in list(self.frontend_queues.keys()):
+            self._queue_to_socket(ws, text)
 
-        for ws, queue in list(self.frontend_queues.items()):
-            if is_latest_media:
-                robot_id = str(payload.get("robot_id", ""))
-                stream = str(payload.get("stream", ""))
-                self.frontend_latest_media.setdefault(ws, {})[
-                    f"{robot_id}:{stream}"
-                ] = text
+    def _broadcast_media_frame(
+        self,
+        robot_id: str,
+        stream: str,
+        header: Dict[str, Any],
+        payload: bytes,
+        coalesce: bool,
+    ) -> None:
+        """Broadcast a binary media frame. Coalesced frames (snapshots/keyframes)
+        are also cached so freshly connected clients receive the latest one."""
+        frame = encode_media_frame(header, payload)
+        if coalesce:
+            self.latest_media_frames[robot_id][stream] = frame
+        if not self.frontend_queues:
+            return
+        key = f"{robot_id}:{stream}"
+        for ws in list(self.frontend_queues.keys()):
+            if coalesce:
+                self._coalesce_to_socket(ws, key, frame)
             else:
-                if queue.full():
-                    with contextlib.suppress(asyncio.QueueEmpty):
-                        queue.get_nowait()
-                with contextlib.suppress(asyncio.QueueFull):
-                    queue.put_nowait(text)
-
-            ready = self.frontend_ready.get(ws)
-            if ready is not None:
-                ready.set()
+                self._queue_to_socket(ws, frame)
 
     def _enqueue_frontend(self, ws: WebSocket, payload: Dict[str, Any]) -> None:
         queue = self.frontend_queues.get(ws)
         if queue is None:
             return
-
         text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-        if (
-            payload.get("type") == "media"
-            and payload.get("stream") in {"video", "lidar"}
-            and not _is_h264_video(payload)
-        ):
-            robot_id = str(payload.get("robot_id", ""))
-            stream = str(payload.get("stream", ""))
-            self.frontend_latest_media.setdefault(ws, {})[
-                f"{robot_id}:{stream}"
-            ] = text
-        else:
-            if queue.full():
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-            with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(text)
+        self._queue_to_socket(ws, text)
 
-        ready = self.frontend_ready.get(ws)
-        if ready is not None:
-            ready.set()
-
-    async def _frontend_sender_loop(self, ws: WebSocket, queue: asyncio.Queue[str]) -> None:
+    async def _frontend_sender_loop(self, ws: WebSocket, queue: "asyncio.Queue[Any]") -> None:
         try:
             while True:
                 ready = self.frontend_ready[ws]
                 latest = self.frontend_latest_media[ws]
-                batch: List[str] = []
+                batch: List[Any] = []
 
-                video_keys = [key for key in latest if key.endswith(":video")]
-                if video_keys:
-                    batch.append(latest.pop(video_keys[-1]))
+                # Snapshots first (newest video frame, lidar keyframe), then the
+                # ordered queue (telemetry, events, H.264, lidar deltas, audio).
+                for key in list(latest.keys()):
+                    batch.append(latest.pop(key))
 
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    batch.append(queue.get_nowait())
-
-                lidar_keys = [key for key in latest if key.endswith(":lidar")]
-                if lidar_keys:
-                    batch.append(latest.pop(lidar_keys[-1]))
+                for _ in range(self.args.frontend_drain_max):
+                    try:
+                        batch.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
 
                 if not batch:
                     ready.clear()
@@ -268,11 +345,17 @@ class CoreRuntime:
                         await ready.wait()
                     continue
 
-                for text in batch:
-                    await asyncio.wait_for(
-                        ws.send_text(text),
-                        timeout=self.args.frontend_send_timeout_s,
-                    )
+                for message in batch:
+                    if isinstance(message, (bytes, bytearray)):
+                        await asyncio.wait_for(
+                            ws.send_bytes(message),
+                            timeout=self.args.frontend_send_timeout_s,
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            ws.send_text(message),
+                            timeout=self.args.frontend_send_timeout_s,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -288,52 +371,57 @@ class CoreRuntime:
             with contextlib.suppress(Exception):
                 await ws.close()
 
-    def _decode_lidar_points(self, data: Dict[str, Any]) -> np.ndarray:
-        point_format = str(data.get("point_format", ""))
-        if point_format not in {"f32_xyz_zlib", "i16_xyz_zlib"}:
-            raise ValueError("unsupported lidar point format")
-
-        encoded = data.get("points_base64")
-        if not isinstance(encoded, str) or not encoded:
-            raise ValueError("missing lidar points")
-
-        compressed = base64.b64decode(encoded, validate=True)
-        decompressor = zlib.decompressobj()
-        raw = decompressor.decompress(
-            compressed,
-            self.args.lidar_max_packet_bytes + 1,
-        )
-        if decompressor.unconsumed_tail:
-            raise ValueError("lidar packet exceeds server limit")
-        raw += decompressor.flush()
-        if len(raw) > self.args.lidar_max_packet_bytes:
-            raise ValueError("lidar packet exceeds server limit")
+    def _points_from_raw(
+        self,
+        raw: bytes,
+        point_format: str,
+        scale: float,
+        offset: np.ndarray,
+    ) -> np.ndarray:
         if point_format == "f32_xyz_zlib":
             if len(raw) % 12 != 0:
                 raise ValueError("invalid float32 xyz payload length")
             points = np.frombuffer(raw, dtype="<f4").reshape(-1, 3)
-        else:
+        elif point_format == "i16_xyz_zlib":
             if len(raw) % 6 != 0:
                 raise ValueError("invalid int16 xyz payload length")
-            scale = float(data.get("quantization_scale", 0.0))
-            offset = np.asarray(data.get("quantization_offset", []), dtype=np.float32)
             if not math.isfinite(scale) or scale <= 0:
                 raise ValueError("invalid lidar quantization scale")
             if offset.shape != (3,) or not np.isfinite(offset).all():
                 raise ValueError("invalid lidar quantization offset")
             quantized = np.frombuffer(raw, dtype="<i2").reshape(-1, 3)
             points = quantized.astype(np.float32) * scale + offset
-
-        declared_count = int(data.get("point_count", points.shape[0]))
-        if declared_count != points.shape[0]:
-            raise ValueError("lidar point count mismatch")
+        else:
+            raise ValueError("unsupported lidar point format")
 
         finite = np.isfinite(points).all(axis=1)
         return np.asarray(points[finite], dtype=np.float32)
 
-    def _update_lidar_voxels(self, robot_id: str, points: np.ndarray) -> None:
+    def _decode_lidar_points(self, data: Dict[str, Any]) -> np.ndarray:
+        """Legacy JSON/base64 lidar payload (kept for older edges)."""
+        point_format = str(data.get("point_format", ""))
+        encoded = data.get("points_base64")
+        if not isinstance(encoded, str) or not encoded:
+            raise ValueError("missing lidar points")
+        compressed = base64.b64decode(encoded, validate=True)
+        raw = zlib_inflate_limited(compressed, self.args.lidar_max_packet_bytes)
+        scale = float(data.get("quantization_scale", 0.0) or 0.0)
+        offset = np.asarray(data.get("quantization_offset", []), dtype=np.float32)
+        return self._points_from_raw(raw, point_format, scale, offset)
+
+    def _decode_lidar_frame(self, header: Dict[str, Any], payload: bytes) -> np.ndarray:
+        """Binary lidar frame from the edge (no base64)."""
+        point_format = str(header.get("fmt", "i16_xyz_zlib"))
+        raw = zlib_inflate_limited(payload, self.args.lidar_max_packet_bytes)
+        scale = float(header.get("scale", 0.0) or 0.0)
+        offset = np.asarray(header.get("offset", []), dtype=np.float32)
+        return self._points_from_raw(raw, point_format, scale, offset)
+
+    def _update_lidar_voxels(self, robot_id: str, points: np.ndarray) -> np.ndarray:
+        """Insert points into the accumulated voxel map. Returns the subset whose
+        voxel was not already present — i.e. the delta to stream to clients."""
         if points.size == 0:
-            return
+            return np.empty((0, 3), dtype=np.float32)
 
         resolution = self.args.lidar_voxel_size
         keys = np.floor(points / resolution).astype(np.int32)
@@ -341,15 +429,23 @@ class CoreRuntime:
         unique_points = points[unique_indices]
         unique_keys = keys[unique_indices]
 
+        new_points: List[Tuple[float, float, float]] = []
         with self.map_data_locks[robot_id]:
             voxels = self.lidar_voxels[robot_id]
             for key_array, point in zip(unique_keys, unique_points):
                 key = (int(key_array[0]), int(key_array[1]), int(key_array[2]))
-                voxels[key] = (float(point[0]), float(point[1]), float(point[2]))
+                value = (float(point[0]), float(point[1]), float(point[2]))
+                if key not in voxels:
+                    new_points.append(value)
+                voxels[key] = value
                 voxels.move_to_end(key)
 
             while len(voxels) > self.args.lidar_map_max_voxels:
                 voxels.popitem(last=False)
+
+        if not new_points:
+            return np.empty((0, 3), dtype=np.float32)
+        return np.asarray(new_points, dtype=np.float32)
 
     def _robot_pose_for_map(
         self,
@@ -372,199 +468,109 @@ class CoreRuntime:
             return float(center[0]), float(center[1]), 0.0
         return 0.0, 0.0, 0.0
 
-    def _render_lidar_map(
+    def _build_lidar_message(
         self,
         robot_id: str,
-        source_point_count: int,
-    ) -> Optional[Dict[str, Any]]:
-        with self.map_data_locks[robot_id]:
-            voxels = self.lidar_voxels.get(robot_id)
-            if not voxels:
+        mode: str,
+        points: Optional[np.ndarray] = None,
+        source_points: int = 0,
+    ) -> Optional[Tuple[Dict[str, Any], bytes, bool]]:
+        """Build a binary lidar frame. A *keyframe* carries the whole accumulated
+        voxel cloud (downsampled to a budget) so a viewer can rebuild the map from
+        scratch; a *delta* carries only the voxels first seen this frame. The
+        browser renders both in WebGL — no server-side rasterisation."""
+        path: Optional[List[Tuple[float, float]]] = None
+        if mode == "keyframe":
+            with self.map_data_locks[robot_id]:
+                voxels = self.lidar_voxels.get(robot_id)
+                if not voxels:
+                    return None
+                cloud = np.asarray(list(voxels.values()), dtype=np.float32)
+                voxel_count = len(voxels)
+                path = list(self.robot_paths.get(robot_id, ()))
+            limit = self.args.lidar_cloud_max_points
+            if limit > 0 and cloud.shape[0] > limit:
+                step = max(int(np.ceil(cloud.shape[0] / limit)), 1)
+                cloud = cloud[::step]
+        else:
+            if points is None or points.shape[0] == 0:
                 return None
-            points = np.asarray(list(voxels.values()), dtype=np.float32)
-            voxel_count = len(voxels)
-            path = list(self.robot_paths.get(robot_id, ()))
+            cloud = points
+            with self.map_data_locks[robot_id]:
+                voxel_count = len(self.lidar_voxels.get(robot_id, ()))
 
-        if points.shape[0] > self.args.lidar_render_max_points:
-            step = max(
-                int(np.ceil(points.shape[0] / self.args.lidar_render_max_points)),
-                1,
-            )
-            points = points[::step]
-
-        center_x, center_y, yaw = self._robot_pose_for_map(robot_id, points)
-        half_range = self.args.lidar_map_range_m / 2.0
-        relative = points.copy()
-        relative[:, 0] -= center_x
-        relative[:, 1] -= center_y
-        visible = (
-            (np.abs(relative[:, 0]) <= half_range)
-            & (np.abs(relative[:, 1]) <= half_range)
-            & (relative[:, 2] >= self.args.lidar_min_z)
-            & (relative[:, 2] <= self.args.lidar_max_z)
-        )
-        relative = relative[visible]
-        if relative.size == 0:
+        if cloud.shape[0] == 0:
             return None
 
-        height = self.args.lidar_render_height
-        width = self.args.lidar_render_width
-        panel_width = width // 2
-        canvas = np.full((height, width, 3), (12, 18, 25), dtype=np.uint8)
-
-        z_low, z_high = np.percentile(relative[:, 2], [2, 98])
-        if z_high - z_low < 0.1:
-            z_high = z_low + 0.1
-        z_norm = np.clip((relative[:, 2] - z_low) / (z_high - z_low), 0, 1)
-        colors = cv2.applyColorMap(
-            (z_norm * 255).astype(np.uint8).reshape(-1, 1),
-            cv2.COLORMAP_TURBO,
-        ).reshape(-1, 3)
-
-        top_size = min(panel_width, height) - 34
-        origin_x = 17 + top_size // 2
-        origin_y = 17 + top_size // 2
-        top_scale = top_size / self.args.lidar_map_range_m
-
-        for meter in range(
-            -int(half_range),
-            int(half_range) + 1,
-            max(1, self.args.lidar_grid_step_m),
-        ):
-            offset = int(round(meter * top_scale))
-            cv2.line(
-                canvas,
-                (origin_x + offset, 17),
-                (origin_x + offset, 17 + top_size),
-                (38, 49, 60),
-                1,
-            )
-            cv2.line(
-                canvas,
-                (17, origin_y - offset),
-                (17 + top_size, origin_y - offset),
-                (38, 49, 60),
-                1,
-            )
-
-        px = (relative[:, 0] * top_scale + origin_x).astype(np.int32)
-        py = (origin_y - relative[:, 1] * top_scale).astype(np.int32)
-        valid = (
-            (px >= 17)
-            & (px < 17 + top_size)
-            & (py >= 17)
-            & (py < 17 + top_size)
+        compressed, scale, offset, count = quantize_points_i16(
+            cloud,
+            self.args.lidar_cloud_quantization_cm,
+            self.args.lidar_cloud_compression_level,
         )
-        canvas[py[valid], px[valid]] = colors[valid]
-
-        if path:
-            path_array = np.asarray(path, dtype=np.float32)
-            path_px = ((path_array[:, 0] - center_x) * top_scale + origin_x).astype(np.int32)
-            path_py = (origin_y - (path_array[:, 1] - center_y) * top_scale).astype(np.int32)
-            path_points = np.column_stack((path_px, path_py))
-            inside = (
-                (path_px >= 17)
-                & (path_px < 17 + top_size)
-                & (path_py >= 17)
-                & (path_py < 17 + top_size)
-            )
-            path_points = path_points[inside]
-            if path_points.shape[0] >= 2:
-                cv2.polylines(
-                    canvas,
-                    [path_points.reshape(-1, 1, 2)],
-                    False,
-                    (60, 210, 255),
-                    2,
-                )
-
-        robot_center = (origin_x, origin_y)
-        direction = (
-            int(round(math.cos(yaw) * 15)),
-            int(round(-math.sin(yaw) * 15)),
-        )
-        cv2.circle(canvas, robot_center, 6, (30, 30, 255), -1)
-        cv2.arrowedLine(
-            canvas,
-            robot_center,
-            (robot_center[0] + direction[0], robot_center[1] + direction[1]),
-            (255, 255, 255),
-            2,
-            tipLength=0.4,
-        )
-
-        iso_origin_x = panel_width + panel_width // 2
-        iso_origin_y = int(height * 0.72)
-        iso_scale = min(panel_width, height) / (self.args.lidar_map_range_m * 1.45)
-        iso_x = (
-            (relative[:, 0] - relative[:, 1]) * 0.707 * iso_scale
-            + iso_origin_x
-        ).astype(np.int32)
-        iso_y = (
-            (relative[:, 0] + relative[:, 1]) * 0.34 * iso_scale
-            - relative[:, 2] * iso_scale * 1.8
-            + iso_origin_y
-        ).astype(np.int32)
-        iso_valid = (
-            (iso_x >= panel_width + 4)
-            & (iso_x < width - 4)
-            & (iso_y >= 20)
-            & (iso_y < height - 8)
-        )
-        order = np.argsort(relative[:, 0] + relative[:, 1])
-        order = order[iso_valid[order]]
-        canvas[iso_y[order], iso_x[order]] = colors[order]
-
-        cv2.line(canvas, (panel_width, 0), (panel_width, height), (58, 72, 86), 1)
-        cv2.putText(canvas, "MAPA SUPERIOR", (18, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 225, 238), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "VISTA 3D", (panel_width + 18, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 225, 238), 1, cv2.LINE_AA)
-        cv2.putText(
-            canvas,
-            f"{voxel_count} voxels | frame {source_point_count} pts | rango {self.args.lidar_map_range_m:.0f}m",
-            (18, height - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            (145, 170, 190),
-            1,
-            cv2.LINE_AA,
-        )
-
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            canvas,
-            [cv2.IMWRITE_JPEG_QUALITY, self.args.lidar_render_jpeg_quality],
-        )
-        if not ok or encoded is None:
-            return None
-
-        return {
-            "image_format": "jpg",
-            "image_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
-            "point_count": int(relative.shape[0]),
-            "map_point_count": voxel_count,
-            "source_point_count": source_point_count,
-            "rendered_ts": time.time(),
-            "coordinate_frame": "map",
+        center_x, center_y, yaw = self._robot_pose_for_map(robot_id, cloud)
+        header: Dict[str, Any] = {
+            "type": "media",
+            "robot_id": robot_id,
+            "stream": "lidar",
+            "ts": time.time(),
+            "fmt": "i16_xyz_zlib",
+            "mode": mode,
+            "count": count,
+            "scale": scale,
+            "offset": offset,
+            "map_points": int(voxel_count),
+            "source_points": int(source_points),
+            "pose": {"x": center_x, "y": center_y, "yaw": yaw},
         }
+        if mode == "keyframe" and path is not None:
+            header["path"] = [
+                [round(float(px), 3), round(float(py), 3)] for px, py in path
+            ]
+        return header, compressed, mode == "keyframe"
 
     def _process_lidar_packet_sync(
         self,
         robot_id: str,
-        data: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
+        points: np.ndarray,
+    ) -> List[Tuple[Dict[str, Any], bytes, bool]]:
         started = time.monotonic()
-        points = self._decode_lidar_points(data)
-        self._update_lidar_voxels(robot_id, points)
-        rendered = self._render_lidar_map(robot_id, int(points.shape[0]))
-        if rendered is not None:
-            rendered["processing_ms"] = round(
-                (time.monotonic() - started) * 1000.0,
-                2,
-            )
-        return rendered
+        new_points = self._update_lidar_voxels(robot_id, points)
+        self.map_revisions[robot_id] += 1
 
-    def _schedule_lidar_packet(self, robot_id: str, data: Dict[str, Any]) -> None:
-        self.lidar_latest_packets[robot_id] = data
+        now = time.monotonic()
+        has_cached_keyframe = "lidar" in self.latest_media_frames.get(robot_id, {})
+        want_keyframe = (
+            not has_cached_keyframe
+            or (now - self.lidar_last_keyframe_at[robot_id])
+            >= self.args.lidar_keyframe_interval_s
+        )
+
+        messages: List[Tuple[Dict[str, Any], bytes, bool]] = []
+        if want_keyframe:
+            keyframe = self._build_lidar_message(
+                robot_id, "keyframe", source_points=int(points.shape[0])
+            )
+            if keyframe is not None:
+                messages.append(keyframe)
+                self.lidar_last_keyframe_at[robot_id] = now
+
+        if new_points.shape[0] > 0:
+            delta = self._build_lidar_message(
+                robot_id,
+                "delta",
+                points=new_points,
+                source_points=int(points.shape[0]),
+            )
+            if delta is not None:
+                messages.append(delta)
+
+        processing_ms = round((time.monotonic() - started) * 1000.0, 2)
+        for header, _payload, _coalesce in messages:
+            header["processing_ms"] = processing_ms
+        return messages
+
+    def _schedule_lidar_packet(self, robot_id: str, points: np.ndarray) -> None:
+        self.lidar_latest_packets[robot_id] = points
         event = self.lidar_events.setdefault(robot_id, asyncio.Event())
         event.set()
         task = self.lidar_tasks.get(robot_id)
@@ -578,15 +584,15 @@ class CoreRuntime:
         while not self.stop_event.is_set():
             await event.wait()
             event.clear()
-            data = self.lidar_latest_packets.pop(robot_id, None)
-            if data is None:
+            points = self.lidar_latest_packets.pop(robot_id, None)
+            if points is None:
                 continue
 
             try:
-                rendered = await asyncio.to_thread(
+                messages = await asyncio.to_thread(
                     self._process_lidar_packet_sync,
                     robot_id,
-                    data,
+                    points,
                 )
             except Exception as exc:
                 self._audit(
@@ -595,19 +601,59 @@ class CoreRuntime:
                 )
                 continue
 
-            self.map_revisions[robot_id] += 1
-            if rendered is None:
-                continue
-            self.latest_media[robot_id]["lidar"] = rendered
-            await self._broadcast(
-                {
-                    "type": "media",
-                    "robot_id": robot_id,
-                    "stream": "lidar",
-                    "data": rendered,
-                    "ts": rendered["rendered_ts"],
-                }
+            for header, payload, coalesce in messages:
+                self._broadcast_media_frame(
+                    robot_id, "lidar", header, payload, coalesce
+                )
+
+    def _handle_edge_binary_frame(self, robot_id: str, buffer: bytes) -> None:
+        header, payload = decode_media_frame(buffer)
+        stream = str(header.get("stream", "")).strip()
+
+        if stream == "lidar":
+            points = self._decode_lidar_frame(header, payload)
+            if points.size:
+                self._schedule_lidar_packet(robot_id, points)
+            return
+
+        if stream == "video":
+            out_header = dict(header)
+            out_header["type"] = "media"
+            out_header["stream"] = "video"
+            out_header["robot_id"] = robot_id
+            out_header["server_received_ts"] = time.time()
+            # H.264 deltas can't be decoded out of context, so never coalesce
+            # them as a "latest snapshot"; the periodic keyframe resyncs viewers.
+            is_h264 = out_header.get("image_format") == "h264"
+            self._broadcast_media_frame(
+                robot_id, "video", out_header, payload, coalesce=not is_h264
             )
+            return
+
+    async def _handle_edge_text_frame(self, robot_id: str, text: str) -> None:
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            return
+        stream = str(payload.get("stream", "")).strip() or "unknown"
+        data = payload.get("data", {})
+
+        # Legacy edges send lidar as base64 JSON; still feed the point-cloud pipeline.
+        if stream == "lidar_points" and isinstance(data, dict):
+            points = await asyncio.to_thread(self._decode_lidar_points, data)
+            if points.size:
+                self._schedule_lidar_packet(robot_id, points)
+            return
+
+        # Audio stays JSON end-to-end (small packets, separate playback path).
+        await self._broadcast(
+            {
+                "type": "media",
+                "robot_id": robot_id,
+                "stream": stream,
+                "data": data,
+                "ts": payload.get("ts", time.time()),
+            }
+        )
 
     @staticmethod
     def _validate_storage_component(value: str, label: str) -> str:
@@ -1473,7 +1519,7 @@ class CoreRuntime:
         @app.get("/api/robots/{robot_id}/state")
         async def robot_state(robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)) -> Dict[str, Any]:
             telemetry = self.latest_telemetry.get(robot_id, {})
-            media = self.latest_media.get(robot_id, {})
+            media = self.latest_media_frames.get(robot_id, {})
             return {
                 "robot_id": robot_id,
                 "telemetry": telemetry,
@@ -1636,7 +1682,7 @@ class CoreRuntime:
                     await ws.close()
                 return
 
-            queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self.args.frontend_queue_size)
+            queue: "asyncio.Queue[Any]" = asyncio.Queue(maxsize=self.args.frontend_queue_size)
             self.frontend_sockets.add(ws)
             self.frontend_queues[ws] = queue
             self.frontend_latest_media[ws] = {}
@@ -1653,18 +1699,11 @@ class CoreRuntime:
                     {"type": "telemetry", "robot_id": robot_id, "data": telemetry},
                 )
 
-            for media_robot_id, media_streams in self.latest_media.items():
-                for stream, data in media_streams.items():
-                    self._enqueue_frontend(
-                        ws,
-                        {
-                            "type": "media",
-                            "robot_id": media_robot_id,
-                            "stream": stream,
-                            "data": data,
-                            "ts": time.time(),
-                        },
-                    )
+            # Replay the latest binary snapshot per stream (lidar keyframe, video
+            # frame) so a freshly connected viewer has something to show at once.
+            for media_robot_id, frames in self.latest_media_frames.items():
+                for stream, frame in frames.items():
+                    self._coalesce_to_socket(ws, f"{media_robot_id}:{stream}", frame)
 
             try:
                 while True:
@@ -1795,40 +1834,16 @@ class CoreRuntime:
 
             try:
                 while True:
-                    text = await ws.receive_text()
+                    message = await ws.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                    raw_bytes = message.get("bytes")
+                    raw_text = message.get("text")
                     with contextlib.suppress(Exception):
-                        payload = json.loads(text)
-                        stream = str(payload.get("stream", "")).strip() or "unknown"
-                        data = payload.get("data", {})
-
-                        if stream == "lidar_points" and isinstance(data, dict):
-                            self._schedule_lidar_packet(robot_id, data)
-                            continue
-
-                        if stream == "video" and isinstance(data, dict):
-                            data = dict(data)
-                            data["server_received_ts"] = time.time()
-
-                        # Don't cache H.264 frames as the "latest snapshot" sent to
-                        # new viewers: an out-of-context delta can't be decoded. The
-                        # periodic keyframe (GOP) resyncs fresh clients within ~2s.
-                        is_h264_video = (
-                            stream == "video"
-                            and isinstance(data, dict)
-                            and data.get("image_format") == "h264"
-                        )
-                        if isinstance(data, dict) and stream != "audio" and not is_h264_video:
-                            self.latest_media[robot_id][stream] = data
-
-                        await self._broadcast(
-                            {
-                                "type": "media",
-                                "robot_id": robot_id,
-                                "stream": stream,
-                                "data": data,
-                                "ts": payload.get("ts", time.time()),
-                            }
-                        )
+                        if raw_bytes is not None:
+                            self._handle_edge_binary_frame(robot_id, raw_bytes)
+                        elif raw_text is not None:
+                            await self._handle_edge_text_frame(robot_id, raw_text)
             except WebSocketDisconnect:
                 pass
             finally:
@@ -1871,21 +1886,36 @@ def parse_args() -> argparse.Namespace:
         help="Token format: <token>:<role>:<user_id>",
     )
     parser.add_argument("--edge-media-token", default="edge-media-dev-token")
-    parser.add_argument("--frontend-queue-size", type=int, default=16)
+    parser.add_argument("--frontend-queue-size", type=int, default=32)
     parser.add_argument("--frontend-send-timeout-s", type=float, default=2.0)
+    parser.add_argument(
+        "--frontend-drain-max",
+        type=int,
+        default=48,
+        help="Max queued messages flushed to a frontend per sender wake-up.",
+    )
 
     parser.add_argument("--lidar-voxel-size", type=float, default=0.08)
     parser.add_argument("--lidar-map-max-voxels", type=int, default=120000)
-    parser.add_argument("--lidar-render-max-points", type=int, default=50000)
     parser.add_argument("--lidar-max-packet-bytes", type=int, default=4 * 1024 * 1024)
-    parser.add_argument("--lidar-map-range-m", type=float, default=20.0)
     parser.add_argument("--lidar-min-z", type=float, default=-1.5)
     parser.add_argument("--lidar-max-z", type=float, default=3.5)
-    parser.add_argument("--lidar-render-width", type=int, default=960)
-    parser.add_argument("--lidar-render-height", type=int, default=480)
-    parser.add_argument("--lidar-render-jpeg-quality", type=int, default=68)
-    parser.add_argument("--lidar-grid-step-m", type=int, default=1)
     parser.add_argument("--lidar-path-max-points", type=int, default=1000)
+    # Live point-cloud streaming (browser renders it in WebGL; no server raster).
+    parser.add_argument(
+        "--lidar-keyframe-interval-s",
+        type=float,
+        default=3.0,
+        help="Seconds between full-cloud keyframes (deltas stream in between).",
+    )
+    parser.add_argument(
+        "--lidar-cloud-max-points",
+        type=int,
+        default=60000,
+        help="Max points sent in a keyframe (LOD downsample budget).",
+    )
+    parser.add_argument("--lidar-cloud-quantization-cm", type=float, default=2.0)
+    parser.add_argument("--lidar-cloud-compression-level", type=int, default=6)
     parser.add_argument(
         "--map-storage-dir",
         default=str(Path(__file__).resolve().parent / "maps"),
@@ -1974,26 +2004,29 @@ def parse_args() -> argparse.Namespace:
     if args.lidar_voxel_size <= 0:
         parser.error("--lidar-voxel-size must be > 0")
 
-    if args.lidar_map_max_voxels <= 0 or args.lidar_render_max_points <= 0:
+    if args.lidar_map_max_voxels <= 0 or args.lidar_cloud_max_points <= 0:
         parser.error("lidar point limits must be > 0")
 
     if args.lidar_max_packet_bytes <= 0:
         parser.error("--lidar-max-packet-bytes must be > 0")
 
-    if args.lidar_map_range_m <= 1:
-        parser.error("--lidar-map-range-m must be > 1")
-
     if args.lidar_min_z >= args.lidar_max_z:
         parser.error("--lidar-min-z must be lower than --lidar-max-z")
 
-    if args.lidar_render_width < 640 or args.lidar_render_height < 320:
-        parser.error("lidar render size must be at least 640x320")
+    if args.lidar_keyframe_interval_s <= 0:
+        parser.error("--lidar-keyframe-interval-s must be > 0")
 
-    if args.lidar_render_jpeg_quality < 1 or args.lidar_render_jpeg_quality > 100:
-        parser.error("--lidar-render-jpeg-quality must be between 1 and 100")
+    if args.lidar_cloud_quantization_cm <= 0:
+        parser.error("--lidar-cloud-quantization-cm must be > 0")
 
-    if args.lidar_grid_step_m <= 0 or args.lidar_path_max_points <= 0:
-        parser.error("lidar grid/path settings must be > 0")
+    if args.lidar_cloud_compression_level < 0 or args.lidar_cloud_compression_level > 9:
+        parser.error("--lidar-cloud-compression-level must be between 0 and 9")
+
+    if args.lidar_path_max_points <= 0:
+        parser.error("--lidar-path-max-points must be > 0")
+
+    if args.frontend_drain_max <= 0:
+        parser.error("--frontend-drain-max must be > 0")
 
     if not str(args.map_storage_dir).strip():
         parser.error("--map-storage-dir must not be empty")

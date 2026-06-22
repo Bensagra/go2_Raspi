@@ -361,9 +361,26 @@
           </div>
         </div>
         <div>
-          <h2 class="title">Mapa LiDAR 3D · procesado en servidor</h2>
-          <div class="media-shell">
-            <canvas id="lidarFrame" class="media map" width="960" height="480" aria-label="mapa lidar"></canvas>
+          <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px;">
+            <h2 class="title" style="margin:0;">Mapa LiDAR 3D · en vivo (WebGL)</h2>
+            <span id="liveLidarStats" class="status">lidar idle</span>
+          </div>
+          <div id="liveLidarShell" class="map3d-shell">
+            <canvas id="liveLidarCanvas" class="map3d-viewer" tabindex="0" aria-label="lidar 3D en vivo"></canvas>
+            <div id="liveLidarOverlay" class="map3d-overlay">
+              Arrastrar: rotar · Shift/2º botón: desplazar · Rueda: zoom
+            </div>
+          </div>
+          <div class="row" style="margin-top:6px; flex-wrap:wrap; gap:6px;">
+            <button id="liveLidarResetBtn" type="button">Centrar vista</button>
+            <button id="liveLidarFollowBtn" type="button">Seguir robot: ON</button>
+            <button id="liveLidarFullscreenBtn" type="button">Pantalla completa</button>
+            <button id="liveLidarClearBtn" type="button">Limpiar mapa</button>
+            <button id="liveLidarRecordBtn" type="button">● Grabar</button>
+            <button id="liveLidarReplayBtn" type="button" disabled>▶ Reproducir</button>
+            <button id="liveLidarExportBtn" type="button" disabled>Exportar sesión</button>
+            <button id="liveLidarImportBtn" type="button">Importar sesión</button>
+            <input id="liveLidarImportInput" type="file" accept="application/json" style="display:none">
           </div>
         </div>
       </div>
@@ -403,6 +420,7 @@
         <label class="inline-check"><input id="enableVideo" type="checkbox" checked>Video</label>
         <label class="inline-check"><input id="enableLidar" type="checkbox" checked>Lidar</label>
         <label class="inline-check"><input id="enableAudio" type="checkbox">Audio</label>
+        <label class="inline-check" title="Baja calidad/lidar automáticamente si sube la latencia o se pierden cuadros"><input id="autoQuality" type="checkbox" checked>Auto-calidad</label>
 
         <label>Red</label>
         <select id="networkProfile">
@@ -436,6 +454,9 @@
       <div class="row" style="margin-top: 8px;">
         <span id="mediaStatus" class="status">media idle</span>
         <span id="audioStatus" class="status">audio bloqueado</span>
+      </div>
+      <div class="row" style="margin-top: 4px;">
+        <span id="netMetrics" class="status">red --</span>
       </div>
       <p class="hint">
         El perfil <strong>Débil</strong> limita cámara y LiDAR para priorizar el control. El audio queda apagado
@@ -614,12 +635,6 @@
           bitmap: null,
           generation: 0,
         },
-        lidar: {
-          busy: false,
-          pending: null,
-          bitmap: null,
-          generation: 0,
-        },
       },
       expandedStream: "",
       videoMode: "h264",
@@ -665,6 +680,60 @@
         renderPending: false,
         metadata: null,
       },
+      // Live LiDAR point cloud: accumulated voxel map rendered in WebGL.
+      liveLidar: {
+        voxels: new Map(),          // "ix,iy,iz" -> [x, y, z]
+        maxPoints: 130000,          // LOD budget for the browser
+        voxelSize: 0.08,            // dedup grid (m)
+        pose: { x: 0, y: 0, yaw: 0 },
+        path: [],                   // [[x, y], ...]
+        follow: true,
+        dirty: false,
+        bounds: null,
+        viewer: {
+          gl: null,
+          program: null,
+          positionBuffer: null,
+          colorBuffer: null,
+          pathPositionBuffer: null,
+          pathColorBuffer: null,
+          robotBuffer: null,
+          robotColorBuffer: null,
+          pointCount: 0,
+          pathPointCount: 0,
+          robotVertexCount: 0,
+          yaw: -0.75,
+          pitch: 0.55,
+          distance: 12,
+          radius: 8,
+          target: [0, 0, 0],
+          dragging: false,
+          dragMode: "orbit",
+          lastX: 0,
+          lastY: 0,
+          renderPending: false,
+          initialized: false,
+          failed: false,
+        },
+      },
+      // Client-side 3D session recorder (record/replay/export).
+      lidarRec: {
+        recording: false,
+        playing: false,
+        frames: [],          // { t, mode, points: Float32Array, pose, path }
+        startedAt: 0,
+        playTimer: null,
+        maxFrames: 4000,
+      },
+      // Rolling bandwidth / latency metrics for the metrics panel + auto-quality.
+      netStats: {
+        windowStart: 0,
+        bytes: { video: 0, lidar: 0, audio: 0 },
+        kbps: { video: 0, lidar: 0, audio: 0, total: 0 },
+        lidarLatencyMs: 0,
+        lastAdaptAt: 0,
+        adaptLevel: 0,        // 0 = none, +N = downgraded N steps
+      },
       audio: {
         ctx: null,
         unlocked: false,
@@ -692,7 +761,6 @@
       telemetryBox: document.getElementById("telemetryBox"),
       events: document.getElementById("events"),
       videoFrame: document.getElementById("videoFrame"),
-      lidarFrame: document.getElementById("lidarFrame"),
       mediaModal: document.getElementById("mediaModal"),
       mediaModalTitle: document.getElementById("mediaModalTitle"),
       closeMediaModal: document.getElementById("closeMediaModal"),
@@ -718,6 +786,21 @@
       unlockAudioBtn: document.getElementById("unlockAudioBtn"),
       mediaStatus: document.getElementById("mediaStatus"),
       audioStatus: document.getElementById("audioStatus"),
+      netMetrics: document.getElementById("netMetrics"),
+      autoQuality: document.getElementById("autoQuality"),
+      liveLidarShell: document.getElementById("liveLidarShell"),
+      liveLidarCanvas: document.getElementById("liveLidarCanvas"),
+      liveLidarOverlay: document.getElementById("liveLidarOverlay"),
+      liveLidarStats: document.getElementById("liveLidarStats"),
+      liveLidarResetBtn: document.getElementById("liveLidarResetBtn"),
+      liveLidarFollowBtn: document.getElementById("liveLidarFollowBtn"),
+      liveLidarFullscreenBtn: document.getElementById("liveLidarFullscreenBtn"),
+      liveLidarClearBtn: document.getElementById("liveLidarClearBtn"),
+      liveLidarRecordBtn: document.getElementById("liveLidarRecordBtn"),
+      liveLidarReplayBtn: document.getElementById("liveLidarReplayBtn"),
+      liveLidarExportBtn: document.getElementById("liveLidarExportBtn"),
+      liveLidarImportBtn: document.getElementById("liveLidarImportBtn"),
+      liveLidarImportInput: document.getElementById("liveLidarImportInput"),
       savedMapSelect: document.getElementById("savedMapSelect"),
       refreshMapsBtn: document.getElementById("refreshMapsBtn"),
       saveMapBtn: document.getElementById("saveMapBtn"),
@@ -912,7 +995,7 @@
     }
 
     function streamCanvas(stream) {
-      return stream === "video" ? els.videoFrame : els.lidarFrame;
+      return els.videoFrame;
     }
 
     async function decodeMediaBlob(blob) {
@@ -941,14 +1024,11 @@
 
       try {
         while (renderer.pending) {
-          const data = renderer.pending;
+          const { bytes, format } = renderer.pending;
           renderer.pending = null;
           const generation = renderer.generation;
 
-          const bytes = base64ToBytes(data.image_base64);
-          const blob = new Blob([bytes], {
-            type: formatImageMime(data.image_format),
-          });
+          const blob = new Blob([bytes], { type: formatImageMime(format) });
           const bitmap = await decodeMediaBlob(blob);
           if (generation !== renderer.generation) {
             if (typeof bitmap.close === "function") bitmap.close();
@@ -979,10 +1059,11 @@
       }
     }
 
-    function renderMediaImage(data, stream) {
-      if (!data || !data.image_base64 || !state.mediaRender[stream]) return;
+    // Render a compressed image frame (WebP/JPEG) delivered as raw bytes.
+    function renderMediaImageBytes(bytes, format, stream) {
+      if (!bytes || !state.mediaRender[stream]) return;
       // Conserva sólo el cuadro más nuevo mientras el navegador decodifica.
-      state.mediaRender[stream].pending = data;
+      state.mediaRender[stream].pending = { bytes, format };
       void processMediaFrames(stream);
     }
 
@@ -1062,7 +1143,7 @@
       return true;
     }
 
-    function decodeH264Chunk(data) {
+    function decodeH264Chunk(header, bytes) {
       if (!webCodecsAvailable()) {
         const vd = state.videoDecoder;
         if (!vd.unsupportedLogged) {
@@ -1075,26 +1156,20 @@
         return;
       }
 
-      const codecString = String(data.codec || "avc1.42e01e");
+      const codecString = String(header.codec || "avc1.42e01e");
       if (!ensureVideoDecoder(codecString)) return;
 
       const vd = state.videoDecoder;
-      const isKey = !!data.key;
+      const isKey = !!header.key;
       if (vd.needKeyframe) {
         // No se puede arrancar (ni resincronizar) en un delta: esperá un keyframe.
         if (!isKey) return;
         vd.needKeyframe = false;
       }
 
-      let bytes;
-      try {
-        bytes = base64ToBytes(data.chunk_base64 || "");
-      } catch (err) {
-        return;
-      }
-      if (!bytes.length) return;
+      if (!bytes || !bytes.length) return;
 
-      const fps = Math.max(1, parseNum(data.target_fps, 30));
+      const fps = Math.max(1, parseNum(header.target_fps, 30));
       const timestamp = Math.round((vd.frameCount++ * 1e6) / fps);
       try {
         vd.decoder.decode(new EncodedVideoChunk({
@@ -1105,6 +1180,598 @@
       } catch (err) {
         addEvent("video_decode_error", normalizeError(err));
         resetVideoDecoder();
+      }
+    }
+
+    // ============================================================
+    // Binary media frames (lidar point cloud + video) + live 3D viewer
+    // ============================================================
+    function decodeMediaFrame(buffer) {
+      if (buffer.byteLength < 6) throw new Error("frame demasiado corto");
+      const view = new DataView(buffer);
+      if (view.getUint8(0) !== 0xA7 || view.getUint8(1) !== 1) {
+        throw new Error("frame binario inválido");
+      }
+      const headerLen = view.getUint32(2, true);
+      if (6 + headerLen > buffer.byteLength) throw new Error("header inválido");
+      const header = JSON.parse(
+        new TextDecoder().decode(new Uint8Array(buffer, 6, headerLen))
+      );
+      const payload = new Uint8Array(buffer, 6 + headerLen);
+      return { header, payload };
+    }
+
+    function recordNetBytes(stream, bytes) {
+      const ns = state.netStats;
+      if (ns.bytes[stream] === undefined) ns.bytes[stream] = 0;
+      ns.bytes[stream] += bytes;
+    }
+
+    function handleBinaryFrame(buffer) {
+      let header, payload;
+      try {
+        ({ header, payload } = decodeMediaFrame(buffer));
+      } catch (err) {
+        addEvent("media_frame_error", normalizeError(err));
+        return;
+      }
+      if (header.robot_id && header.robot_id !== state.robotId) return;
+      const stream = String(header.stream || "");
+      recordNetBytes(stream, buffer.byteLength);
+
+      if (stream === "video") {
+        const now = Date.now();
+        if (header.image_format === "h264") {
+          state.videoMode = "h264";
+          decodeH264Chunk(header, payload);
+        } else {
+          state.videoMode = "mjpeg";
+          renderMediaImageBytes(payload, header.image_format, "video");
+        }
+        state.lastVideoAt = now;
+        const ft = state.videoStats.frameTimes;
+        ft.push(now);
+        while (ft.length && ft[0] < now - 1000) ft.shift();
+        state.videoStats.fps = ft.length;
+        state.videoStats.encodeMs = parseNum(header.encode_ms, 0);
+        const encodedTs = parseNum(header.encoded_ts, 0);
+        state.videoStats.latencyMs = encodedTs > 0
+          ? Math.max(0, now - encodedTs * 1000)
+          : 0;
+        return;
+      }
+
+      if (stream === "lidar") {
+        void handleLidarFrame(header, payload);
+        return;
+      }
+    }
+
+    async function decodeLidarCloud(header, payload) {
+      const fmt = String(header.fmt || "i16_xyz_zlib");
+      const raw = await inflateZlib(payload);   // Uint8Array
+      const aligned = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
+      if (fmt === "f32_xyz_zlib") {
+        return new Float32Array(aligned);
+      }
+      if (fmt !== "i16_xyz_zlib") throw new Error("formato de nube no soportado");
+      const count = Number(header.count || 0);
+      if (raw.byteLength !== count * 6) throw new Error("longitud de nube inválida");
+      const i16 = new Int16Array(aligned);
+      const scale = Number(header.scale) || 0;
+      const off = header.offset || [0, 0, 0];
+      const out = new Float32Array(count * 3);
+      for (let i = 0; i < count; i += 1) {
+        out[i * 3] = i16[i * 3] * scale + off[0];
+        out[i * 3 + 1] = i16[i * 3 + 1] * scale + off[1];
+        out[i * 3 + 2] = i16[i * 3 + 2] * scale + off[2];
+      }
+      return out;
+    }
+
+    async function handleLidarFrame(header, payload) {
+      let points;
+      try {
+        points = await decodeLidarCloud(header, payload);
+      } catch (err) {
+        addEvent("lidar_decode_error", normalizeError(err));
+        return;
+      }
+      state.lastLidarAt = Date.now();
+      state.lidarStats.mapPoints = Math.round(parseNum(header.map_points, 0));
+      state.lidarStats.sourcePoints = Math.round(parseNum(header.source_points, 0));
+      state.lidarStats.processingMs = parseNum(header.processing_ms, 0);
+      const ts = parseNum(header.ts, 0);
+      state.netStats.lidarLatencyMs = ts > 0 ? Math.max(0, Date.now() - ts * 1000) : 0;
+      applyLiveLidar(header, points);
+      recordLidarFrame(header, points);
+    }
+
+    // ----- Live LiDAR voxel map -----
+    function applyLiveLidar(header, points) {
+      const live = state.liveLidar;
+      const mode = String(header.mode || "delta");
+      if (mode === "keyframe") {
+        live.voxels.clear();
+        if (Array.isArray(header.path)) {
+          live.path = header.path.map((p) => [p[0], p[1]]);
+        }
+      }
+      const inv = 1 / live.voxelSize;
+      const vox = live.voxels;
+      const n = points.length / 3;
+      for (let i = 0; i < n; i += 1) {
+        const x = points[i * 3];
+        const y = points[i * 3 + 1];
+        const z = points[i * 3 + 2];
+        const key = Math.round(x * inv) + "," + Math.round(y * inv) + "," + Math.round(z * inv);
+        if (vox.has(key)) vox.delete(key);   // refresh recency (insertion order = LOD)
+        vox.set(key, [x, y, z]);
+      }
+      while (vox.size > live.maxPoints) {
+        vox.delete(vox.keys().next().value);
+      }
+
+      if (header.pose) {
+        live.pose = {
+          x: parseNum(header.pose.x, live.pose.x),
+          y: parseNum(header.pose.y, live.pose.y),
+          yaw: parseNum(header.pose.yaw, live.pose.yaw),
+        };
+        if (mode === "delta") {
+          const p = live.path;
+          const last = p.length ? p[p.length - 1] : null;
+          if (!last || Math.hypot(live.pose.x - last[0], live.pose.y - last[1]) >= 0.05) {
+            p.push([live.pose.x, live.pose.y]);
+            if (p.length > 4000) p.shift();
+          }
+        }
+      }
+      live.dirty = true;
+      requestLiveRender();
+    }
+
+    const LIVE_VERTEX_SHADER = `
+      attribute vec3 aPosition;
+      attribute vec3 aColor;
+      uniform mat4 uMvp;
+      uniform float uPointSize;
+      varying vec3 vColor;
+      void main() {
+        gl_Position = uMvp * vec4(aPosition, 1.0);
+        float depth = max(1.0, gl_Position.w);
+        gl_PointSize = clamp(uPointSize / sqrt(depth), 1.5, 9.0);
+        vColor = aColor;
+      }
+    `;
+    const LIVE_FRAGMENT_SHADER = `
+      precision mediump float;
+      varying vec3 vColor;
+      uniform float uRoundPoints;
+      void main() {
+        if (uRoundPoints > 0.5) {
+          vec2 delta = gl_PointCoord - vec2(0.5);
+          if (dot(delta, delta) > 0.25) discard;
+        }
+        gl_FragColor = vec4(vColor, 1.0);
+      }
+    `;
+
+    function initLiveViewer() {
+      const v = state.liveLidar.viewer;
+      if (v.gl) return v.gl;
+      if (v.failed) return null;
+      let gl = null;
+      try {
+        gl = els.liveLidarCanvas.getContext("webgl", {
+          antialias: true, alpha: false, depth: true, powerPreference: "high-performance",
+        });
+      } catch (e) { gl = null; }
+      if (!gl) {
+        v.failed = true;
+        setBadge(els.liveLidarStats, "WebGL no disponible en este navegador", "err");
+        return null;
+      }
+      try {
+        const vertexShader = compileMapShader(gl, gl.VERTEX_SHADER, LIVE_VERTEX_SHADER);
+        const fragmentShader = compileMapShader(gl, gl.FRAGMENT_SHADER, LIVE_FRAGMENT_SHADER);
+        const program = gl.createProgram();
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
+        gl.deleteShader(vertexShader);
+        gl.deleteShader(fragmentShader);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          throw new Error(gl.getProgramInfoLog(program) || "no se pudo iniciar el visor 3D");
+        }
+        v.gl = gl;
+        v.program = program;
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.clearColor(0.02, 0.04, 0.06, 1.0);
+      } catch (err) {
+        v.failed = true;
+        setBadge(els.liveLidarStats, normalizeError(err), "err");
+        return null;
+      }
+      return gl;
+    }
+
+    function buildRobotMarker(v, pose) {
+      const gl = v.gl;
+      const bounds = state.liveLidar.bounds;
+      const z = (bounds ? bounds.min[2] : 0) + 0.05;
+      const size = Math.max(v.radius * 0.05, 0.3);
+      const x = pose.x, y = pose.y, yaw = pose.yaw || 0;
+      const fx = Math.cos(yaw), fy = Math.sin(yaw);
+      const verts = new Float32Array([
+        x, y, z, x + fx * size * 2, y + fy * size * 2, z,
+        x, y, z, x, y, z + size * 1.6,
+      ]);
+      const cols = new Float32Array([
+        1, 0.25, 0.25, 1, 1, 1,
+        1, 0.25, 0.25, 1, 0.25, 0.25,
+      ]);
+      v.robotBuffer = replaceGlBuffer(gl, v.robotBuffer, verts);
+      v.robotColorBuffer = replaceGlBuffer(gl, v.robotColorBuffer, cols);
+      v.robotVertexCount = 4;
+    }
+
+    function rebuildLiveBuffers() {
+      const live = state.liveLidar;
+      const v = live.viewer;
+      const gl = v.gl;
+      if (!gl) return;
+      const count = live.voxels.size;
+      const positions = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+      const min = [Infinity, Infinity, Infinity];
+      const max = [-Infinity, -Infinity, -Infinity];
+      let i = 0;
+      for (const p of live.voxels.values()) {
+        positions[i * 3] = p[0];
+        positions[i * 3 + 1] = p[1];
+        positions[i * 3 + 2] = p[2];
+        for (let a = 0; a < 3; a += 1) {
+          if (p[a] < min[a]) min[a] = p[a];
+          if (p[a] > max[a]) max[a] = p[a];
+        }
+        i += 1;
+      }
+      const zSpan = Math.max(max[2] - min[2], 0.001);
+      i = 0;
+      for (const p of live.voxels.values()) {
+        const c = heightColor((p[2] - min[2]) / zSpan);
+        colors[i * 3] = c[0];
+        colors[i * 3 + 1] = c[1];
+        colors[i * 3 + 2] = c[2];
+        i += 1;
+      }
+      v.positionBuffer = replaceGlBuffer(gl, v.positionBuffer, positions);
+      v.colorBuffer = replaceGlBuffer(gl, v.colorBuffer, colors);
+      v.pointCount = count;
+
+      if (count) {
+        live.bounds = { min, max };
+        v.radius = Math.max(
+          Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]) / 2,
+          1
+        );
+        if (live.follow) {
+          v.target = [live.pose.x, live.pose.y, (min[2] + max[2]) / 2];
+        }
+      }
+
+      const path = live.path;
+      const pathPositions = new Float32Array(path.length * 3);
+      const pathColors = new Float32Array(path.length * 3);
+      const pathZ = (live.bounds ? live.bounds.min[2] : 0) + 0.05;
+      for (let k = 0; k < path.length; k += 1) {
+        pathPositions[k * 3] = path[k][0];
+        pathPositions[k * 3 + 1] = path[k][1];
+        pathPositions[k * 3 + 2] = pathZ;
+        pathColors[k * 3] = 1.0;
+        pathColors[k * 3 + 1] = 0.82;
+        pathColors[k * 3 + 2] = 0.18;
+      }
+      v.pathPositionBuffer = replaceGlBuffer(gl, v.pathPositionBuffer, pathPositions);
+      v.pathColorBuffer = replaceGlBuffer(gl, v.pathColorBuffer, pathColors);
+      v.pathPointCount = path.length;
+
+      buildRobotMarker(v, live.pose);
+    }
+
+    function resizeLiveCanvas(gl) {
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const c = els.liveLidarCanvas;
+      const width = Math.max(1, Math.floor(c.clientWidth * ratio));
+      const height = Math.max(1, Math.floor(c.clientHeight * ratio));
+      if (c.width !== width || c.height !== height) {
+        c.width = width;
+        c.height = height;
+      }
+      gl.viewport(0, 0, width, height);
+      return { width, height, ratio };
+    }
+
+    function renderLiveViewer() {
+      const v = state.liveLidar.viewer;
+      v.renderPending = false;
+      if (!v.gl || !v.program) return;
+      if (state.liveLidar.dirty) {
+        rebuildLiveBuffers();
+        state.liveLidar.dirty = false;
+      }
+      const gl = v.gl;
+      const size = resizeLiveCanvas(gl);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      if (!v.pointCount) return;
+      gl.useProgram(v.program);
+
+      const horizontal = Math.cos(v.pitch) * v.distance;
+      const eye = [
+        v.target[0] + Math.cos(v.yaw) * horizontal,
+        v.target[1] + Math.sin(v.yaw) * horizontal,
+        v.target[2] + Math.sin(v.pitch) * v.distance,
+      ];
+      const projection = mat4Perspective(
+        Math.PI / 4,
+        size.width / size.height,
+        Math.max(0.02, v.radius / 200),
+        Math.max(100, v.radius * 40)
+      );
+      const view = mat4LookAt(eye, v.target, [0, 0, 1]);
+      const mvp = mat4Multiply(projection, view);
+      gl.uniformMatrix4fv(gl.getUniformLocation(v.program, "uMvp"), false, mvp);
+      gl.uniform1f(
+        gl.getUniformLocation(v.program, "uPointSize"),
+        Math.max(4, 7 * size.ratio)
+      );
+
+      bindMapAttributes(gl, v.program, v.positionBuffer, v.colorBuffer);
+      gl.uniform1f(gl.getUniformLocation(v.program, "uRoundPoints"), 1);
+      gl.drawArrays(gl.POINTS, 0, v.pointCount);
+
+      if (v.pathPointCount >= 2) {
+        bindMapAttributes(gl, v.program, v.pathPositionBuffer, v.pathColorBuffer);
+        gl.uniform1f(gl.getUniformLocation(v.program, "uRoundPoints"), 0);
+        gl.lineWidth(2);
+        gl.drawArrays(gl.LINE_STRIP, 0, v.pathPointCount);
+      }
+      if (v.robotVertexCount >= 2) {
+        bindMapAttributes(gl, v.program, v.robotBuffer, v.robotColorBuffer);
+        gl.uniform1f(gl.getUniformLocation(v.program, "uRoundPoints"), 0);
+        gl.lineWidth(3);
+        gl.drawArrays(gl.LINES, 0, v.robotVertexCount);
+      }
+    }
+
+    function requestLiveRender() {
+      const v = state.liveLidar.viewer;
+      if (!v.gl && !initLiveViewer()) return;
+      if (v.renderPending) return;
+      v.renderPending = true;
+      requestAnimationFrame(renderLiveViewer);
+    }
+
+    function resetLiveView() {
+      const live = state.liveLidar;
+      const v = live.viewer;
+      v.yaw = -0.75;
+      v.pitch = 0.55;
+      v.distance = Math.max(v.radius * 2.2, 4);
+      if (live.bounds) {
+        v.target = live.follow
+          ? [live.pose.x, live.pose.y, (live.bounds.min[2] + live.bounds.max[2]) / 2]
+          : [
+              (live.bounds.min[0] + live.bounds.max[0]) / 2,
+              (live.bounds.min[1] + live.bounds.max[1]) / 2,
+              (live.bounds.min[2] + live.bounds.max[2]) / 2,
+            ];
+      }
+      requestLiveRender();
+    }
+
+    function clearLiveLidar() {
+      state.liveLidar.voxels.clear();
+      state.liveLidar.path = [];
+      state.liveLidar.dirty = true;
+      requestLiveRender();
+    }
+
+    function toggleLiveFollow() {
+      state.liveLidar.follow = !state.liveLidar.follow;
+      els.liveLidarFollowBtn.textContent = "Seguir robot: " + (state.liveLidar.follow ? "ON" : "OFF");
+      requestLiveRender();
+    }
+
+    function toggleLiveFullscreen() {
+      const enabled = !els.liveLidarShell.classList.contains("fullscreen");
+      els.liveLidarShell.classList.toggle("fullscreen", enabled);
+      els.liveLidarFullscreenBtn.textContent = enabled ? "Salir de pantalla completa" : "Pantalla completa";
+      document.body.style.overflow = enabled ? "hidden" : "";
+      requestLiveRender();
+    }
+
+    function setupLiveInteraction() {
+      const canvas = els.liveLidarCanvas;
+      canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+      canvas.addEventListener("pointerdown", (event) => {
+        const v = state.liveLidar.viewer;
+        v.dragging = true;
+        v.dragMode = event.button === 2 || event.shiftKey ? "pan" : "orbit";
+        v.lastX = event.clientX;
+        v.lastY = event.clientY;
+        canvas.setPointerCapture(event.pointerId);
+        canvas.style.cursor = "grabbing";
+      });
+      canvas.addEventListener("pointermove", (event) => {
+        const v = state.liveLidar.viewer;
+        if (!v.dragging) return;
+        const dx = event.clientX - v.lastX;
+        const dy = event.clientY - v.lastY;
+        v.lastX = event.clientX;
+        v.lastY = event.clientY;
+        if (v.dragMode === "orbit") {
+          v.yaw -= dx * 0.008;
+          v.pitch = clamp(v.pitch - dy * 0.008, -1.42, 1.42);
+        } else {
+          // Manual pan turns off "follow" so the camera stays where the user put it.
+          state.liveLidar.follow = false;
+          els.liveLidarFollowBtn.textContent = "Seguir robot: OFF";
+          const scale = v.distance * 0.0018;
+          const right = [-Math.sin(v.yaw), Math.cos(v.yaw), 0];
+          const up = [
+            -Math.cos(v.yaw) * Math.sin(v.pitch),
+            -Math.sin(v.yaw) * Math.sin(v.pitch),
+            Math.cos(v.pitch),
+          ];
+          for (let axis = 0; axis < 3; axis += 1) {
+            v.target[axis] += (-dx * right[axis] + dy * up[axis]) * scale;
+          }
+        }
+        requestLiveRender();
+      });
+      const finishDrag = (event) => {
+        const v = state.liveLidar.viewer;
+        v.dragging = false;
+        canvas.style.cursor = "grab";
+        if (canvas.hasPointerCapture(event.pointerId)) {
+          canvas.releasePointerCapture(event.pointerId);
+        }
+      };
+      canvas.addEventListener("pointerup", finishDrag);
+      canvas.addEventListener("pointercancel", finishDrag);
+      canvas.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        const v = state.liveLidar.viewer;
+        v.distance = clamp(
+          v.distance * Math.exp(event.deltaY * 0.001),
+          Math.max(v.radius * 0.05, 0.15),
+          Math.max(v.radius * 30, 30)
+        );
+        requestLiveRender();
+      }, { passive: false });
+      if (typeof ResizeObserver === "function") {
+        new ResizeObserver(requestLiveRender).observe(els.liveLidarShell);
+      } else {
+        window.addEventListener("resize", requestLiveRender);
+      }
+    }
+
+    // ----- 3D session recorder (record / replay / export / import) -----
+    function updateRecorderUi() {
+      const rec = state.lidarRec;
+      els.liveLidarRecordBtn.textContent = rec.recording
+        ? `■ Detener (${rec.frames.length})`
+        : "● Grabar";
+      els.liveLidarRecordBtn.classList.toggle("primary", rec.recording);
+      const hasFrames = rec.frames.length > 0 && !rec.recording;
+      els.liveLidarReplayBtn.disabled = !hasFrames && !rec.playing;
+      els.liveLidarReplayBtn.textContent = rec.playing ? "■ Detener replay" : "▶ Reproducir";
+      els.liveLidarExportBtn.disabled = !hasFrames;
+    }
+
+    function recordLidarFrame(header, points) {
+      const rec = state.lidarRec;
+      if (!rec.recording) return;
+      rec.frames.push({
+        t: Date.now() - rec.startedAt,
+        mode: String(header.mode || "delta"),
+        points: points.slice(0),
+        pose: { ...state.liveLidar.pose },
+        path: header.mode === "keyframe" && Array.isArray(header.path)
+          ? header.path.map((p) => [p[0], p[1]])
+          : null,
+      });
+      if (rec.frames.length > rec.maxFrames) rec.frames.shift();
+      updateRecorderUi();
+    }
+
+    function toggleLidarRecord() {
+      const rec = state.lidarRec;
+      if (rec.playing) return;
+      rec.recording = !rec.recording;
+      if (rec.recording) {
+        rec.frames = [];
+        rec.startedAt = Date.now();
+        setBadge(els.liveLidarStats, "grabando sesión 3D…", "warn");
+      }
+      updateRecorderUi();
+    }
+
+    function stopReplay() {
+      const rec = state.lidarRec;
+      rec.playing = false;
+      if (rec.playTimer) {
+        clearTimeout(rec.playTimer);
+        rec.playTimer = null;
+      }
+      updateRecorderUi();
+    }
+
+    function playRecording() {
+      const rec = state.lidarRec;
+      if (rec.playing) { stopReplay(); return; }
+      if (!rec.frames.length) return;
+      rec.playing = true;
+      updateRecorderUi();
+      clearLiveLidar();
+      let idx = 0;
+      const startWall = Date.now();
+      const step = () => {
+        if (!rec.playing) return;
+        const now = Date.now() - startWall;
+        while (idx < rec.frames.length && rec.frames[idx].t <= now) {
+          const f = rec.frames[idx];
+          idx += 1;
+          applyLiveLidar({ mode: f.mode, pose: f.pose, path: f.path }, f.points);
+        }
+        if (idx >= rec.frames.length) { stopReplay(); return; }
+        rec.playTimer = setTimeout(step, 30);
+      };
+      step();
+    }
+
+    function exportSession() {
+      const rec = state.lidarRec;
+      if (!rec.frames.length) return;
+      const out = {
+        version: 1,
+        robot_id: state.robotId,
+        created_at: Date.now(),
+        voxel_size: state.liveLidar.voxelSize,
+        frames: rec.frames.map((f) => ({
+          t: f.t, mode: f.mode, pose: f.pose, path: f.path,
+          points: Array.from(f.points),
+        })),
+      };
+      const blob = new Blob([JSON.stringify(out)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `lidar_session_${state.robotId}_${Date.now()}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    async function importSession(file) {
+      try {
+        const data = JSON.parse(await file.text());
+        const frames = Array.isArray(data.frames) ? data.frames : [];
+        state.lidarRec.frames = frames.map((f) => ({
+          t: Number(f.t) || 0,
+          mode: String(f.mode || "delta"),
+          pose: f.pose || { x: 0, y: 0, yaw: 0 },
+          path: Array.isArray(f.path) ? f.path : null,
+          points: Float32Array.from(f.points || []),
+        }));
+        state.lidarRec.recording = false;
+        updateRecorderUi();
+        setBadge(els.liveLidarStats, `sesión importada · ${state.lidarRec.frames.length} cuadros`, "ok");
+        playRecording();
+      } catch (err) {
+        setBadge(els.liveLidarStats, normalizeError(err), "err");
       }
     }
 
@@ -2013,50 +2680,15 @@
       }
 
       if (type === "media") {
+        // Video and lidar now arrive as binary frames (see handleBinaryFrame).
+        // Only JSON streams (audio) reach this path.
         if (msg.robot_id !== state.robotId) return;
         const stream = String(msg.stream || "");
-        const data = msg.data || {};
-
-        if (stream === "video") {
-          const now = Date.now();
-          if (data.image_format === "h264") {
-            state.videoMode = "h264";
-            decodeH264Chunk(data);
-          } else {
-            state.videoMode = "mjpeg";
-            renderMediaImage(data, "video");
-          }
-          state.lastVideoAt = now;
-          state.videoStats.frameTimes.push(now);
-          while (
-            state.videoStats.frameTimes.length > 0
-            && state.videoStats.frameTimes[0] < now - 1000
-          ) {
-            state.videoStats.frameTimes.shift();
-          }
-          state.videoStats.fps = state.videoStats.frameTimes.length;
-          state.videoStats.encodeMs = parseNum(data.encode_ms, 0);
-          const encodedTs = parseNum(data.encoded_ts, 0);
-          state.videoStats.latencyMs = encodedTs > 0
-            ? Math.max(0, now - encodedTs * 1000)
-            : 0;
-          return;
-        }
-
-        if (stream === "lidar") {
-          renderMediaImage(data, "lidar");
-          state.lastLidarAt = Date.now();
-          state.lidarStats.mapPoints = Math.round(parseNum(data.map_point_count, 0));
-          state.lidarStats.sourcePoints = Math.round(parseNum(data.source_point_count, 0));
-          state.lidarStats.processingMs = parseNum(data.processing_ms, 0);
-          return;
-        }
-
         if (stream === "audio") {
-          queueAudioPacket(data);
+          recordNetBytes("audio", JSON.stringify(msg.data || {}).length);
+          queueAudioPacket(msg.data || {});
           return;
         }
-
         return;
       }
 
@@ -2166,6 +2798,10 @@
         );
       }
 
+      updateNetMetrics();
+      updateLiveLidarStats();
+      maybeAutoAdapt();
+
       if (!state.audio.unlocked) {
         setBadge(els.audioStatus, "audio bloqueado (click Activar audio web)", "err");
         return;
@@ -2176,6 +2812,73 @@
         `audio ${state.audio.lastSampleRate || "--"}Hz ${state.audio.lastChannels || "--"}ch pkt:${state.audio.packets} drop:${state.audio.dropped} under:${state.audio.underruns}`,
         "ok"
       );
+    }
+
+    // ----- Metrics panel + client-driven adaptive quality -----
+    function updateNetMetrics() {
+      const ns = state.netStats;
+      const now = Date.now();
+      if (!ns.windowStart) { ns.windowStart = now; return; }
+      const dt = (now - ns.windowStart) / 1000;
+      if (dt < 0.4) return;
+      const kv = (ns.bytes.video * 8) / 1000 / dt;
+      const kl = (ns.bytes.lidar * 8) / 1000 / dt;
+      const ka = (ns.bytes.audio * 8) / 1000 / dt;
+      ns.kbps = { video: kv, lidar: kl, audio: ka, total: kv + kl + ka };
+      ns.bytes = { video: 0, lidar: 0, audio: 0 };
+      ns.windowStart = now;
+      if (els.netMetrics) {
+        const auto = els.autoQuality.checked ? ` · auto nivel ${ns.adaptLevel}` : "";
+        setBadge(
+          els.netMetrics,
+          `BW ${ns.kbps.total.toFixed(0)} kbps (vid ${kv.toFixed(0)} · lidar ${kl.toFixed(0)} · audio ${ka.toFixed(0)}) `
+          + `· lidar lat ${ns.lidarLatencyMs.toFixed(0)}ms${auto}`,
+          ns.adaptLevel > 0 ? "warn" : "ok"
+        );
+      }
+    }
+
+    function updateLiveLidarStats() {
+      if (state.lidarRec.recording || state.lidarRec.playing) return;
+      const live = state.liveLidar;
+      const lAge = state.lastLidarAt ? Date.now() - state.lastLidarAt : Number.POSITIVE_INFINITY;
+      const stale = state.connected && els.enableLidar.checked && lAge > 3500;
+      setBadge(
+        els.liveLidarStats,
+        `${live.voxels.size.toLocaleString()} pts · srv ${state.lidarStats.mapPoints.toLocaleString()} vox · ${state.lidarStats.processingMs.toFixed(0)}ms`,
+        stale ? "err" : (live.voxels.size ? "ok" : "")
+      );
+    }
+
+    const ADAPT_FPS_FACTOR = [1, 0.7, 0.5, 0.35];
+    const ADAPT_BITRATE_FACTOR = [1, 0.6, 0.4, 0.28];
+
+    function setAdaptLevel(level) {
+      const ns = state.netStats;
+      const next = clamp(level, 0, 3);
+      if (next === ns.adaptLevel) return;
+      ns.adaptLevel = next;
+      ns.lastAdaptAt = Date.now();
+      const base = selectedNetworkProfile();
+      els.cameraFps.value = String(Math.max(4, Math.round(base.cameraFps * ADAPT_FPS_FACTOR[next])));
+      els.cameraBitrate.value = String(Math.max(150, Math.round(base.cameraBitrateKbps * ADAPT_BITRATE_FACTOR[next])));
+      addEvent("auto_quality", { level: next, camFps: els.cameraFps.value, camKbps: els.cameraBitrate.value });
+      void applyMediaSettings();
+    }
+
+    function maybeAutoAdapt() {
+      if (!els.autoQuality.checked || !state.connected) return;
+      const ns = state.netStats;
+      const now = Date.now();
+      const vLat = state.videoStats.latencyMs;
+      const lLat = ns.lidarLatencyMs;
+      const bad = vLat > 1200 || lLat > 2500;
+      const good = vLat > 0 && vLat < 450 && lLat < 1200;
+      if (bad && ns.adaptLevel < 3 && now - ns.lastAdaptAt > 5000) {
+        setAdaptLevel(ns.adaptLevel + 1);
+      } else if (good && ns.adaptLevel > 0 && now - ns.lastAdaptAt > 12000) {
+        setAdaptLevel(ns.adaptLevel - 1);
+      }
     }
 
     function selectedNetworkProfile() {
@@ -2520,6 +3223,7 @@
       let ws;
       try {
         ws = new WebSocket(url);
+        ws.binaryType = "arraybuffer";
       } catch (err) {
         if (generation !== state.connectGeneration) return;
         addEvent("ws_create_error", normalizeError(err));
@@ -2572,6 +3276,10 @@
 
       ws.onmessage = (ev) => {
         if (state.ws !== ws || generation !== state.connectGeneration) return;
+        if (ev.data instanceof ArrayBuffer) {
+          handleBinaryFrame(ev.data);
+          return;
+        }
         try {
           const msg = JSON.parse(ev.data);
           handleWsMessage(msg);
@@ -2611,6 +3319,8 @@
     });
 
     els.networkProfile.addEventListener("change", async () => {
+      state.netStats.adaptLevel = 0;   // manual choice wins over auto-quality
+      state.netStats.lastAdaptAt = Date.now();
       applyNetworkProfileValues();
       if (state.connected) await applyMediaSettings();
     });
@@ -2638,12 +3348,23 @@
     els.resetMapViewBtn.addEventListener("click", resetSavedMapView);
     els.fullscreenMapBtn.addEventListener("click", toggleSavedMapFullscreen);
 
-    els.videoFrame.addEventListener("click", () => {
-      openMediaModal("video");
+    // Live LiDAR 3D viewer controls
+    els.liveLidarResetBtn.addEventListener("click", resetLiveView);
+    els.liveLidarFollowBtn.addEventListener("click", toggleLiveFollow);
+    els.liveLidarFullscreenBtn.addEventListener("click", toggleLiveFullscreen);
+    els.liveLidarClearBtn.addEventListener("click", clearLiveLidar);
+    els.liveLidarRecordBtn.addEventListener("click", toggleLidarRecord);
+    els.liveLidarReplayBtn.addEventListener("click", playRecording);
+    els.liveLidarExportBtn.addEventListener("click", exportSession);
+    els.liveLidarImportBtn.addEventListener("click", () => els.liveLidarImportInput.click());
+    els.liveLidarImportInput.addEventListener("change", (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (file) importSession(file);
+      ev.target.value = "";
     });
 
-    els.lidarFrame.addEventListener("click", () => {
-      openMediaModal("lidar");
+    els.videoFrame.addEventListener("click", () => {
+      openMediaModal("video");
     });
 
     els.closeMediaModal.addEventListener("click", closeMediaModal);
@@ -2777,6 +3498,8 @@
     els.maxApiToggle.disabled = true;
     applyNetworkProfileValues();
     setupSavedMapInteraction();
+    setupLiveInteraction();
+    updateRecorderUi();
     updateSpeedUi();
     updateMediaStatus();
     updateMotionReadouts();

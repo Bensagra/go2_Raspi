@@ -18,6 +18,9 @@ Separar canales por tipo de dato:
 - Canal pesado:
   - Uplink de media independiente Edge -> Server por WebSocket (`/ws/edge-media/{robot_id}`)
   - Video y audio no se mezclan con telemetria critica.
+  - **Frames binarios** (sin base64): cabecera JSON compacta + payload crudo
+    (`magic | version | header_len(u32 LE) | header | payload`). ~33% mas liviano
+    en la red y sin costo de base64 en la Raspi. El audio sigue como JSON (paquetes chicos).
 
 ## Flujo
 
@@ -103,6 +106,12 @@ Los valores por defecto están preparados para una red débil:
   El bitstream H.264 se entrega de forma confiable y en orden (nunca se descartan deltas); si no hay WebCodecs
   el dashboard cae automáticamente a MJPEG (WebP).
 - LiDAR: 0.7 actualizaciones/s, hasta 2500 puntos, cuantización de 2 cm y zlib nivel 6.
+  El **server ya no rasteriza un JPEG**: acumula la nube en voxels y la envía como
+  nube de puntos binaria (`i16 xyz + zlib`). Manda un **keyframe** (mapa completo, cada
+  `--lidar-keyframe-interval-s`, 3 s por defecto) y **deltas** entre medio (solo los voxels
+  nuevos), así cuando el robot está quieto casi no consume ancho de banda. El dashboard
+  la dibuja en **WebGL 3D en vivo** (órbita/zoom/pan, color por altura, robot + trayectoria,
+  LOD y mapa acumulado), con grabación/replay de sesiones y panel de métricas + auto-calidad.
 - Audio: 16 kHz en el edge y apagado por defecto en el dashboard.
 - Uplink de media: techo de 2200 kbps; el video H.264 tiene prioridad (su propio control de bitrate) y los
   streams descartables (LiDAR/audio) ceden ancho de banda al superarse el presupuesto.

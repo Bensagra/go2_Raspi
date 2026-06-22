@@ -1264,11 +1264,22 @@ class CoreRuntime:
             if "enabled" in output:
                 output["enabled"] = bool(output["enabled"])
 
+            if "format" in output:
+                image_format = str(output["format"]).strip().lower()
+                if image_format not in {"jpg", "webp"}:
+                    raise HTTPException(status_code=400, detail="camera format must be 'jpg' or 'webp'")
+                output["format"] = image_format
+
             if "emit_every" in output:
                 output["emit_every"] = max(1, int(output["emit_every"]))
 
             if "jpeg_quality" in output:
                 output["jpeg_quality"] = int(clamp(float(output["jpeg_quality"]), 1, 100))
+
+            if "min_quality" in output:
+                output["min_quality"] = int(clamp(float(output["min_quality"]), 1, 100))
+                requested_quality = int(output.get("jpeg_quality", 100))
+                output["min_quality"] = min(output["min_quality"], requested_quality)
 
             if "target_fps" in output:
                 output["target_fps"] = clamp(float(output["target_fps"]), 1, 30)
@@ -1276,6 +1287,14 @@ class CoreRuntime:
             if "max_width" in output:
                 max_width = int(output["max_width"])
                 output["max_width"] = 0 if max_width <= 0 else max(320, max_width)
+
+            if "uplink_max_kbps" in output:
+                uplink_max_kbps = int(output["uplink_max_kbps"])
+                output["uplink_max_kbps"] = (
+                    0
+                    if uplink_max_kbps <= 0
+                    else int(clamp(uplink_max_kbps, 256, 50000))
+                )
 
         if command_type == "set_audio":
             if "enabled" in output:

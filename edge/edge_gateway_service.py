@@ -73,6 +73,8 @@ class EdgeGatewayService:
         self.media_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=args.media_queue_size)
         self.latest_media_by_stream: Dict[str, Dict[str, Any]] = {}
         self.media_ready = asyncio.Event()
+        self.media_max_kbps = args.media_max_kbps
+        self.media_budget_drops: Dict[str, int] = {}
         self.robot_request_lock = asyncio.Lock()
         self.robot_request_sequence = int(time.time() * 1000) & 0x3FFFFFFF
 
@@ -86,7 +88,9 @@ class EdgeGatewayService:
         self.camera_enabled = args.enable_camera
         self.camera_channel_active = False
         self.camera_emit_every = args.camera_emit_every
+        self.camera_format = args.camera_format
         self.camera_jpeg_quality = args.camera_jpeg_quality
+        self.camera_min_quality = args.camera_min_quality
         self.camera_target_fps = args.camera_target_fps
         self.camera_max_width = args.camera_max_width
         self.camera_frame_count = 0
@@ -588,7 +592,10 @@ class EdgeGatewayService:
                     self.camera_frame_ready.clear()
 
             encode_started = time.monotonic()
-            encoded, width, height = await asyncio.to_thread(self._encode_camera_frame, frame)
+            encoded, width, height, image_format, used_quality = await asyncio.to_thread(
+                self._encode_camera_frame,
+                frame,
+            )
             if encoded is None:
                 continue
             encoded_at = time.time()
@@ -605,8 +612,10 @@ class EdgeGatewayService:
                         "source_frame_index": self.camera_frame_count,
                         "width": width,
                         "height": height,
-                        "image_format": "jpg",
+                        "image_format": image_format,
                         "image_base64": base64.b64encode(encoded).decode("ascii"),
+                        "encoded_bytes": len(encoded),
+                        "quality": used_quality,
                         "encoded_ts": encoded_at,
                         "encode_ms": round((time.monotonic() - encode_started) * 1000.0, 2),
                         "target_fps": self.camera_target_fps,
@@ -614,7 +623,10 @@ class EdgeGatewayService:
                 }
             )
 
-    def _encode_camera_frame(self, frame) -> Tuple[Optional[bytes], int, int]:
+    def _encode_camera_frame(
+        self,
+        frame,
+    ) -> Tuple[Optional[bytes], int, int, str, int]:
         image = frame.to_ndarray(format="bgr24")
         height, width = image.shape[:2]
         if self.camera_max_width > 0 and width > self.camera_max_width:
@@ -623,19 +635,83 @@ class EdgeGatewayService:
             height = max(1, int(round(height * scale)))
             image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
 
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            image,
-            [
-                cv2.IMWRITE_JPEG_QUALITY,
-                self.camera_jpeg_quality,
-                cv2.IMWRITE_JPEG_OPTIMIZE,
-                0,
-            ],
-        )
+        image_format = self.camera_format
+        quality = self.camera_jpeg_quality
+
+        def encode(selected_format: str, selected_quality: int):
+            try:
+                if selected_format == "webp":
+                    return cv2.imencode(
+                        ".webp",
+                        image,
+                        [getattr(cv2, "IMWRITE_WEBP_QUALITY", 64), selected_quality],
+                    )
+                return cv2.imencode(
+                    ".jpg",
+                    image,
+                    [
+                        cv2.IMWRITE_JPEG_QUALITY,
+                        selected_quality,
+                        cv2.IMWRITE_JPEG_OPTIMIZE,
+                        1,
+                    ],
+                )
+            except Exception:
+                return False, None
+
+        ok, encoded = encode(image_format, quality)
+        if (not ok or encoded is None) and image_format == "webp":
+            image_format = "jpg"
+            ok, encoded = encode(image_format, quality)
         if not ok or encoded is None:
-            return None, width, height
-        return encoded.tobytes(), width, height
+            return None, width, height, image_format, quality
+
+        target_bytes = 0
+        if self.media_max_kbps > 0:
+            camera_bytes_per_second = self.media_max_kbps * 125.0 * 0.78
+            target_bytes = int(
+                camera_bytes_per_second / max(self.camera_target_fps, 1.0)
+            )
+
+        if (
+            target_bytes > 0
+            and len(encoded) > target_bytes
+            and quality > self.camera_min_quality
+        ):
+            size_ratio = target_bytes / float(len(encoded))
+            adaptive_quality = max(
+                self.camera_min_quality,
+                min(quality - 1, int(round(quality * size_ratio ** 0.55))),
+            )
+            ok_retry, encoded_retry = encode(image_format, adaptive_quality)
+            if ok_retry and encoded_retry is not None:
+                quality = adaptive_quality
+                encoded = encoded_retry
+
+            if len(encoded) > target_bytes and quality > self.camera_min_quality:
+                ok_min, encoded_min = encode(image_format, self.camera_min_quality)
+                if ok_min and encoded_min is not None:
+                    quality = self.camera_min_quality
+                    encoded = encoded_min
+
+            if len(encoded) > target_bytes and width > 320:
+                resize_ratio = max(
+                    320.0 / width,
+                    min(0.95, (target_bytes / float(len(encoded))) ** 0.5 * 0.95),
+                )
+                resized_width = max(320, int(round(width * resize_ratio)))
+                resized_height = max(1, int(round(height * resized_width / width)))
+                image = cv2.resize(
+                    image,
+                    (resized_width, resized_height),
+                    interpolation=cv2.INTER_AREA,
+                )
+                width, height = resized_width, resized_height
+                ok_resized, encoded_resized = encode(image_format, quality)
+                if ok_resized and encoded_resized is not None:
+                    encoded = encoded_resized
+
+        return encoded.tobytes(), width, height, image_format, quality
 
     async def _on_audio_frame(self, frame) -> None:
         self.audio_frame_count += 1
@@ -989,6 +1065,7 @@ class EdgeGatewayService:
             },
             "media": {
                 "camera_enabled": self.camera_enabled,
+                "camera_format": self.camera_format,
                 "lidar_enabled": self.lidar_enabled,
                 "audio_enabled": self.audio_enabled,
                 "camera_emit_every": self.camera_emit_every,
@@ -996,6 +1073,7 @@ class EdgeGatewayService:
                 "camera_max_width": self.camera_max_width,
                 "camera_encoded_frames": self.camera_encoded_count,
                 "camera_jpeg_quality": self.camera_jpeg_quality,
+                "camera_min_quality": self.camera_min_quality,
                 "audio_emit_every": self.audio_emit_every,
                 "audio_max_bytes": self.audio_max_bytes,
                 "audio_sample_rate": self.args.audio_sample_rate,
@@ -1004,6 +1082,8 @@ class EdgeGatewayService:
                 "lidar_uplink_max_points": self.lidar_uplink_max_points,
                 "lidar_compression_level": self.lidar_compression_level,
                 "lidar_quantization_cm": self.lidar_quantization_cm,
+                "uplink_max_kbps": self.media_max_kbps,
+                "uplink_budget_drops": dict(self.media_budget_drops),
             },
             "temperatures": {
                 "ntc1": low.get("temperature_ntc1"),
@@ -1164,6 +1244,12 @@ class EdgeGatewayService:
             }
 
         if cmd_type == "set_camera_stream":
+            if "format" in payload:
+                image_format = str(payload.get("format", self.camera_format)).lower()
+                if image_format not in {"jpg", "webp"}:
+                    raise ValueError("format must be 'jpg' or 'webp'")
+                self.camera_format = image_format
+
             if "emit_every" in payload:
                 emit_every = int(payload.get("emit_every", 1))
                 if emit_every <= 0:
@@ -1175,6 +1261,17 @@ class EdgeGatewayService:
                 if quality < 1 or quality > 100:
                     raise ValueError("jpeg_quality must be between 1 and 100")
                 self.camera_jpeg_quality = quality
+
+            if "min_quality" in payload:
+                min_quality = int(payload.get("min_quality", self.camera_min_quality))
+                if min_quality < 1 or min_quality > 100:
+                    raise ValueError("min_quality must be between 1 and 100")
+                self.camera_min_quality = min_quality
+
+            self.camera_min_quality = min(
+                self.camera_min_quality,
+                self.camera_jpeg_quality,
+            )
 
             if "target_fps" in payload:
                 target_fps = float(payload.get("target_fps", self.camera_target_fps))
@@ -1188,16 +1285,29 @@ class EdgeGatewayService:
                     raise ValueError("max_width must be 0 or >= 320")
                 self.camera_max_width = max_width
 
+            if "uplink_max_kbps" in payload:
+                uplink_max_kbps = int(
+                    payload.get("uplink_max_kbps", self.media_max_kbps)
+                )
+                if uplink_max_kbps < 0 or (
+                    uplink_max_kbps > 0 and uplink_max_kbps < 256
+                ):
+                    raise ValueError("uplink_max_kbps must be 0 or >= 256")
+                self.media_max_kbps = uplink_max_kbps
+
             if "enabled" in payload:
                 await self._set_video(bool(payload.get("enabled")))
 
             return {
                 "executed": "set_camera_stream",
                 "camera_enabled": self.camera_enabled,
+                "format": self.camera_format,
                 "emit_every": self.camera_emit_every,
                 "jpeg_quality": self.camera_jpeg_quality,
+                "min_quality": self.camera_min_quality,
                 "target_fps": self.camera_target_fps,
                 "max_width": self.camera_max_width,
+                "uplink_max_kbps": self.media_max_kbps,
             }
 
         if cmd_type == "set_audio":
@@ -1404,6 +1514,8 @@ class EdgeGatewayService:
             ws_url = f"{ws_url}{sep}token={self.args.media_ws_token}"
 
         while not self.stop_event.is_set():
+            budget_tokens = max(self.media_max_kbps, 0) * 125.0
+            budget_updated_at = time.monotonic()
             try:
                 async with websockets.connect(
                     ws_url,
@@ -1424,6 +1536,10 @@ class EdgeGatewayService:
 
                         batch: List[Dict[str, Any]] = []
 
+                        lidar_points = self.latest_media_by_stream.pop("lidar_points", None)
+                        if lidar_points is not None:
+                            batch.append(lidar_points)
+
                         video = self.latest_media_by_stream.pop("video", None)
                         if video is not None:
                             batch.append(video)
@@ -1433,10 +1549,6 @@ class EdgeGatewayService:
                                 batch.append(self.media_queue.get_nowait())
                             except asyncio.QueueEmpty:
                                 break
-
-                        lidar_points = self.latest_media_by_stream.pop("lidar_points", None)
-                        if lidar_points is not None:
-                            batch.append(lidar_points)
 
                         for stream in list(self.latest_media_by_stream):
                             payload = self.latest_media_by_stream.pop(stream, None)
@@ -1448,6 +1560,23 @@ class EdgeGatewayService:
 
                         for payload in batch:
                             text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+                            payload_size = len(text.encode("utf-8"))
+                            max_bytes_per_second = max(self.media_max_kbps, 0) * 125.0
+                            if max_bytes_per_second > 0:
+                                now = time.monotonic()
+                                budget_tokens = min(
+                                    max_bytes_per_second,
+                                    budget_tokens
+                                    + (now - budget_updated_at) * max_bytes_per_second,
+                                )
+                                budget_updated_at = now
+                                if payload_size > budget_tokens:
+                                    stream = str(payload.get("stream", "unknown"))
+                                    self.media_budget_drops[stream] = (
+                                        self.media_budget_drops.get(stream, 0) + 1
+                                    )
+                                    continue
+                                budget_tokens -= payload_size
                             await asyncio.wait_for(ws.send(text), timeout=self.args.media_ws_send_timeout_s)
 
             except Exception as exc:
@@ -1718,9 +1847,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-ms-per-degree", type=float, default=15.0)
 
     parser.add_argument("--camera-emit-every", type=int, default=1)
-    parser.add_argument("--camera-jpeg-quality", type=int, default=32)
+    parser.add_argument("--camera-format", choices=["jpg", "webp"], default="webp")
+    parser.add_argument("--camera-jpeg-quality", type=int, default=60)
+    parser.add_argument("--camera-min-quality", type=int, default=38)
     parser.add_argument("--camera-target-fps", type=float, default=6.0)
-    parser.add_argument("--camera-max-width", type=int, default=480)
+    parser.add_argument("--camera-max-width", type=int, default=640)
 
     parser.add_argument("--audio-emit-every", type=int, default=2)
     parser.add_argument("--audio-max-bytes", type=int, default=24576)
@@ -1731,8 +1862,8 @@ def parse_args() -> argparse.Namespace:
         choices=[8000, 12000, 16000, 24000, 48000],
     )
 
-    parser.add_argument("--lidar-media-hz", type=float, default=1.5)
-    parser.add_argument("--lidar-uplink-max-points", type=int, default=4000)
+    parser.add_argument("--lidar-media-hz", type=float, default=1.0)
+    parser.add_argument("--lidar-uplink-max-points", type=int, default=3000)
     parser.add_argument("--lidar-compression-level", type=int, default=6)
     parser.add_argument(
         "--lidar-quantization-cm",
@@ -1749,6 +1880,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--media-ws-token", default="")
     parser.add_argument("--media-queue-size", type=int, default=64)
     parser.add_argument("--media-audio-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--media-max-kbps",
+        type=int,
+        default=1600,
+        help="Total media uplink budget. Frames are dropped instead of queued; 0 disables the cap.",
+    )
     parser.add_argument("--media-ws-reconnect-s", type=float, default=2.0)
     parser.add_argument("--media-ws-send-timeout-s", type=float, default=2.0)
     parser.add_argument("--media-ws-max-size", type=int, default=8 * 1024 * 1024)
@@ -1770,6 +1907,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.camera_jpeg_quality < 1 or args.camera_jpeg_quality > 100:
         parser.error("--camera-jpeg-quality must be between 1 and 100")
+
+    if args.camera_min_quality < 1 or args.camera_min_quality > args.camera_jpeg_quality:
+        parser.error("--camera-min-quality must be between 1 and --camera-jpeg-quality")
 
     if args.camera_target_fps < 1 or args.camera_target_fps > 30:
         parser.error("--camera-target-fps must be between 1 and 30")
@@ -1815,6 +1955,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.media_audio_batch_size <= 0:
         parser.error("--media-audio-batch-size must be > 0")
+
+    if args.media_max_kbps < 0 or (0 < args.media_max_kbps < 256):
+        parser.error("--media-max-kbps must be 0 or >= 256")
 
     if args.media_ws_send_timeout_s <= 0:
         parser.error("--media-ws-send-timeout-s must be > 0")

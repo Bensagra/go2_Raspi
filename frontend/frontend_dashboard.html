@@ -414,11 +414,11 @@
         <label>Cam FPS</label>
         <input id="cameraFps" class="small" type="number" min="1" max="30" value="6">
 
-        <label>JPEG %</label>
-        <input id="cameraQuality" class="small" type="number" min="25" max="85" value="32">
+        <label>Calidad %</label>
+        <input id="cameraQuality" class="small" type="number" min="25" max="90" value="60">
 
         <label>Cam ancho</label>
-        <input id="cameraWidth" style="width:100px" type="number" min="320" max="1920" value="480">
+        <input id="cameraWidth" style="width:100px" type="number" min="320" max="1920" value="640">
 
         <label>Audio every</label>
         <input id="audioEmitEvery" class="small" type="number" min="1" max="10" value="2">
@@ -529,30 +529,39 @@
     const NETWORK_PROFILES = Object.freeze({
       weak: Object.freeze({
         cameraFps: 6,
-        cameraQuality: 32,
-        cameraWidth: 480,
-        lidarHz: 1.5,
-        lidarMaxPoints: 4000,
+        cameraFormat: "webp",
+        cameraQuality: 60,
+        cameraMinQuality: 38,
+        cameraWidth: 640,
+        lidarHz: 1,
+        lidarMaxPoints: 3000,
         lidarCompression: 6,
         lidarQuantizationCm: 2.0,
+        uplinkMaxKbps: 1600,
       }),
       balanced: Object.freeze({
-        cameraFps: 10,
-        cameraQuality: 38,
-        cameraWidth: 640,
+        cameraFps: 8,
+        cameraFormat: "webp",
+        cameraQuality: 65,
+        cameraMinQuality: 42,
+        cameraWidth: 960,
         lidarHz: 3,
         lidarMaxPoints: 10000,
         lidarCompression: 5,
         lidarQuantizationCm: 1.0,
+        uplinkMaxKbps: 3500,
       }),
       quality: Object.freeze({
-        cameraFps: 15,
-        cameraQuality: 50,
-        cameraWidth: 960,
+        cameraFps: 12,
+        cameraFormat: "webp",
+        cameraQuality: 72,
+        cameraMinQuality: 50,
+        cameraWidth: 1280,
         lidarHz: 5,
         lidarMaxPoints: 30000,
         lidarCompression: 3,
         lidarQuantizationCm: 0.5,
+        uplinkMaxKbps: 8000,
       }),
     });
 
@@ -865,6 +874,7 @@
     function formatImageMime(imageFormat) {
       const fmt = String(imageFormat || "jpg").toLowerCase();
       if (fmt === "png") return "image/png";
+      if (fmt === "webp") return "image/webp";
       return "image/jpeg";
     }
 
@@ -2036,7 +2046,7 @@
       const audioMaxBytes = Math.max(0, Math.round(parseNum(els.audioMaxBytes.value, 24576)));
       const profile = selectedNetworkProfile();
       const cameraFps = clamp(Math.round(parseNum(els.cameraFps.value, profile.cameraFps)), 1, 30);
-      const cameraQuality = clamp(Math.round(parseNum(els.cameraQuality.value, profile.cameraQuality)), 25, 85);
+      const cameraQuality = clamp(Math.round(parseNum(els.cameraQuality.value, profile.cameraQuality)), 25, 90);
       const cameraWidth = clamp(Math.round(parseNum(els.cameraWidth.value, profile.cameraWidth)), 320, 1920);
 
       els.audioEmitEvery.value = String(audioEmitEvery);
@@ -2057,9 +2067,12 @@
           payload: {
             enabled: !!els.enableVideo.checked,
             emit_every: 1,
+            format: profile.cameraFormat,
             jpeg_quality: cameraQuality,
+            min_quality: profile.cameraMinQuality,
             target_fps: cameraFps,
             max_width: cameraWidth,
+            uplink_max_kbps: profile.uplinkMaxKbps,
           },
         },
         {
@@ -2101,9 +2114,11 @@
       addEvent("media_config_applied", {
         video: !!els.enableVideo.checked,
         network_profile: els.networkProfile.value,
+        camera_format: profile.cameraFormat,
         camera_fps: cameraFps,
         camera_quality: cameraQuality,
         camera_width: cameraWidth,
+        uplink_max_kbps: profile.uplinkMaxKbps,
         lidar: !!els.enableLidar.checked,
         lidar_hz: profile.lidarHz,
         lidar_max_points: profile.lidarMaxPoints,

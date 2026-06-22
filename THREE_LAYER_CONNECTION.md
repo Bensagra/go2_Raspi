@@ -97,9 +97,10 @@ python edge/edge_gateway_service.py \
 
 Los valores por defecto están preparados para una red débil:
 
-- Cámara: 480 px, 6 FPS, JPEG 32%.
-- LiDAR: 1.5 actualizaciones/s, hasta 4000 puntos, cuantización de 2 cm y zlib nivel 6.
+- Cámara: WebP, 640 px, 6 FPS y calidad objetivo 60% con ajuste automático por cuadro.
+- LiDAR: 1 actualización/s, hasta 3000 puntos, cuantización de 2 cm y zlib nivel 6.
 - Audio: 16 kHz en el edge y apagado por defecto en el dashboard.
+- Uplink de media: techo de 1600 kbps; al superarlo se descartan frames viejos en vez de acumular latencia.
 
 El dashboard ofrece perfiles `Débil`, `Balanceada` y `Alta calidad`. Para priorizar la respuesta de
 los comandos y evitar tener que apagar la cámara, dejar seleccionado `Débil`.

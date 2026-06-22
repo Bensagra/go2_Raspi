@@ -95,6 +95,15 @@ python edge/edge_gateway_service.py \
   --media-ws-token edge-media-dev-token
 ```
 
+Los valores por defecto están preparados para una red débil:
+
+- Cámara: 480 px, 6 FPS, JPEG 32%.
+- LiDAR: 1.5 actualizaciones/s, hasta 4000 puntos, cuantización de 2 cm y zlib nivel 6.
+- Audio: 16 kHz en el edge y apagado por defecto en el dashboard.
+
+El dashboard ofrece perfiles `Débil`, `Balanceada` y `Alta calidad`. Para priorizar la respuesta de
+los comandos y evitar tener que apagar la cámara, dejar seleccionado `Débil`.
+
 ### 4) Frontend
 
 Abre en navegador:

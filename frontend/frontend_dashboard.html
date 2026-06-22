@@ -402,16 +402,23 @@
       <div class="row" style="margin-top: 8px;">
         <label class="inline-check"><input id="enableVideo" type="checkbox" checked>Video</label>
         <label class="inline-check"><input id="enableLidar" type="checkbox" checked>Lidar</label>
-        <label class="inline-check"><input id="enableAudio" type="checkbox" checked>Audio</label>
+        <label class="inline-check"><input id="enableAudio" type="checkbox">Audio</label>
+
+        <label>Red</label>
+        <select id="networkProfile">
+          <option value="weak" selected>Débil</option>
+          <option value="balanced">Balanceada</option>
+          <option value="quality">Alta calidad</option>
+        </select>
 
         <label>Cam FPS</label>
-        <input id="cameraFps" class="small" type="number" min="1" max="30" value="15">
+        <input id="cameraFps" class="small" type="number" min="1" max="30" value="6">
 
         <label>JPEG %</label>
-        <input id="cameraQuality" class="small" type="number" min="25" max="85" value="45">
+        <input id="cameraQuality" class="small" type="number" min="25" max="85" value="32">
 
         <label>Cam ancho</label>
-        <input id="cameraWidth" style="width:100px" type="number" min="320" max="1920" value="960">
+        <input id="cameraWidth" style="width:100px" type="number" min="320" max="1920" value="480">
 
         <label>Audio every</label>
         <input id="audioEmitEvery" class="small" type="number" min="1" max="10" value="2">
@@ -427,6 +434,10 @@
         <span id="mediaStatus" class="status">media idle</span>
         <span id="audioStatus" class="status">audio bloqueado</span>
       </div>
+      <p class="hint">
+        El perfil <strong>Débil</strong> limita cámara y LiDAR para priorizar el control. El audio queda apagado
+        por defecto porque, aun sin video, puede consumir una porción importante del enlace.
+      </p>
       <p class="hint">
         Movimiento continuo: mantené <span class="kbd">2</span> para avanzar y, sin soltarlo, usá
         <span class="kbd">1/4</span> para girar a la izquierda o <span class="kbd">3/6</span> para girar a la derecha.
@@ -515,6 +526,35 @@
     const RIGHT_KEYS = ["KeyD", "ArrowRight", "Digit3", "Digit6", "Numpad3", "Numpad6"];
     const STRAFE_LEFT_KEYS = ["KeyQ", "KeyZ"];
     const STRAFE_RIGHT_KEYS = ["KeyE", "KeyC"];
+    const NETWORK_PROFILES = Object.freeze({
+      weak: Object.freeze({
+        cameraFps: 6,
+        cameraQuality: 32,
+        cameraWidth: 480,
+        lidarHz: 1.5,
+        lidarMaxPoints: 4000,
+        lidarCompression: 6,
+        lidarQuantizationCm: 2.0,
+      }),
+      balanced: Object.freeze({
+        cameraFps: 10,
+        cameraQuality: 38,
+        cameraWidth: 640,
+        lidarHz: 3,
+        lidarMaxPoints: 10000,
+        lidarCompression: 5,
+        lidarQuantizationCm: 1.0,
+      }),
+      quality: Object.freeze({
+        cameraFps: 15,
+        cameraQuality: 50,
+        cameraWidth: 960,
+        lidarHz: 5,
+        lidarMaxPoints: 30000,
+        lidarCompression: 3,
+        lidarQuantizationCm: 0.5,
+      }),
+    });
 
     const state = {
       ws: null,
@@ -639,6 +679,7 @@
       enableVideo: document.getElementById("enableVideo"),
       enableLidar: document.getElementById("enableLidar"),
       enableAudio: document.getElementById("enableAudio"),
+      networkProfile: document.getElementById("networkProfile"),
       cameraFps: document.getElementById("cameraFps"),
       cameraQuality: document.getElementById("cameraQuality"),
       cameraWidth: document.getElementById("cameraWidth"),
@@ -1973,6 +2014,18 @@
       );
     }
 
+    function selectedNetworkProfile() {
+      return NETWORK_PROFILES[els.networkProfile.value] || NETWORK_PROFILES.weak;
+    }
+
+    function applyNetworkProfileValues() {
+      const profile = selectedNetworkProfile();
+      els.cameraFps.value = String(profile.cameraFps);
+      els.cameraQuality.value = String(profile.cameraQuality);
+      els.cameraWidth.value = String(profile.cameraWidth);
+      return profile;
+    }
+
     async function applyMediaSettings() {
       if (!state.connected) {
         addEvent("media_config", "Conectate antes de aplicar media");
@@ -1981,9 +2034,10 @@
 
       const audioEmitEvery = Math.max(1, Math.min(10, Math.round(parseNum(els.audioEmitEvery.value, 2))));
       const audioMaxBytes = Math.max(0, Math.round(parseNum(els.audioMaxBytes.value, 24576)));
-      const cameraFps = clamp(Math.round(parseNum(els.cameraFps.value, 15)), 1, 30);
-      const cameraQuality = clamp(Math.round(parseNum(els.cameraQuality.value, 45)), 25, 85);
-      const cameraWidth = clamp(Math.round(parseNum(els.cameraWidth.value, 960)), 320, 1920);
+      const profile = selectedNetworkProfile();
+      const cameraFps = clamp(Math.round(parseNum(els.cameraFps.value, profile.cameraFps)), 1, 30);
+      const cameraQuality = clamp(Math.round(parseNum(els.cameraQuality.value, profile.cameraQuality)), 25, 85);
+      const cameraWidth = clamp(Math.round(parseNum(els.cameraWidth.value, profile.cameraWidth)), 320, 1920);
 
       els.audioEmitEvery.value = String(audioEmitEvery);
       els.audioMaxBytes.value = String(audioMaxBytes);
@@ -2019,6 +2073,10 @@
           payload: {
             enabled: !!els.enableLidar.checked,
             subscribe: true,
+            media_hz: profile.lidarHz,
+            max_points: profile.lidarMaxPoints,
+            compression_level: profile.lidarCompression,
+            quantization_cm: profile.lidarQuantizationCm,
           },
         },
         {
@@ -2042,10 +2100,13 @@
 
       addEvent("media_config_applied", {
         video: !!els.enableVideo.checked,
+        network_profile: els.networkProfile.value,
         camera_fps: cameraFps,
         camera_quality: cameraQuality,
         camera_width: cameraWidth,
         lidar: !!els.enableLidar.checked,
+        lidar_hz: profile.lidarHz,
+        lidar_max_points: profile.lidarMaxPoints,
         audio: !!els.enableAudio.checked,
         audio_emit_every: audioEmitEvery,
         audio_max_bytes: audioMaxBytes,
@@ -2361,6 +2422,11 @@
 
     els.applyMediaBtn.addEventListener("click", async () => {
       await applyMediaSettings();
+    });
+
+    els.networkProfile.addEventListener("change", async () => {
+      applyNetworkProfileValues();
+      if (state.connected) await applyMediaSettings();
     });
 
     els.unlockAudioBtn.addEventListener("click", async () => {

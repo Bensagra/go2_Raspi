@@ -275,7 +275,8 @@ class CoreRuntime:
                 await ws.close()
 
     def _decode_lidar_points(self, data: Dict[str, Any]) -> np.ndarray:
-        if str(data.get("point_format", "")) != "f32_xyz_zlib":
+        point_format = str(data.get("point_format", ""))
+        if point_format not in {"f32_xyz_zlib", "i16_xyz_zlib"}:
             raise ValueError("unsupported lidar point format")
 
         encoded = data.get("points_base64")
@@ -293,10 +294,22 @@ class CoreRuntime:
         raw += decompressor.flush()
         if len(raw) > self.args.lidar_max_packet_bytes:
             raise ValueError("lidar packet exceeds server limit")
-        if len(raw) % 12 != 0:
-            raise ValueError("invalid float32 xyz payload length")
+        if point_format == "f32_xyz_zlib":
+            if len(raw) % 12 != 0:
+                raise ValueError("invalid float32 xyz payload length")
+            points = np.frombuffer(raw, dtype="<f4").reshape(-1, 3)
+        else:
+            if len(raw) % 6 != 0:
+                raise ValueError("invalid int16 xyz payload length")
+            scale = float(data.get("quantization_scale", 0.0))
+            offset = np.asarray(data.get("quantization_offset", []), dtype=np.float32)
+            if not math.isfinite(scale) or scale <= 0:
+                raise ValueError("invalid lidar quantization scale")
+            if offset.shape != (3,) or not np.isfinite(offset).all():
+                raise ValueError("invalid lidar quantization offset")
+            quantized = np.frombuffer(raw, dtype="<i2").reshape(-1, 3)
+            points = quantized.astype(np.float32) * scale + offset
 
-        points = np.frombuffer(raw, dtype="<f4").reshape(-1, 3)
         declared_count = int(data.get("point_count", points.shape[0]))
         if declared_count != points.shape[0]:
             raise ValueError("lidar point count mismatch")
@@ -1277,6 +1290,22 @@ class CoreRuntime:
         if command_type == "set_lidar":
             output["enabled"] = bool(output.get("enabled", True))
             output["subscribe"] = bool(output.get("subscribe", True))
+            if "media_hz" in output:
+                output["media_hz"] = clamp(float(output["media_hz"]), 0.2, 15)
+            if "max_points" in output:
+                output["max_points"] = int(
+                    clamp(float(output["max_points"]), 500, 100000)
+                )
+            if "compression_level" in output:
+                output["compression_level"] = int(
+                    clamp(float(output["compression_level"]), 0, 9)
+                )
+            if "quantization_cm" in output:
+                output["quantization_cm"] = clamp(
+                    float(output["quantization_cm"]),
+                    0.1,
+                    50,
+                )
 
         if command_type == "set_lidar_decoder":
             decoder = str(output.get("decoder", "libvoxel")).strip().lower()

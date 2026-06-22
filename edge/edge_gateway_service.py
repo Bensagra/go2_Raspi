@@ -98,11 +98,19 @@ class EdgeGatewayService:
         self.audio_max_bytes = args.audio_max_bytes
         self.audio_frame_count = 0
         self.last_audio_error_at = 0.0
-        self.audio_resampler = AudioResampler(format="s16", layout="mono", rate=48000)
+        self.audio_resampler = AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=args.audio_sample_rate,
+        )
         self.audio_pcm_buffer = bytearray()
         self.audio_buffered_frames = 0
 
         self.lidar_enabled = args.enable_lidar
+        self.lidar_media_hz = args.lidar_media_hz
+        self.lidar_uplink_max_points = args.lidar_uplink_max_points
+        self.lidar_compression_level = args.lidar_compression_level
+        self.lidar_quantization_cm = args.lidar_quantization_cm
         self.last_lidar_media_at = 0.0
 
         self.move_active = False
@@ -116,7 +124,11 @@ class EdgeGatewayService:
         self.last_heartbeat_fault_event_at = 0.0
 
     def _reset_audio_pipeline(self) -> None:
-        self.audio_resampler = AudioResampler(format="s16", layout="mono", rate=48000)
+        self.audio_resampler = AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=self.args.audio_sample_rate,
+        )
         self.audio_pcm_buffer.clear()
         self.audio_buffered_frames = 0
 
@@ -547,6 +559,11 @@ class EdgeGatewayService:
 
             if not self.camera_enabled:
                 continue
+            if (
+                self.camera_emit_every > 1
+                and self.camera_frame_count % self.camera_emit_every != 0
+            ):
+                continue
 
             self.latest_camera_frame = frame
             self.camera_frame_ready.set()
@@ -679,7 +696,7 @@ class EdgeGatewayService:
 
         output_frames = self.audio_resampler.resample(frame)
         if not output_frames:
-            return b"", 48000, 1
+            return b"", self.args.audio_sample_rate, 1
 
         chunks: List[bytes] = []
         for output_frame in output_frames:
@@ -689,7 +706,7 @@ class EdgeGatewayService:
             pcm = np.ascontiguousarray(array.reshape(-1), dtype="<i2")
             chunks.append(pcm.tobytes())
 
-        return b"".join(chunks), 48000, 1
+        return b"".join(chunks), self.args.audio_sample_rate, 1
 
     async def _enqueue_media(self, payload: Dict[str, Any]) -> None:
         if not self.args.media_ws_url:
@@ -793,7 +810,7 @@ class EdgeGatewayService:
 
     async def _maybe_publish_lidar_media(self, payload: Any) -> None:
         now = time.monotonic()
-        if now - self.last_lidar_media_at < (1.0 / max(self.args.lidar_media_hz, 0.01)):
+        if now - self.last_lidar_media_at < (1.0 / max(self.lidar_media_hz, 0.01)):
             return
         self.last_lidar_media_at = now
 
@@ -817,19 +834,29 @@ class EdgeGatewayService:
         if points.size == 0:
             return
 
-        max_points = self.args.lidar_uplink_max_points
+        max_points = self.lidar_uplink_max_points
         if max_points > 0 and points.shape[0] > max_points:
             step = max(int(np.ceil(points.shape[0] / max_points)), 1)
             points = points[::step][:max_points]
 
-        raw = np.ascontiguousarray(points, dtype="<f4").tobytes()
+        quantization_scale = max(self.lidar_quantization_cm / 100.0, 0.001)
+        bounds_min = points.min(axis=0)
+        bounds_max = points.max(axis=0)
+        quantization_offset = (bounds_min + bounds_max) / 2.0
+        max_delta = float(np.max(np.abs(points - quantization_offset)))
+        if max_delta > 0:
+            quantization_scale = max(quantization_scale, max_delta / 32760.0)
+
+        quantized = np.rint(
+            (points - quantization_offset) / quantization_scale
+        )
+        quantized = np.clip(quantized, -32768, 32767).astype("<i2")
+        raw = np.ascontiguousarray(quantized).tobytes()
         compressed = await asyncio.to_thread(
             zlib.compress,
             raw,
-            self.args.lidar_compression_level,
+            self.lidar_compression_level,
         )
-        mins = points.min(axis=0)
-        maxs = points.max(axis=0)
 
         await self._enqueue_media(
             {
@@ -837,12 +864,14 @@ class EdgeGatewayService:
                 "ts": time.time(),
                 "stream": "lidar_points",
                 "data": {
-                    "point_format": "f32_xyz_zlib",
+                    "point_format": "i16_xyz_zlib",
                     "points_base64": base64.b64encode(compressed).decode("ascii"),
                     "point_count": int(points.shape[0]),
                     "uncompressed_bytes": len(raw),
-                    "bounds_min": mins.tolist(),
-                    "bounds_max": maxs.tolist(),
+                    "quantization_scale": quantization_scale,
+                    "quantization_offset": quantization_offset.tolist(),
+                    "bounds_min": bounds_min.tolist(),
+                    "bounds_max": bounds_max.tolist(),
                     "coordinate_frame": "map",
                 },
             }
@@ -966,9 +995,15 @@ class EdgeGatewayService:
                 "camera_target_fps": self.camera_target_fps,
                 "camera_max_width": self.camera_max_width,
                 "camera_encoded_frames": self.camera_encoded_count,
+                "camera_jpeg_quality": self.camera_jpeg_quality,
                 "audio_emit_every": self.audio_emit_every,
                 "audio_max_bytes": self.audio_max_bytes,
+                "audio_sample_rate": self.args.audio_sample_rate,
                 "audio_queue_depth": self.media_queue.qsize(),
+                "lidar_media_hz": self.lidar_media_hz,
+                "lidar_uplink_max_points": self.lidar_uplink_max_points,
+                "lidar_compression_level": self.lidar_compression_level,
+                "lidar_quantization_cm": self.lidar_quantization_cm,
             },
             "temperatures": {
                 "ntc1": low.get("temperature_ntc1"),
@@ -1195,6 +1230,35 @@ class EdgeGatewayService:
         if cmd_type == "set_lidar":
             enabled = bool(payload.get("enabled", True))
             subscribe = bool(payload.get("subscribe", True))
+
+            if "media_hz" in payload:
+                media_hz = float(payload.get("media_hz", self.lidar_media_hz))
+                if media_hz < 0.2 or media_hz > 15:
+                    raise ValueError("media_hz must be between 0.2 and 15")
+                self.lidar_media_hz = media_hz
+
+            if "max_points" in payload:
+                max_points = int(payload.get("max_points", self.lidar_uplink_max_points))
+                if max_points < 500 or max_points > 100000:
+                    raise ValueError("max_points must be between 500 and 100000")
+                self.lidar_uplink_max_points = max_points
+
+            if "compression_level" in payload:
+                compression_level = int(
+                    payload.get("compression_level", self.lidar_compression_level)
+                )
+                if compression_level < 0 or compression_level > 9:
+                    raise ValueError("compression_level must be between 0 and 9")
+                self.lidar_compression_level = compression_level
+
+            if "quantization_cm" in payload:
+                quantization_cm = float(
+                    payload.get("quantization_cm", self.lidar_quantization_cm)
+                )
+                if quantization_cm < 0.1 or quantization_cm > 50:
+                    raise ValueError("quantization_cm must be between 0.1 and 50")
+                self.lidar_quantization_cm = quantization_cm
+
             await self._set_lidar(enabled)
             if enabled and subscribe:
                 with contextlib.suppress(Exception):
@@ -1205,6 +1269,10 @@ class EdgeGatewayService:
                 "executed": "set_lidar",
                 "lidar_enabled": self.lidar_enabled,
                 "subscribe": subscribe,
+                "media_hz": self.lidar_media_hz,
+                "max_points": self.lidar_uplink_max_points,
+                "compression_level": self.lidar_compression_level,
+                "quantization_cm": self.lidar_quantization_cm,
             }
 
         if cmd_type == "set_lidar_decoder":
@@ -1650,16 +1718,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-ms-per-degree", type=float, default=15.0)
 
     parser.add_argument("--camera-emit-every", type=int, default=1)
-    parser.add_argument("--camera-jpeg-quality", type=int, default=45)
-    parser.add_argument("--camera-target-fps", type=float, default=15.0)
-    parser.add_argument("--camera-max-width", type=int, default=960)
+    parser.add_argument("--camera-jpeg-quality", type=int, default=32)
+    parser.add_argument("--camera-target-fps", type=float, default=6.0)
+    parser.add_argument("--camera-max-width", type=int, default=480)
 
     parser.add_argument("--audio-emit-every", type=int, default=2)
     parser.add_argument("--audio-max-bytes", type=int, default=24576)
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=16000,
+        choices=[8000, 12000, 16000, 24000, 48000],
+    )
 
-    parser.add_argument("--lidar-media-hz", type=float, default=5.0)
-    parser.add_argument("--lidar-uplink-max-points", type=int, default=30000)
-    parser.add_argument("--lidar-compression-level", type=int, default=1)
+    parser.add_argument("--lidar-media-hz", type=float, default=1.5)
+    parser.add_argument("--lidar-uplink-max-points", type=int, default=4000)
+    parser.add_argument("--lidar-compression-level", type=int, default=6)
+    parser.add_argument(
+        "--lidar-quantization-cm",
+        type=float,
+        default=2.0,
+        help="LiDAR coordinate precision in centimeters before zlib compression.",
+    )
 
     parser.add_argument(
         "--media-ws-url",
@@ -1765,6 +1845,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.lidar_compression_level < 0 or args.lidar_compression_level > 9:
         parser.error("--lidar-compression-level must be between 0 and 9")
+
+    if args.lidar_quantization_cm < 0.1 or args.lidar_quantization_cm > 50:
+        parser.error("--lidar-quantization-cm must be between 0.1 and 50")
 
     if args.mqtt_port <= 0 or args.mqtt_port > 65535:
         parser.error("--mqtt-port must be between 1 and 65535")

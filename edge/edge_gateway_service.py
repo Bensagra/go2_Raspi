@@ -668,7 +668,7 @@ class EdgeGatewayService:
 
         target_bytes = 0
         if self.media_max_kbps > 0:
-            camera_bytes_per_second = self.media_max_kbps * 125.0 * 0.78
+            camera_bytes_per_second = self.media_max_kbps * 125.0 * 0.65
             target_bytes = int(
                 camera_bytes_per_second / max(self.camera_target_fps, 1.0)
             )
@@ -1275,8 +1275,8 @@ class EdgeGatewayService:
 
             if "target_fps" in payload:
                 target_fps = float(payload.get("target_fps", self.camera_target_fps))
-                if target_fps < 1 or target_fps > 30:
-                    raise ValueError("target_fps must be between 1 and 30")
+                if target_fps < 1 or target_fps > 40:
+                    raise ValueError("target_fps must be between 1 and 40")
                 self.camera_target_fps = target_fps
 
             if "max_width" in payload:
@@ -1848,9 +1848,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--camera-emit-every", type=int, default=1)
     parser.add_argument("--camera-format", choices=["jpg", "webp"], default="webp")
-    parser.add_argument("--camera-jpeg-quality", type=int, default=60)
-    parser.add_argument("--camera-min-quality", type=int, default=38)
-    parser.add_argument("--camera-target-fps", type=float, default=6.0)
+    parser.add_argument("--camera-jpeg-quality", type=int, default=55)
+    parser.add_argument("--camera-min-quality", type=int, default=34)
+    parser.add_argument("--camera-target-fps", type=float, default=12.0)
     parser.add_argument("--camera-max-width", type=int, default=640)
 
     parser.add_argument("--audio-emit-every", type=int, default=2)
@@ -1862,8 +1862,8 @@ def parse_args() -> argparse.Namespace:
         choices=[8000, 12000, 16000, 24000, 48000],
     )
 
-    parser.add_argument("--lidar-media-hz", type=float, default=1.0)
-    parser.add_argument("--lidar-uplink-max-points", type=int, default=3000)
+    parser.add_argument("--lidar-media-hz", type=float, default=0.7)
+    parser.add_argument("--lidar-uplink-max-points", type=int, default=2500)
     parser.add_argument("--lidar-compression-level", type=int, default=6)
     parser.add_argument(
         "--lidar-quantization-cm",
@@ -1883,7 +1883,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--media-max-kbps",
         type=int,
-        default=1600,
+        default=2200,
         help="Total media uplink budget. Frames are dropped instead of queued; 0 disables the cap.",
     )
     parser.add_argument("--media-ws-reconnect-s", type=float, default=2.0)
@@ -1911,8 +1911,8 @@ def parse_args() -> argparse.Namespace:
     if args.camera_min_quality < 1 or args.camera_min_quality > args.camera_jpeg_quality:
         parser.error("--camera-min-quality must be between 1 and --camera-jpeg-quality")
 
-    if args.camera_target_fps < 1 or args.camera_target_fps > 30:
-        parser.error("--camera-target-fps must be between 1 and 30")
+    if args.camera_target_fps < 1 or args.camera_target_fps > 40:
+        parser.error("--camera-target-fps must be between 1 and 40")
 
     if args.camera_max_width < 0 or (0 < args.camera_max_width < 320):
         parser.error("--camera-max-width must be 0 or >= 320")

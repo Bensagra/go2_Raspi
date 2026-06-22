@@ -97,13 +97,14 @@ python edge/edge_gateway_service.py \
 
 Los valores por defecto están preparados para una red débil:
 
-- Cámara: WebP, 640 px, 6 FPS y calidad objetivo 60% con ajuste automático por cuadro.
-- LiDAR: 1 actualización/s, hasta 3000 puntos, cuantización de 2 cm y zlib nivel 6.
+- Cámara: WebP, 640 px, 12 FPS y calidad objetivo 55% con ajuste automático por cuadro.
+- LiDAR: 0.7 actualizaciones/s, hasta 2500 puntos, cuantización de 2 cm y zlib nivel 6.
 - Audio: 16 kHz en el edge y apagado por defecto en el dashboard.
-- Uplink de media: techo de 1600 kbps; al superarlo se descartan frames viejos en vez de acumular latencia.
+- Uplink de media: techo de 2200 kbps; al superarlo se descartan frames viejos en vez de acumular latencia.
 
 El dashboard ofrece perfiles `Débil`, `Balanceada` y `Alta calidad`. Para priorizar la respuesta de
 los comandos y evitar tener que apagar la cámara, dejar seleccionado `Débil`.
+El perfil `Alta calidad` solicita hasta 40 FPS (limitado por los FPS que entregue físicamente el Go2).
 
 ### 4) Frontend
 

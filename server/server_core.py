@@ -1282,7 +1282,7 @@ class CoreRuntime:
                 output["min_quality"] = min(output["min_quality"], requested_quality)
 
             if "target_fps" in output:
-                output["target_fps"] = clamp(float(output["target_fps"]), 1, 30)
+                output["target_fps"] = clamp(float(output["target_fps"]), 1, 40)
 
             if "max_width" in output:
                 max_width = int(output["max_width"])

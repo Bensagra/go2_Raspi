@@ -412,10 +412,10 @@
         </select>
 
         <label>Cam FPS</label>
-        <input id="cameraFps" class="small" type="number" min="1" max="30" value="6">
+        <input id="cameraFps" class="small" type="number" min="1" max="40" value="12">
 
         <label>Calidad %</label>
-        <input id="cameraQuality" class="small" type="number" min="25" max="90" value="60">
+        <input id="cameraQuality" class="small" type="number" min="25" max="90" value="55">
 
         <label>Cam ancho</label>
         <input id="cameraWidth" style="width:100px" type="number" min="320" max="1920" value="640">
@@ -528,40 +528,40 @@
     const STRAFE_RIGHT_KEYS = ["KeyE", "KeyC"];
     const NETWORK_PROFILES = Object.freeze({
       weak: Object.freeze({
-        cameraFps: 6,
-        cameraFormat: "webp",
-        cameraQuality: 60,
-        cameraMinQuality: 38,
-        cameraWidth: 640,
-        lidarHz: 1,
-        lidarMaxPoints: 3000,
-        lidarCompression: 6,
-        lidarQuantizationCm: 2.0,
-        uplinkMaxKbps: 1600,
-      }),
-      balanced: Object.freeze({
-        cameraFps: 8,
-        cameraFormat: "webp",
-        cameraQuality: 65,
-        cameraMinQuality: 42,
-        cameraWidth: 960,
-        lidarHz: 3,
-        lidarMaxPoints: 10000,
-        lidarCompression: 5,
-        lidarQuantizationCm: 1.0,
-        uplinkMaxKbps: 3500,
-      }),
-      quality: Object.freeze({
         cameraFps: 12,
         cameraFormat: "webp",
-        cameraQuality: 72,
-        cameraMinQuality: 50,
+        cameraQuality: 55,
+        cameraMinQuality: 34,
+        cameraWidth: 640,
+        lidarHz: 0.7,
+        lidarMaxPoints: 2500,
+        lidarCompression: 6,
+        lidarQuantizationCm: 2.0,
+        uplinkMaxKbps: 2200,
+      }),
+      balanced: Object.freeze({
+        cameraFps: 15,
+        cameraFormat: "webp",
+        cameraQuality: 62,
+        cameraMinQuality: 38,
+        cameraWidth: 960,
+        lidarHz: 2,
+        lidarMaxPoints: 8000,
+        lidarCompression: 5,
+        lidarQuantizationCm: 1.0,
+        uplinkMaxKbps: 5000,
+      }),
+      quality: Object.freeze({
+        cameraFps: 40,
+        cameraFormat: "webp",
+        cameraQuality: 68,
+        cameraMinQuality: 45,
         cameraWidth: 1280,
         lidarHz: 5,
         lidarMaxPoints: 30000,
         lidarCompression: 3,
         lidarQuantizationCm: 0.5,
-        uplinkMaxKbps: 8000,
+        uplinkMaxKbps: 12000,
       }),
     });
 
@@ -2045,7 +2045,7 @@
       const audioEmitEvery = Math.max(1, Math.min(10, Math.round(parseNum(els.audioEmitEvery.value, 2))));
       const audioMaxBytes = Math.max(0, Math.round(parseNum(els.audioMaxBytes.value, 24576)));
       const profile = selectedNetworkProfile();
-      const cameraFps = clamp(Math.round(parseNum(els.cameraFps.value, profile.cameraFps)), 1, 30);
+      const cameraFps = clamp(Math.round(parseNum(els.cameraFps.value, profile.cameraFps)), 1, 40);
       const cameraQuality = clamp(Math.round(parseNum(els.cameraQuality.value, profile.cameraQuality)), 25, 90);
       const cameraWidth = clamp(Math.round(parseNum(els.cameraWidth.value, profile.cameraWidth)), 320, 1920);
 

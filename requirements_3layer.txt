@@ -7,3 +7,12 @@ opencv-python>=4.10.0
 av>=11.0.0
 sounddevice>=0.5.2
 unitree-webrtc-connect>=2.0.4
+
+# --- Server perception (optional, GPU box only) --------------------------------
+# Autonomy + mapping run WITHOUT these; person detection and face recognition
+# activate only when they are installed (see Perception.capabilities()).
+# Install on the CUDA server:
+#   pip install ultralytics insightface onnxruntime-gpu
+# ultralytics>=8.3.0          # YOLO person detector (pulls torch)
+# insightface>=0.7.3          # face detection + embeddings (buffalo_l)
+# onnxruntime-gpu>=1.18.0     # insightface CUDA backend (use onnxruntime on CPU)

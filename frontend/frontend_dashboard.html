@@ -372,6 +372,7 @@
             </div>
           </div>
           <div class="row" style="margin-top:6px; flex-wrap:wrap; gap:6px;">
+            <button id="liveLidarColorBtn" type="button">Color: cámara</button>
             <button id="liveLidarResetBtn" type="button">Centrar vista</button>
             <button id="liveLidarFollowBtn" type="button">Seguir robot: ON</button>
             <button id="liveLidarFullscreenBtn" type="button">Pantalla completa</button>
@@ -382,6 +383,21 @@
             <button id="liveLidarImportBtn" type="button">Importar sesión</button>
             <input id="liveLidarImportInput" type="file" accept="application/json" style="display:none">
           </div>
+          <details style="margin-top:6px;">
+            <summary class="hint" style="cursor:pointer;">⚙ Calibrar color de cámara (sin calibración: ajustá a ojo)</summary>
+            <div class="row" style="margin-top:6px; flex-wrap:wrap; gap:8px; align-items:center;">
+              <label class="inline-check"><input id="colorEnable" type="checkbox" checked>Colorizar</label>
+              <label>FOV° <span id="colorFovVal" class="status">150</span></label>
+              <input id="colorFov" class="range" type="range" min="60" max="210" step="1" value="150" style="width:130px;">
+              <label>Pitch° <span id="colorPitchVal" class="status">0</span></label>
+              <input id="colorPitch" class="range" type="range" min="-45" max="45" step="1" value="0" style="width:110px;">
+              <label>Altura m <span id="colorHeightVal" class="status">0.30</span></label>
+              <input id="colorHeight" class="range" type="range" min="-0.5" max="1.5" step="0.05" value="0.30" style="width:110px;">
+              <label>Adelante m <span id="colorForwardVal" class="status">0.25</span></label>
+              <input id="colorForward" class="range" type="range" min="-0.5" max="1.5" step="0.05" value="0.25" style="width:110px;">
+              <button id="colorApplyBtn" type="button" class="primary">Aplicar al robot</button>
+            </div>
+          </details>
         </div>
       </div>
 
@@ -478,6 +494,47 @@
       <ul id="events" class="events"></ul>
     </div>
 
+    <div class="panel">
+      <h2 class="title">🤖 Navegación autónoma</h2>
+      <div class="row">
+        <button id="autoStartBtn" type="button" class="primary">▶ Iniciar exploración</button>
+        <button id="autoStopBtn" type="button">⏹ Detener</button>
+        <button id="autoEstopBtn" type="button" style="background:#a11; color:#fff; font-weight:700;">⛔ PARADA EMERGENCIA</button>
+        <span id="autoStatus" class="status">autonomía inactiva</span>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <span id="autoState" class="status">estado: --</span>
+        <span id="autoCoverage" class="status">cobertura: --</span>
+        <span id="autoCaptures" class="status">capturas: 0</span>
+        <span id="autoGoal" class="status">meta: --</span>
+      </div>
+
+      <h2 class="title" style="margin-top:12px;">🛡 Seguridad (anti-choque LiDAR)</h2>
+      <div class="row">
+        <span id="safArmed" class="status">guard: --</span>
+        <span id="safFront" class="status">frente: --</span>
+        <span id="safSides" class="status">L/R/atrás: --</span>
+        <span id="safCliff" class="status">borde: --</span>
+        <span id="safLast" class="status">última intervención: --</span>
+      </div>
+      <p class="hint">
+        El anti-choque corre en el robot (edge) sobre el LiDAR crudo y filtra todo movimiento — manual y autónomo —
+        así nunca choca ni se cae aunque se corte la red. Calibrá el piso con <span class="kbd">--safety-ground-z-m</span>.
+      </p>
+
+      <h2 class="title" style="margin-top:12px;">👤 Caras capturadas</h2>
+      <div class="row">
+        <button id="facesRefreshBtn" type="button">Actualizar</button>
+        <button id="facesPurgeBtn" type="button" style="background:#a11;color:#fff;">Borrar todas (privacidad)</button>
+        <span id="facesCaps" class="status">reconocimiento: --</span>
+      </div>
+      <div id="facesGallery" class="row" style="flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
+      <p class="hint">
+        Reconocimiento facial en el servidor (GPU). Guarda biometría: definí retención con
+        <span class="kbd">--face-retention-days</span> y borrá cuando corresponda.
+      </p>
+    </div>
+
     <div class="panel saved-map-panel">
       <h2 class="title">Biblioteca de mapas 3D · guardada en el servidor</h2>
       <div class="row">
@@ -500,6 +557,29 @@
       <p class="hint">
         “Mapa actual” se guarda automáticamente mientras llegan puntos. “Guardar snapshot” crea una copia fechada que no cambia.
         Los mapas se pueden abrir aunque el robot o el WebSocket estén desconectados.
+      </p>
+    </div>
+
+    <div class="panel saved-map-panel">
+      <h2 class="title">Modelo 3D sólido · reconstruido en el servidor</h2>
+      <div class="row">
+        <button id="loadMeshBtn" type="button" class="primary">Cargar modelo</button>
+        <button id="rebuildMeshBtn" type="button">Reconstruir ahora</button>
+        <button id="resetMeshViewBtn" type="button">Centrar vista</button>
+        <button id="fullscreenMeshBtn" type="button">Pantalla completa</button>
+        <label class="inline-check"><input id="meshAutoLoad" type="checkbox" checked>Auto-cargar al actualizar</label>
+        <span id="meshStatus" class="status">sin modelo cargado</span>
+      </div>
+      <div id="meshShell" class="map3d-shell">
+        <canvas id="meshCanvas" class="map3d-viewer" tabindex="0" aria-label="visor 3D del modelo sólido"></canvas>
+        <div id="meshOverlay" class="map3d-overlay">
+          Arrastrar: rotar · Shift/segundo botón: desplazar · Rueda: zoom
+        </div>
+      </div>
+      <p class="hint">
+        El servidor reconstruye automáticamente en segundo plano una <strong>malla sólida iluminada</strong>
+        (superficie + color de cámara) a partir del mapa acumulado, la guarda y la sirve lista para visualizar.
+        Tarda según el tamaño del mapa; cuando termina podés “Cargar modelo” (o se carga solo si dejás tildado el auto).
       </p>
     </div>
   </div>
@@ -688,6 +768,7 @@
         pose: { x: 0, y: 0, yaw: 0 },
         path: [],                   // [[x, y], ...]
         follow: true,
+        colorMode: "camera",        // "camera" (real RGB) | "height"
         dirty: false,
         bounds: null,
         viewer: {
@@ -715,6 +796,31 @@
           initialized: false,
           failed: false,
         },
+      },
+      // Solid mesh viewer (lit triangles) for the server reconstruction.
+      mesh: {
+        gl: null,
+        program: null,
+        positionBuffer: null,
+        normalBuffer: null,
+        colorBuffer: null,
+        indexBuffer: null,
+        indexCount: 0,
+        uintIndex: false,
+        yaw: -0.75,
+        pitch: 0.5,
+        distance: 12,
+        radius: 8,
+        center: [0, 0, 0],
+        target: [0, 0, 0],
+        dragging: false,
+        dragMode: "orbit",
+        lastX: 0,
+        lastY: 0,
+        renderPending: false,
+        failed: false,
+        loading: false,
+        metadata: null,
       },
       // Client-side 3D session recorder (record/replay/export).
       lidarRec: {
@@ -792,10 +898,21 @@
       liveLidarCanvas: document.getElementById("liveLidarCanvas"),
       liveLidarOverlay: document.getElementById("liveLidarOverlay"),
       liveLidarStats: document.getElementById("liveLidarStats"),
+      liveLidarColorBtn: document.getElementById("liveLidarColorBtn"),
       liveLidarResetBtn: document.getElementById("liveLidarResetBtn"),
       liveLidarFollowBtn: document.getElementById("liveLidarFollowBtn"),
       liveLidarFullscreenBtn: document.getElementById("liveLidarFullscreenBtn"),
       liveLidarClearBtn: document.getElementById("liveLidarClearBtn"),
+      colorEnable: document.getElementById("colorEnable"),
+      colorFov: document.getElementById("colorFov"),
+      colorFovVal: document.getElementById("colorFovVal"),
+      colorPitch: document.getElementById("colorPitch"),
+      colorPitchVal: document.getElementById("colorPitchVal"),
+      colorHeight: document.getElementById("colorHeight"),
+      colorHeightVal: document.getElementById("colorHeightVal"),
+      colorForward: document.getElementById("colorForward"),
+      colorForwardVal: document.getElementById("colorForwardVal"),
+      colorApplyBtn: document.getElementById("colorApplyBtn"),
       liveLidarRecordBtn: document.getElementById("liveLidarRecordBtn"),
       liveLidarReplayBtn: document.getElementById("liveLidarReplayBtn"),
       liveLidarExportBtn: document.getElementById("liveLidarExportBtn"),
@@ -811,6 +928,15 @@
       savedMapShell: document.getElementById("savedMapShell"),
       savedMapCanvas: document.getElementById("savedMapCanvas"),
       savedMapOverlay: document.getElementById("savedMapOverlay"),
+      loadMeshBtn: document.getElementById("loadMeshBtn"),
+      rebuildMeshBtn: document.getElementById("rebuildMeshBtn"),
+      resetMeshViewBtn: document.getElementById("resetMeshViewBtn"),
+      fullscreenMeshBtn: document.getElementById("fullscreenMeshBtn"),
+      meshAutoLoad: document.getElementById("meshAutoLoad"),
+      meshStatus: document.getElementById("meshStatus"),
+      meshShell: document.getElementById("meshShell"),
+      meshCanvas: document.getElementById("meshCanvas"),
+      meshOverlay: document.getElementById("meshOverlay"),
     };
 
     function clamp(value, min, max) {
@@ -1247,16 +1373,10 @@
       }
     }
 
-    async function decodeLidarCloud(header, payload) {
-      const fmt = String(header.fmt || "i16_xyz_zlib");
-      const raw = await inflateZlib(payload);   // Uint8Array
-      const aligned = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
-      if (fmt === "f32_xyz_zlib") {
-        return new Float32Array(aligned);
-      }
-      if (fmt !== "i16_xyz_zlib") throw new Error("formato de nube no soportado");
+    function i16RawToPoints(raw, header) {
       const count = Number(header.count || 0);
       if (raw.byteLength !== count * 6) throw new Error("longitud de nube inválida");
+      const aligned = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
       const i16 = new Int16Array(aligned);
       const scale = Number(header.scale) || 0;
       const off = header.offset || [0, 0, 0];
@@ -1269,10 +1389,39 @@
       return out;
     }
 
+    async function decodeLidarCloud(header, payload) {
+      const fmt = String(header.fmt || "i16_xyz_zlib");
+      if (fmt === "f32_xyz_zlib") {
+        const raw = await inflateZlib(payload);
+        const aligned = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
+        return { points: new Float32Array(aligned), colors: null };
+      }
+      if (fmt === "i16_xyz_zlib") {
+        const raw = await inflateZlib(payload);
+        return { points: i16RawToPoints(raw, header), colors: null };
+      }
+      if (fmt === "i16_xyz_rgb_zlib") {
+        // Layout: u32 geom_len | zlib(int16 xyz) | zlib(uint8 rgba)
+        if (payload.byteLength < 4) throw new Error("nube con color inválida");
+        const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        const geomLen = dv.getUint32(0, true);
+        if (4 + geomLen > payload.byteLength) throw new Error("geom_len inválido");
+        const geomBytes = payload.subarray(4, 4 + geomLen);
+        const colBytes = payload.subarray(4 + geomLen);
+        const points = i16RawToPoints(await inflateZlib(geomBytes), header);
+        const colors = await inflateZlib(colBytes);   // Uint8Array rgba
+        if (colors.byteLength !== Number(header.count || 0) * 4) {
+          throw new Error("color/punto no coinciden");
+        }
+        return { points, colors };
+      }
+      throw new Error("formato de nube no soportado");
+    }
+
     async function handleLidarFrame(header, payload) {
-      let points;
+      let decoded;
       try {
-        points = await decodeLidarCloud(header, payload);
+        decoded = await decodeLidarCloud(header, payload);
       } catch (err) {
         addEvent("lidar_decode_error", normalizeError(err));
         return;
@@ -1283,12 +1432,13 @@
       state.lidarStats.processingMs = parseNum(header.processing_ms, 0);
       const ts = parseNum(header.ts, 0);
       state.netStats.lidarLatencyMs = ts > 0 ? Math.max(0, Date.now() - ts * 1000) : 0;
-      applyLiveLidar(header, points);
-      recordLidarFrame(header, points);
+      applyLiveLidar(header, decoded.points, decoded.colors);
+      recordLidarFrame(header, decoded.points, decoded.colors);
     }
 
     // ----- Live LiDAR voxel map -----
-    function applyLiveLidar(header, points) {
+    // Voxel value layout: [x, y, z, r, g, b, hasColor]
+    function applyLiveLidar(header, points, colors) {
       const live = state.liveLidar;
       const mode = String(header.mode || "delta");
       if (mode === "keyframe") {
@@ -1305,8 +1455,18 @@
         const y = points[i * 3 + 1];
         const z = points[i * 3 + 2];
         const key = Math.round(x * inv) + "," + Math.round(y * inv) + "," + Math.round(z * inv);
-        if (vox.has(key)) vox.delete(key);   // refresh recency (insertion order = LOD)
-        vox.set(key, [x, y, z]);
+        let r = 0, g = 0, b = 0, has = 0;
+        if (colors && colors[i * 4 + 3] !== 0) {
+          r = colors[i * 4]; g = colors[i * 4 + 1]; b = colors[i * 4 + 2]; has = 1;
+        }
+        const existing = vox.get(key);
+        if (existing) {
+          vox.delete(key);                       // refresh recency (insertion order = LOD)
+          if (!has && existing[6]) {             // keep last known color if this obs has none
+            r = existing[3]; g = existing[4]; b = existing[5]; has = 1;
+          }
+        }
+        vox.set(key, [x, y, z, r, g, b, has]);
       }
       while (vox.size > live.maxPoints) {
         vox.delete(vox.keys().next().value);
@@ -1439,12 +1599,19 @@
         i += 1;
       }
       const zSpan = Math.max(max[2] - min[2], 0.001);
+      const useCamera = live.colorMode === "camera";
       i = 0;
       for (const p of live.voxels.values()) {
-        const c = heightColor((p[2] - min[2]) / zSpan);
-        colors[i * 3] = c[0];
-        colors[i * 3 + 1] = c[1];
-        colors[i * 3 + 2] = c[2];
+        if (useCamera && p[6]) {
+          colors[i * 3] = p[3] / 255;
+          colors[i * 3 + 1] = p[4] / 255;
+          colors[i * 3 + 2] = p[5] / 255;
+        } else {
+          const c = heightColor((p[2] - min[2]) / zSpan);
+          colors[i * 3] = c[0];
+          colors[i * 3 + 1] = c[1];
+          colors[i * 3 + 2] = c[2];
+        }
         i += 1;
       }
       v.positionBuffer = replaceGlBuffer(gl, v.positionBuffer, positions);
@@ -1585,6 +1752,36 @@
       requestLiveRender();
     }
 
+    function toggleLiveColorMode() {
+      const live = state.liveLidar;
+      live.colorMode = live.colorMode === "camera" ? "height" : "camera";
+      els.liveLidarColorBtn.textContent = "Color: " + (live.colorMode === "camera" ? "cámara" : "altura");
+      live.dirty = true;
+      requestLiveRender();
+    }
+
+    function refreshColorLabels() {
+      els.colorFovVal.textContent = els.colorFov.value;
+      els.colorPitchVal.textContent = els.colorPitch.value;
+      els.colorHeightVal.textContent = Number(els.colorHeight.value).toFixed(2);
+      els.colorForwardVal.textContent = Number(els.colorForward.value).toFixed(2);
+    }
+
+    async function applyColorSettings() {
+      refreshColorLabels();
+      if (!state.connected) {
+        addEvent("color_config", "Conectate antes de aplicar el color");
+        return;
+      }
+      await sendCommand("set_color", {
+        enabled: !!els.colorEnable.checked,
+        fov_deg: parseNum(els.colorFov.value, 150),
+        pitch_deg: parseNum(els.colorPitch.value, 0),
+        height_m: parseNum(els.colorHeight.value, 0.30),
+        forward_m: parseNum(els.colorForward.value, 0.25),
+      });
+    }
+
     function toggleLiveFullscreen() {
       const enabled = !els.liveLidarShell.classList.contains("fullscreen");
       els.liveLidarShell.classList.toggle("fullscreen", enabled);
@@ -1672,13 +1869,14 @@
       els.liveLidarExportBtn.disabled = !hasFrames;
     }
 
-    function recordLidarFrame(header, points) {
+    function recordLidarFrame(header, points, colors) {
       const rec = state.lidarRec;
       if (!rec.recording) return;
       rec.frames.push({
         t: Date.now() - rec.startedAt,
         mode: String(header.mode || "delta"),
         points: points.slice(0),
+        colors: colors ? colors.slice(0) : null,
         pose: { ...state.liveLidar.pose },
         path: header.mode === "keyframe" && Array.isArray(header.path)
           ? header.path.map((p) => [p[0], p[1]])
@@ -1725,7 +1923,7 @@
         while (idx < rec.frames.length && rec.frames[idx].t <= now) {
           const f = rec.frames[idx];
           idx += 1;
-          applyLiveLidar({ mode: f.mode, pose: f.pose, path: f.path }, f.points);
+          applyLiveLidar({ mode: f.mode, pose: f.pose, path: f.path }, f.points, f.colors);
         }
         if (idx >= rec.frames.length) { stopReplay(); return; }
         rec.playTimer = setTimeout(step, 30);
@@ -1744,6 +1942,7 @@
         frames: rec.frames.map((f) => ({
           t: f.t, mode: f.mode, pose: f.pose, path: f.path,
           points: Array.from(f.points),
+          colors: f.colors ? Array.from(f.colors) : null,
         })),
       };
       const blob = new Blob([JSON.stringify(out)], { type: "application/json" });
@@ -1765,6 +1964,7 @@
           pose: f.pose || { x: 0, y: 0, yaw: 0 },
           path: Array.isArray(f.path) ? f.path : null,
           points: Float32Array.from(f.points || []),
+          colors: Array.isArray(f.colors) ? Uint8Array.from(f.colors) : null,
         }));
         state.lidarRec.recording = false;
         updateRecorderUi();
@@ -1772,6 +1972,326 @@
         playRecording();
       } catch (err) {
         setBadge(els.liveLidarStats, normalizeError(err), "err");
+      }
+    }
+
+    // ============================================================
+    // Solid mesh viewer (server reconstruction, lit triangles)
+    // ============================================================
+    const MESH_VERTEX_SHADER = `
+      attribute vec3 aPosition;
+      attribute vec3 aNormal;
+      attribute vec3 aColor;
+      uniform mat4 uMvp;
+      varying vec3 vNormal;
+      varying vec3 vColor;
+      void main() {
+        gl_Position = uMvp * vec4(aPosition, 1.0);
+        vNormal = aNormal;
+        vColor = aColor;
+      }
+    `;
+    const MESH_FRAGMENT_SHADER = `
+      precision mediump float;
+      varying vec3 vNormal;
+      varying vec3 vColor;
+      uniform vec3 uLightDir;
+      void main() {
+        vec3 n = normalize(vNormal);
+        float d = abs(dot(n, normalize(uLightDir)));
+        float light = 0.4 + 0.6 * d;     // ambient + diffuse, two-sided
+        gl_FragColor = vec4(vColor * light, 1.0);
+      }
+    `;
+
+    function initMeshViewer() {
+      const m = state.mesh;
+      if (m.gl) return m.gl;
+      if (m.failed) return null;
+      let gl = null;
+      try {
+        gl = els.meshCanvas.getContext("webgl", {
+          antialias: true, alpha: false, depth: true, powerPreference: "high-performance",
+        });
+      } catch (e) { gl = null; }
+      if (!gl) {
+        m.failed = true;
+        setBadge(els.meshStatus, "WebGL no disponible en este navegador", "err");
+        return null;
+      }
+      m.uintIndex = !!gl.getExtension("OES_element_index_uint");
+      try {
+        const vs = compileMapShader(gl, gl.VERTEX_SHADER, MESH_VERTEX_SHADER);
+        const fs = compileMapShader(gl, gl.FRAGMENT_SHADER, MESH_FRAGMENT_SHADER);
+        const program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          throw new Error(gl.getProgramInfoLog(program) || "no se pudo iniciar el visor 3D");
+        }
+        m.gl = gl;
+        m.program = program;
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.clearColor(0.02, 0.04, 0.06, 1.0);
+      } catch (err) {
+        m.failed = true;
+        setBadge(els.meshStatus, normalizeError(err), "err");
+        return null;
+      }
+      return gl;
+    }
+
+    function uploadMesh(positions, normals, colors, indices, vertexCount, faceCount) {
+      const gl = initMeshViewer();
+      if (!gl) return;
+      const m = state.mesh;
+      if (!m.uintIndex) {
+        for (let i = 0; i < indices.length; i += 1) {
+          if (indices[i] > 65535) {
+            setBadge(els.meshStatus, "modelo demasiado grande para este navegador", "err");
+            return;
+          }
+        }
+      }
+      const min = [Infinity, Infinity, Infinity];
+      const max = [-Infinity, -Infinity, -Infinity];
+      for (let i = 0; i < positions.length; i += 3) {
+        for (let a = 0; a < 3; a += 1) {
+          const v = positions[i + a];
+          if (v < min[a]) min[a] = v;
+          if (v > max[a]) max[a] = v;
+        }
+      }
+      m.center = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+      m.radius = Math.max(Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]) / 2, 1);
+
+      m.positionBuffer = replaceGlBuffer(gl, m.positionBuffer, positions);
+      if (m.normalBuffer) gl.deleteBuffer(m.normalBuffer);
+      m.normalBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.normalBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
+      if (m.colorBuffer) gl.deleteBuffer(m.colorBuffer);
+      m.colorBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.colorBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+      if (m.indexBuffer) gl.deleteBuffer(m.indexBuffer);
+      m.indexBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.indexBuffer);
+      const idx = m.uintIndex ? indices : Uint16Array.from(indices);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+      m.indexCount = faceCount * 3;
+      m.indexType = m.uintIndex ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+      resetMeshView();
+    }
+
+    async function loadServerMesh() {
+      const m = state.mesh;
+      if (m.loading) return;
+      try {
+        syncMapApiInputs();
+      } catch (err) {
+        setBadge(els.meshStatus, normalizeError(err), "err");
+        return;
+      }
+      m.loading = true;
+      try {
+        setBadge(els.meshStatus, "descargando modelo…", "warn");
+        const res = await fetchOrThrow(
+          api(`/api/meshes/${encodeURIComponent(state.robotId)}/latest`),
+          { headers: { "Authorization": "Bearer " + state.token } },
+          120000
+        );
+        const raw = await inflateZlib(new Uint8Array(await res.arrayBuffer()));
+        if (raw.byteLength < 12 || raw[0] !== 77 || raw[1] !== 83 || raw[2] !== 72 || raw[3] !== 49) {
+          throw new Error("modelo con formato inválido");
+        }
+        const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+        const V = dv.getUint32(4, true);
+        const F = dv.getUint32(8, true);
+        const ab = raw.buffer;
+        let off = raw.byteOffset + 12;
+        const positions = new Float32Array(ab.slice(off, off + V * 12)); off += V * 12;
+        const normals = new Int8Array(ab.slice(off, off + V * 3)); off += V * 3;
+        const colors = new Uint8Array(ab.slice(off, off + V * 3)); off += V * 3;
+        const indices = new Uint32Array(ab.slice(off, off + F * 12)); off += F * 12;
+        uploadMesh(positions, normals, colors, indices, V, F);
+        setBadge(
+          els.meshStatus,
+          `modelo cargado · ${V.toLocaleString()} vértices · ${F.toLocaleString()} caras`,
+          "ok"
+        );
+      } catch (err) {
+        const msg = String(err);
+        if (msg.includes("404") || /not found/i.test(msg)) {
+          setBadge(els.meshStatus, "todavía no hay modelo (esperá la reconstrucción)", "warn");
+        } else {
+          setBadge(els.meshStatus, normalizeError(err), "err");
+        }
+      } finally {
+        m.loading = false;
+      }
+    }
+
+    async function rebuildMeshNow() {
+      try {
+        syncMapApiInputs();
+        setBadge(els.meshStatus, "reconstruyendo en el servidor…", "warn");
+        const res = await fetchOrThrow(
+          api(`/api/meshes/${encodeURIComponent(state.robotId)}/rebuild`),
+          { method: "POST", headers: { "Authorization": "Bearer " + state.token } },
+          180000
+        );
+        const payload = await res.json();
+        if (!payload.ok) {
+          setBadge(els.meshStatus, payload.reason || "no se pudo reconstruir todavía", "warn");
+          return;
+        }
+        await loadServerMesh();
+      } catch (err) {
+        setBadge(els.meshStatus, normalizeError(err), "err");
+      }
+    }
+
+    function bindMeshAttrib(gl, program, name, buffer, size, type, normalized) {
+      const loc = gl.getAttribLocation(program, name);
+      if (loc < 0) return;
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, size, type, normalized, 0, 0);
+    }
+
+    function resizeMeshCanvas(gl) {
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const c = els.meshCanvas;
+      const width = Math.max(1, Math.floor(c.clientWidth * ratio));
+      const height = Math.max(1, Math.floor(c.clientHeight * ratio));
+      if (c.width !== width || c.height !== height) {
+        c.width = width;
+        c.height = height;
+      }
+      gl.viewport(0, 0, width, height);
+      return { width, height, ratio };
+    }
+
+    function renderMeshViewer() {
+      const m = state.mesh;
+      m.renderPending = false;
+      if (!m.gl || !m.program) return;
+      const gl = m.gl;
+      const size = resizeMeshCanvas(gl);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      if (!m.indexCount) return;
+      gl.useProgram(m.program);
+      const horizontal = Math.cos(m.pitch) * m.distance;
+      const eye = [
+        m.target[0] + Math.cos(m.yaw) * horizontal,
+        m.target[1] + Math.sin(m.yaw) * horizontal,
+        m.target[2] + Math.sin(m.pitch) * m.distance,
+      ];
+      const proj = mat4Perspective(
+        Math.PI / 4, size.width / size.height,
+        Math.max(0.02, m.radius / 200), Math.max(100, m.radius * 40)
+      );
+      const view = mat4LookAt(eye, m.target, [0, 0, 1]);
+      const mvp = mat4Multiply(proj, view);
+      gl.uniformMatrix4fv(gl.getUniformLocation(m.program, "uMvp"), false, mvp);
+      gl.uniform3f(gl.getUniformLocation(m.program, "uLightDir"), 0.4, 0.5, 0.9);
+      bindMeshAttrib(gl, m.program, "aPosition", m.positionBuffer, 3, gl.FLOAT, false);
+      bindMeshAttrib(gl, m.program, "aNormal", m.normalBuffer, 3, gl.BYTE, true);
+      bindMeshAttrib(gl, m.program, "aColor", m.colorBuffer, 3, gl.UNSIGNED_BYTE, true);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.indexBuffer);
+      gl.drawElements(gl.TRIANGLES, m.indexCount, m.indexType, 0);
+    }
+
+    function requestMeshRender() {
+      const m = state.mesh;
+      if (!m.gl && !initMeshViewer()) return;
+      if (m.renderPending) return;
+      m.renderPending = true;
+      requestAnimationFrame(renderMeshViewer);
+    }
+
+    function resetMeshView() {
+      const m = state.mesh;
+      m.yaw = -0.75;
+      m.pitch = 0.5;
+      m.distance = Math.max(m.radius * 2.4, 4);
+      m.target = [m.center[0], m.center[1], m.center[2]];
+      requestMeshRender();
+    }
+
+    function toggleMeshFullscreen() {
+      const enabled = !els.meshShell.classList.contains("fullscreen");
+      els.meshShell.classList.toggle("fullscreen", enabled);
+      els.fullscreenMeshBtn.textContent = enabled ? "Salir de pantalla completa" : "Pantalla completa";
+      document.body.style.overflow = enabled ? "hidden" : "";
+      requestMeshRender();
+    }
+
+    function setupMeshInteraction() {
+      const canvas = els.meshCanvas;
+      canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+      canvas.addEventListener("pointerdown", (event) => {
+        const m = state.mesh;
+        m.dragging = true;
+        m.dragMode = event.button === 2 || event.shiftKey ? "pan" : "orbit";
+        m.lastX = event.clientX;
+        m.lastY = event.clientY;
+        canvas.setPointerCapture(event.pointerId);
+        canvas.style.cursor = "grabbing";
+      });
+      canvas.addEventListener("pointermove", (event) => {
+        const m = state.mesh;
+        if (!m.dragging) return;
+        const dx = event.clientX - m.lastX;
+        const dy = event.clientY - m.lastY;
+        m.lastX = event.clientX;
+        m.lastY = event.clientY;
+        if (m.dragMode === "orbit") {
+          m.yaw -= dx * 0.008;
+          m.pitch = clamp(m.pitch - dy * 0.008, -1.42, 1.42);
+        } else {
+          const scale = m.distance * 0.0018;
+          const right = [-Math.sin(m.yaw), Math.cos(m.yaw), 0];
+          const up = [
+            -Math.cos(m.yaw) * Math.sin(m.pitch),
+            -Math.sin(m.yaw) * Math.sin(m.pitch),
+            Math.cos(m.pitch),
+          ];
+          for (let axis = 0; axis < 3; axis += 1) {
+            m.target[axis] += (-dx * right[axis] + dy * up[axis]) * scale;
+          }
+        }
+        requestMeshRender();
+      });
+      const finishDrag = (event) => {
+        const m = state.mesh;
+        m.dragging = false;
+        canvas.style.cursor = "grab";
+        if (canvas.hasPointerCapture(event.pointerId)) {
+          canvas.releasePointerCapture(event.pointerId);
+        }
+      };
+      canvas.addEventListener("pointerup", finishDrag);
+      canvas.addEventListener("pointercancel", finishDrag);
+      canvas.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        const m = state.mesh;
+        m.distance = clamp(
+          m.distance * Math.exp(event.deltaY * 0.001),
+          Math.max(m.radius * 0.05, 0.15),
+          Math.max(m.radius * 30, 30)
+        );
+        requestMeshRender();
+      }, { passive: false });
+      if (typeof ResizeObserver === "function") {
+        new ResizeObserver(requestMeshRender).observe(els.meshShell);
+      } else {
+        window.addEventListener("resize", requestMeshRender);
       }
     }
 
@@ -2645,6 +3165,157 @@
       return true;
     }
 
+    // ----------------------------------------------------- autonomy + safety UI
+    function autoEl(id) { return document.getElementById(id); }
+
+    function fmtM(v) { return (v === null || v === undefined) ? "∞" : (Number(v).toFixed(2) + "m"); }
+
+    function updateSafetyReadout(t) {
+      const saf = (t && t.safety) || {};
+      const armed = saf.armed;
+      const armedEl = autoEl("safArmed");
+      if (armedEl) {
+        armedEl.textContent = "guard: " + (saf.enabled ? (armed ? "ARMADO" : "sin LiDAR") : "OFF");
+        armedEl.className = "status " + (armed ? "ok" : (saf.enabled ? "warn" : "err"));
+      }
+      const sectors = saf.sectors_m || {};
+      const fEl = autoEl("safFront");
+      if (fEl) {
+        fEl.textContent = "frente: " + fmtM(sectors.front);
+        fEl.className = "status " + (sectors.front !== null && sectors.front !== undefined && sectors.front < 0.5 ? "err" : "");
+      }
+      const sEl = autoEl("safSides");
+      if (sEl) sEl.textContent = "L/R/atrás: " + fmtM(sectors.left) + " / " + fmtM(sectors.right) + " / " + fmtM(sectors.back);
+      const cEl = autoEl("safCliff");
+      if (cEl) { cEl.textContent = "borde: " + (saf.cliff ? "⚠ DETECTADO" : "ok"); cEl.className = "status " + (saf.cliff ? "err" : "ok"); }
+      const lEl = autoEl("safLast");
+      if (lEl) {
+        const li = saf.last_intervention || {};
+        lEl.textContent = "última intervención: " + (li.blocked ? (li.reasons || []).join(",") : "ninguna");
+      }
+      const aut = (t && t.autonomy) || {};
+      const aEl = autoEl("autoState");
+      if (aEl && !state.autoStateFromEvent) aEl.textContent = "estado: " + (aut.enabled ? (aut.driving ? "conduciendo" : "activa") : "manual");
+    }
+
+    function handleAutonomyMessage(msg) {
+      const ev = msg.event;
+      const d = msg.data || {};
+      if (ev === "autonomy_state") {
+        state.autoStateFromEvent = true;
+        if (d.state) autoEl("autoState").textContent = "estado: " + d.state;
+        if (d.plan) {
+          const p = d.plan;
+          if (p.coverage !== undefined && p.coverage !== null) autoEl("autoCoverage").textContent = "cobertura: " + Math.round(p.coverage * 100) + "%";
+          if (p.goal_xy) autoEl("autoGoal").textContent = "meta: " + p.goal_xy.map(v => v.toFixed(1)).join(", ");
+        }
+        if (d.captures !== undefined) autoEl("autoCaptures").textContent = "capturas: " + d.captures;
+        const stBadge = autoEl("autoStatus");
+        if (stBadge) { stBadge.textContent = "autonomía: " + (d.state || "?"); stBadge.className = "status " + (d.running ? "ok" : ""); }
+      } else if (ev === "autonomy_done") {
+        setBadge(autoEl("autoStatus"), "✅ mapeo completo (" + Math.round((d.coverage || 0) * 100) + "%)", "ok");
+        autoEl("autoState").textContent = "estado: done";
+      } else if (ev === "person_captured") {
+        addEvent("person_captured", `${d.known ? "Conocido" : (d.is_new ? "Nuevo" : "Repetido")}: ${d.label || d.person_id} (q=${d.quality})`);
+        autoEl("autoCaptures").textContent = "capturas: " + (Number(autoEl("autoCaptures").textContent.replace(/\D/g, "")) + 1);
+        loadFacesGallery();
+      } else if (ev === "autonomy_error") {
+        addEvent("autonomy_error", d.error || "error");
+      }
+    }
+
+    async function autonomyAction(action) {
+      try {
+        const res = await fetch(api(`/api/robots/${encodeURIComponent(state.robotId)}/autonomy`), {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + state.token, "Content-Type": "application/json" },
+          body: JSON.stringify({ action }),
+        });
+        const data = await res.json();
+        if (!res.ok) { setBadge(autoEl("autoStatus"), "error: " + (data.detail || res.status), "err"); return; }
+        setBadge(autoEl("autoStatus"), "autonomía: " + (data.state || action), action === "start" ? "ok" : "warn");
+      } catch (e) {
+        setBadge(autoEl("autoStatus"), "error de red", "err");
+      }
+    }
+
+    async function loadFacesGallery() {
+      const gallery = autoEl("facesGallery");
+      if (!gallery || !state.token || !state.robotId) return;
+      try {
+        const res = await fetch(api(`/api/robots/${encodeURIComponent(state.robotId)}/faces`), {
+          headers: { "Authorization": "Bearer " + state.token },
+        });
+        const data = await res.json();
+        const people = data.people || [];
+        gallery.innerHTML = "";
+        if (!people.length) { gallery.innerHTML = '<span class="status">sin caras capturadas</span>'; return; }
+        for (const p of people) {
+          const card = document.createElement("div");
+          card.style.cssText = "width:104px;text-align:center;font-size:11px;";
+          const img = document.createElement("img");
+          img.src = api(`/api/robots/${encodeURIComponent(state.robotId)}/faces/${encodeURIComponent(p.person_id)}/image`) + `?t=${Date.now()}`;
+          img.style.cssText = "width:96px;height:96px;object-fit:cover;border-radius:6px;border:2px solid " + (p.known ? "#2a7" : "#777") + ";";
+          img.onerror = () => { img.style.display = "none"; };
+          const cap = document.createElement("div");
+          cap.textContent = `${p.label || p.person_id} ${p.known ? "✓" : ""} (${p.captures})`;
+          card.appendChild(img); card.appendChild(cap);
+          card.onclick = () => labelPerson(p);
+          gallery.appendChild(card);
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    async function labelPerson(p) {
+      const label = prompt("Nombre para esta persona:", p.label || "");
+      if (label === null) return;
+      const known = confirm("¿Marcar como CONOCIDA? (Cancelar = desconocida)");
+      try {
+        await fetch(api(`/api/robots/${encodeURIComponent(state.robotId)}/faces/${encodeURIComponent(p.person_id)}`), {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + state.token, "Content-Type": "application/json" },
+          body: JSON.stringify({ label, known }),
+        });
+        loadFacesGallery();
+      } catch (e) { /* ignore */ }
+    }
+
+    async function purgeFaces() {
+      if (!confirm("¿Borrar TODAS las caras de este robot? (privacidad, irreversible)")) return;
+      try {
+        await fetch(api(`/api/robots/${encodeURIComponent(state.robotId)}/faces`), {
+          method: "DELETE", headers: { "Authorization": "Bearer " + state.token },
+        });
+        loadFacesGallery();
+      } catch (e) { /* ignore */ }
+    }
+
+    async function loadPerceptionCaps() {
+      try {
+        const res = await fetch(api("/api/perception/capabilities"), {
+          headers: { "Authorization": "Bearer " + state.token },
+        });
+        const d = await res.json();
+        const el = autoEl("facesCaps");
+        if (!el) return;
+        if (!d.enabled) { el.textContent = "percepción: deshabilitada"; return; }
+        const fr = d.face || {};
+        const pd = d.person_detector || {};
+        el.textContent = `personas: ${pd.available ? "ON" : "off"} · caras: ${fr.available ? "ON" : "off"} · reconoce: ${fr.recognition ? "sí" : "no"}`;
+        el.className = "status " + (pd.available && fr.recognition ? "ok" : "warn");
+      } catch (e) { /* ignore */ }
+    }
+
+    function setupAutonomyUI() {
+      const bind = (id, fn) => { const e = autoEl(id); if (e) e.addEventListener("click", fn); };
+      bind("autoStartBtn", () => autonomyAction("start"));
+      bind("autoStopBtn", () => autonomyAction("stop"));
+      bind("autoEstopBtn", () => autonomyAction("estop"));
+      bind("facesRefreshBtn", () => { loadFacesGallery(); loadPerceptionCaps(); });
+      bind("facesPurgeBtn", purgeFaces);
+    }
+    document.addEventListener("DOMContentLoaded", setupAutonomyUI);
+
     function handleWsMessage(msg) {
       const type = msg.type;
 
@@ -2653,6 +3324,13 @@
         const telemetry = msg.data || {};
         els.telemetryBox.textContent = JSON.stringify(telemetry, null, 2);
         updateMeasuredMotion(telemetry);
+        updateSafetyReadout(telemetry);
+        return;
+      }
+
+      if (type === "autonomy") {
+        if (msg.robot_id !== state.robotId) return;
+        handleAutonomyMessage(msg);
         return;
       }
 
@@ -2689,6 +3367,15 @@
           queueAudioPacket(msg.data || {});
           return;
         }
+        return;
+      }
+
+      if (type === "mesh_ready") {
+        if (msg.robot_id !== state.robotId) return;
+        const meta = msg.data || {};
+        const verts = Number(meta.vertex_count || 0).toLocaleString();
+        setBadge(els.meshStatus, `modelo nuevo disponible · ${verts} vértices`, "warn");
+        if (els.meshAutoLoad.checked) void loadServerMesh();
         return;
       }
 
@@ -3246,6 +3933,9 @@
         if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
         await applyMediaSettings();
         void loadSavedMapList();
+        void loadServerMesh();
+        void loadPerceptionCaps();
+        void loadFacesGallery();
       };
 
       ws.onclose = (ev) => {
@@ -3348,7 +4038,18 @@
     els.resetMapViewBtn.addEventListener("click", resetSavedMapView);
     els.fullscreenMapBtn.addEventListener("click", toggleSavedMapFullscreen);
 
+    // Solid mesh viewer controls
+    els.loadMeshBtn.addEventListener("click", loadServerMesh);
+    els.rebuildMeshBtn.addEventListener("click", rebuildMeshNow);
+    els.resetMeshViewBtn.addEventListener("click", resetMeshView);
+    els.fullscreenMeshBtn.addEventListener("click", toggleMeshFullscreen);
+
     // Live LiDAR 3D viewer controls
+    els.liveLidarColorBtn.addEventListener("click", toggleLiveColorMode);
+    for (const slider of [els.colorFov, els.colorPitch, els.colorHeight, els.colorForward]) {
+      slider.addEventListener("input", refreshColorLabels);
+    }
+    els.colorApplyBtn.addEventListener("click", applyColorSettings);
     els.liveLidarResetBtn.addEventListener("click", resetLiveView);
     els.liveLidarFollowBtn.addEventListener("click", toggleLiveFollow);
     els.liveLidarFullscreenBtn.addEventListener("click", toggleLiveFullscreen);
@@ -3499,6 +4200,7 @@
     applyNetworkProfileValues();
     setupSavedMapInteraction();
     setupLiveInteraction();
+    setupMeshInteraction();
     updateRecorderUi();
     updateSpeedUi();
     updateMediaStatus();

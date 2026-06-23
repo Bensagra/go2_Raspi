@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import math
 import time
 import uuid
 import zlib
@@ -42,6 +43,31 @@ def encode_media_frame(header: Dict[str, Any], payload: bytes) -> bytes:
     out[6 + len(header_bytes) :] = payload
     return bytes(out)
 
+
+def encode_cloud_payload(points, colors, quantization_cm: float, compression_level: int):
+    """Quantize Nx3 points to int16+zlib, optionally with per-point RGBA color.
+
+    Returns (payload, fmt, scale, offset, count). Colored layout is
+    `u32 geom_len | zlib(int16 xyz) | zlib(uint8 rgba)` so a single payload
+    carries geometry + color; uncolored is just `zlib(int16 xyz)`."""
+    points = np.ascontiguousarray(points[:, :3], dtype=np.float32)
+    bounds_min = points.min(axis=0)
+    bounds_max = points.max(axis=0)
+    offset = (bounds_min + bounds_max) / 2.0
+    scale = max(quantization_cm / 100.0, 0.001)
+    max_delta = float(np.max(np.abs(points - offset))) if points.size else 0.0
+    if max_delta > 0:
+        scale = max(scale, max_delta / 32760.0)
+    quantized = np.clip(np.rint((points - offset) / scale), -32768, 32767).astype("<i2")
+    geom = zlib.compress(np.ascontiguousarray(quantized).tobytes(), compression_level)
+    count = int(points.shape[0])
+    if colors is None:
+        return geom, "i16_xyz_zlib", float(scale), offset.tolist(), count
+    rgba = np.ascontiguousarray(colors, dtype=np.uint8)
+    col = zlib.compress(rgba.tobytes(), compression_level)
+    payload = len(geom).to_bytes(4, "little") + geom + col
+    return payload, "i16_xyz_rgb_zlib", float(scale), offset.tolist(), count
+
 try:
     from unitree_webrtc_connect import (
         DATA_CHANNEL_TYPE,
@@ -58,6 +84,12 @@ except ImportError:
         WebRTCConnectionMethod,
     )
     from unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection  # type: ignore
+
+
+try:
+    from safety_guard import SafetyGuard
+except ImportError:  # when imported as a package (edge.edge_gateway_service)
+    from edge.safety_guard import SafetyGuard  # type: ignore
 
 
 TOPIC_ALIAS_TO_VALUE = dict(RTC_TOPIC)
@@ -156,6 +188,20 @@ class EdgeGatewayService:
         self.lidar_quantization_cm = args.lidar_quantization_cm
         self.last_lidar_media_at = 0.0
 
+        # Camera colorization: project each LiDAR point onto the live camera frame
+        # (approximate fisheye, no calibration) and sample its RGB. Extrinsics are
+        # tunable live via the set_color command so they can be eyeballed.
+        self.colorize_enabled = args.enable_colorization
+        self.color_cam_fov_deg = args.color_cam_fov_deg
+        self.color_cam_pitch_deg = args.color_cam_pitch_deg
+        self.color_cam_height_m = args.color_cam_height_m
+        self.color_cam_forward_m = args.color_cam_forward_m
+        self.color_max_distance_m = args.color_max_distance_m
+        # "world": LiDAR points are in the odom frame (default, matches the
+        # accumulated map). "body": already robot-relative (skip pose transform).
+        self.color_points_frame = args.color_points_frame
+        self.latest_color_frame = None
+
         self.move_active = False
         self.pending_stop_deadline = 0.0
         self.last_move_command: Dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
@@ -165,6 +211,40 @@ class EdgeGatewayService:
         self.last_speed_profile_reset_attempt = 0.0
 
         self.last_heartbeat_fault_event_at = 0.0
+
+        # Reactive LiDAR safety guard (hard "never collide / never fall" layer).
+        # Runs locally on the raw scan so it survives network loss. It filters
+        # EVERY translation command (manual move and autonomous drive) but only
+        # while it actually has a fresh LiDAR scan (see _guard_velocity).
+        self.safety_enabled = args.enable_safety_guard
+        self.safety_points_frame = args.safety_points_frame
+        self.safety_update_hz = args.safety_update_hz
+        self.last_safety_update_at = 0.0
+        self.safety_guard = SafetyGuard(
+            obstacle_min_height_m=args.safety_obstacle_min_height_m,
+            obstacle_max_height_m=args.safety_obstacle_max_height_m,
+            robot_half_width_m=args.safety_robot_half_width_m,
+            stop_distance_m=args.safety_stop_distance_m,
+            slow_distance_m=args.safety_slow_distance_m,
+            motion_cone_half_deg=args.safety_cone_half_deg,
+            cliff_enabled=args.safety_cliff_enabled,
+            cliff_lookahead_m=args.safety_cliff_lookahead_m,
+            cliff_drop_m=args.safety_cliff_drop_m,
+            ground_z_default_m=args.safety_ground_z_m,
+            max_consider_radius_m=args.safety_max_radius_m,
+            scan_timeout_s=args.safety_scan_timeout_s,
+        )
+        self.last_safety_info: Dict[str, Any] = {}
+        self.last_safety_event_at = 0.0
+
+        # Autonomy: continuous velocity target repeated by the drive loop and
+        # always passed through the safety guard. Enabled by set_autonomy; the
+        # server brain feeds drive_velocity goals.
+        self.autonomy_enabled = False
+        self.drive_target: Optional[Dict[str, float]] = None
+        self.drive_target_set_at = 0.0
+        self.drive_target_ttl_s = args.drive_target_ttl_s
+        self.autonomy_driving = False
 
     def _reset_audio_pipeline(self) -> None:
         self.audio_resampler = AudioResampler(
@@ -338,6 +418,7 @@ class EdgeGatewayService:
         self._mqtt_publish("topic_events", event_payload, qos=0)
 
         if self.lidar_enabled and topic_alias == "ULIDAR_ARRAY":
+            self._update_safety_from_lidar(message)
             await self._maybe_publish_lidar_media(message)
 
     async def _subscribe_topic(self, topic_value: str) -> None:
@@ -613,6 +694,10 @@ class EdgeGatewayService:
                 continue
 
             self.latest_camera_frame = frame
+            # Keep an independent reference for colorization (the encode loop
+            # consumes/nulls latest_camera_frame).
+            if self.colorize_enabled:
+                self.latest_color_frame = frame
             self.camera_frame_ready.set()
 
     async def _camera_encode_loop(self) -> None:
@@ -1129,6 +1214,163 @@ class EdgeGatewayService:
 
         return None
 
+    def _current_camera_pose(self) -> Tuple[float, float, float, float]:
+        """Robot pose (x, y, z, yaw) in the odom/world frame from the sport state."""
+        topic = TOPIC_ALIAS_TO_VALUE.get("LF_SPORT_MOD_STATE", "")
+        msg = self.latest_by_topic.get(topic, {})
+        data = msg.get("data", {}) if isinstance(msg, dict) else {}
+        pos = data.get("position") if isinstance(data, dict) else None
+        imu = data.get("imu_state", {}) if isinstance(data, dict) else {}
+        rpy = imu.get("rpy") if isinstance(imu, dict) else None
+        x = y = z = 0.0
+        yaw = 0.0
+        if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+            x = float(pos[0])
+            y = float(pos[1])
+            if len(pos) >= 3:
+                z = float(pos[2])
+        if isinstance(rpy, (list, tuple)) and len(rpy) >= 3:
+            yaw = float(rpy[2])
+        return x, y, z, yaw
+
+    def _world_points_to_body(self, points: np.ndarray) -> np.ndarray:
+        """Transform odom/world-frame LiDAR points into the robot body frame
+        (x forward, y left, z up relative to the robot) used by the safety guard."""
+        if self.safety_points_frame == "body":
+            return points
+        x, y, z, yaw = self._current_camera_pose()
+        d = points[:, :3] - np.array([x, y, z], dtype=np.float32)
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+        bx = cos_y * d[:, 0] + sin_y * d[:, 1]
+        by = -sin_y * d[:, 0] + cos_y * d[:, 1]
+        bz = d[:, 2]
+        return np.column_stack((bx, by, bz)).astype(np.float32)
+
+    def _update_safety_from_lidar(self, message: Any) -> None:
+        """Feed the reactive safety guard from a raw LiDAR scan, at full sensor
+        rate (throttled to safety_update_hz). Cheap: a single downsampled numpy
+        pass. This is the input to the local collision/cliff guarantee."""
+        if not self.safety_enabled:
+            return
+        now = time.monotonic()
+        if now - self.last_safety_update_at < (1.0 / max(self.safety_update_hz, 0.1)):
+            return
+        self.last_safety_update_at = now
+
+        points = self._extract_lidar_points(message)
+        if points is None:
+            return
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 3:
+            return
+        finite = np.isfinite(points).all(axis=1)
+        points = points[finite][:, :3]
+        if points.shape[0] == 0:
+            return
+        # Downsample for the guard: it only needs the near field at modest density.
+        if points.shape[0] > 2500:
+            step = int(np.ceil(points.shape[0] / 2500))
+            points = points[::step]
+        body = self._world_points_to_body(points)
+        self.safety_guard.update(body, now=now)
+
+    def _guard_velocity(
+        self, vx: float, vy: float, wz: float
+    ) -> Tuple[float, float, float, Dict[str, Any]]:
+        """Pass a requested body velocity through the safety guard. Only enforced
+        while the guard is armed (safety enabled AND LiDAR running, so we actually
+        have a scan); otherwise the request passes through untouched and the
+        diagnostics flag that safety is inactive."""
+        if not self.safety_enabled or not self.lidar_enabled:
+            info = {"active": False, "blocked": False, "reasons": ["safety_inactive"]}
+            self.last_safety_info = info
+            return vx, vy, wz, info
+        result = self.safety_guard.filter_velocity(vx, vy, wz)
+        info = dict(result)
+        info["active"] = True
+        self.last_safety_info = info
+        now = time.monotonic()
+        if result["blocked"] and now - self.last_safety_event_at >= 0.5:
+            self.last_safety_event_at = now
+            self._publish_event(
+                "safety_intervention",
+                {
+                    "requested": {"vx": vx, "vy": vy, "wz": wz},
+                    "applied": {"vx": result["vx"], "vy": result["vy"], "wz": result["wz"]},
+                    "reasons": result["reasons"],
+                    "front_clearance_m": result["front_clearance_m"],
+                    "cliff": result["cliff"],
+                },
+            )
+        return result["vx"], result["vy"], result["wz"], info
+
+    def _colorize_points(self, points: np.ndarray) -> Optional[np.ndarray]:
+        """Project world-frame points onto the latest camera frame (approximate
+        fisheye, no calibration) and sample RGB. Returns uint8 (N,4) RGBA where
+        alpha=255 marks a valid color, 0 means "not seen by the camera"."""
+        frame = self.latest_color_frame
+        if frame is None or points.size == 0:
+            return None
+        try:
+            img = frame.to_ndarray(format="rgb24")
+        except Exception:
+            return None
+        height, width = img.shape[:2]
+        if height < 2 or width < 2:
+            return None
+
+        fov = math.radians(clamp(self.color_cam_fov_deg, 30.0, 220.0))
+        pitch = math.radians(self.color_cam_pitch_deg)
+
+        if self.color_points_frame == "body":
+            # Points already robot-relative (x fwd, y left, z up): only the camera
+            # mount offset matters, no pose transform.
+            d = points[:, :3] - np.array(
+                [self.color_cam_forward_m, 0.0, self.color_cam_height_m],
+                dtype=np.float32,
+            )
+            bx, by, bz = d[:, 0], d[:, 1], d[:, 2]
+        else:
+            x, y, z, yaw = self._current_camera_pose()
+            cam_x = x + self.color_cam_forward_m * math.cos(yaw)
+            cam_y = y + self.color_cam_forward_m * math.sin(yaw)
+            cam_z = z + self.color_cam_height_m
+            d = points[:, :3] - np.array([cam_x, cam_y, cam_z], dtype=np.float32)
+            cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+            bx = cos_y * d[:, 0] + sin_y * d[:, 1]   # body forward
+            by = -sin_y * d[:, 0] + cos_y * d[:, 1]  # body left
+            bz = d[:, 2]                             # body up
+        cos_p, sin_p = math.cos(pitch), math.sin(pitch)
+        forward = bx * cos_p + bz * sin_p
+        up = -bx * sin_p + bz * cos_p
+
+        z_cam = forward          # optical axis
+        x_cam = -by              # right
+        y_cam = -up              # down
+        radial = np.sqrt(x_cam * x_cam + y_cam * y_cam)
+        theta = np.arctan2(radial, z_cam)
+        focal = (min(width, height) / 2.0) / (fov / 2.0)
+        safe_radial = np.where(radial > 1e-6, radial, 1.0)
+        u = width / 2.0 + focal * theta * (x_cam / safe_radial)
+        v = height / 2.0 + focal * theta * (y_cam / safe_radial)
+        ui = np.round(u).astype(np.int64)
+        vi = np.round(v).astype(np.int64)
+        dist = np.linalg.norm(d, axis=1)
+
+        valid = (
+            (z_cam > 0.05)
+            & (theta <= fov / 2.0)
+            & (dist <= self.color_max_distance_m)
+            & (ui >= 0) & (ui < width)
+            & (vi >= 0) & (vi < height)
+        )
+        rgba = np.zeros((points.shape[0], 4), dtype=np.uint8)
+        idx = np.where(valid)[0]
+        if idx.size:
+            rgba[idx, 0:3] = img[vi[idx], ui[idx], :3]
+            rgba[idx, 3] = 255
+        return rgba
+
     async def _maybe_publish_lidar_media(self, payload: Any) -> None:
         now = time.monotonic()
         if now - self.last_lidar_media_at < (1.0 / max(self.lidar_media_hz, 0.01)):
@@ -1160,22 +1402,14 @@ class EdgeGatewayService:
             step = max(int(np.ceil(points.shape[0] / max_points)), 1)
             points = points[::step][:max_points]
 
-        quantization_scale = max(self.lidar_quantization_cm / 100.0, 0.001)
-        bounds_min = points.min(axis=0)
-        bounds_max = points.max(axis=0)
-        quantization_offset = (bounds_min + bounds_max) / 2.0
-        max_delta = float(np.max(np.abs(points - quantization_offset)))
-        if max_delta > 0:
-            quantization_scale = max(quantization_scale, max_delta / 32760.0)
+        # Sample camera color for each point (approximate fisheye projection).
+        colors = self._colorize_points(points) if self.colorize_enabled else None
 
-        quantized = np.rint(
-            (points - quantization_offset) / quantization_scale
-        )
-        quantized = np.clip(quantized, -32768, 32767).astype("<i2")
-        raw = np.ascontiguousarray(quantized).tobytes()
-        compressed = await asyncio.to_thread(
-            zlib.compress,
-            raw,
+        payload, fmt, scale, offset, count = await asyncio.to_thread(
+            encode_cloud_payload,
+            points,
+            colors,
+            self.lidar_quantization_cm,
             self.lidar_compression_level,
         )
 
@@ -1185,15 +1419,14 @@ class EdgeGatewayService:
                 "binary": True,
                 "header": {
                     "stream": "lidar",
-                    "fmt": "i16_xyz_zlib",
-                    "count": int(points.shape[0]),
-                    "uncompressed_bytes": len(raw),
-                    "scale": float(quantization_scale),
-                    "offset": quantization_offset.tolist(),
+                    "fmt": fmt,
+                    "count": count,
+                    "scale": scale,
+                    "offset": offset,
                     "coordinate_frame": "map",
                     "ts": time.time(),
                 },
-                "payload": compressed,
+                "payload": payload,
             }
         )
 
@@ -1279,6 +1512,14 @@ class EdgeGatewayService:
         if heartbeat_age > self.args.heartbeat_timeout_s:
             alerts.append("control_heartbeat_timeout")
 
+        safety_status = self.safety_guard.status() if self.safety_enabled else {}
+        safety_armed = self.safety_enabled and self.lidar_enabled
+        if safety_armed and safety_status.get("cliff"):
+            alerts.append("cliff_front")
+        last_reasons = self.last_safety_info.get("reasons", []) if isinstance(self.last_safety_info, dict) else []
+        if safety_armed and ("obstacle_front" in last_reasons or "cliff_front" in last_reasons):
+            alerts.append("obstacle_front")
+
         return {
             "robot_id": self.args.robot_id,
             "ts": time.time(),
@@ -1336,6 +1577,20 @@ class EdgeGatewayService:
                 "bms_bq_ntc": low.get("bms_bq_ntc"),
                 "bms_mcu_ntc": low.get("bms_mcu_ntc"),
             },
+            "safety": {
+                "enabled": self.safety_enabled,
+                "armed": safety_armed,
+                **safety_status,
+                "last_intervention": {
+                    "blocked": bool(self.last_safety_info.get("blocked")),
+                    "reasons": last_reasons,
+                } if self.last_safety_info else {},
+            },
+            "autonomy": {
+                "enabled": self.autonomy_enabled,
+                "driving": self.autonomy_driving,
+                "has_target": self.drive_target is not None,
+            },
             "alerts": alerts,
         }
 
@@ -1357,11 +1612,16 @@ class EdgeGatewayService:
             "enter_mode",
             "follow_target",
             "go_to",
+            "drive_velocity",
+            "set_autonomy",
+            "e_stop",
+            "set_safety",
             "set_video",
             "set_camera_stream",
             "set_audio",
             "set_lidar",
             "set_lidar_decoder",
+            "set_color",
             "set_speed_profile",
         }:
             return False, f"unsupported command type: {cmd_type}"
@@ -1379,7 +1639,7 @@ class EdgeGatewayService:
             else "normal"
         )
         requires_live_heartbeat = (
-            cmd_type in {"move", "turn", "enter_mode", "follow_target", "go_to"}
+            cmd_type in {"move", "turn", "enter_mode", "follow_target", "go_to", "drive_velocity"}
             or (cmd_type == "set_speed_profile" and requested_profile == "max_api")
         )
         if requires_live_heartbeat and heartbeat_age > self.args.heartbeat_timeout_s:
@@ -1419,6 +1679,10 @@ class EdgeGatewayService:
             )
             duration_ms = int(payload.get("duration_ms", self.args.default_move_duration_ms))
 
+            # Reactive safety: clamp/veto translation that would hit an obstacle
+            # or run off a ledge. Rotation is preserved.
+            x, y, z, safety_info = self._guard_velocity(x, y, z)
+
             self.move_active = True
             self.last_move_command = {"x": x, "y": y, "z": z}
             self.last_move_sent_at = time.monotonic()
@@ -1433,6 +1697,7 @@ class EdgeGatewayService:
                 "y": y,
                 "z": z,
                 "duration_ms": duration_ms,
+                "safety": safety_info,
             }
 
         if cmd_type == "turn":
@@ -1647,6 +1912,29 @@ class EdgeGatewayService:
                 "quantization_cm": self.lidar_quantization_cm,
             }
 
+        if cmd_type == "set_color":
+            if "enabled" in payload:
+                self.colorize_enabled = bool(payload.get("enabled"))
+            if "fov_deg" in payload:
+                self.color_cam_fov_deg = clamp(float(payload["fov_deg"]), 30.0, 220.0)
+            if "pitch_deg" in payload:
+                self.color_cam_pitch_deg = clamp(float(payload["pitch_deg"]), -60.0, 60.0)
+            if "height_m" in payload:
+                self.color_cam_height_m = clamp(float(payload["height_m"]), -1.0, 3.0)
+            if "forward_m" in payload:
+                self.color_cam_forward_m = clamp(float(payload["forward_m"]), -1.0, 2.0)
+            if "max_distance_m" in payload:
+                self.color_max_distance_m = clamp(float(payload["max_distance_m"]), 0.5, 60.0)
+            return {
+                "executed": "set_color",
+                "colorize_enabled": self.colorize_enabled,
+                "fov_deg": self.color_cam_fov_deg,
+                "pitch_deg": self.color_cam_pitch_deg,
+                "height_m": self.color_cam_height_m,
+                "forward_m": self.color_cam_forward_m,
+                "max_distance_m": self.color_max_distance_m,
+            }
+
         if cmd_type == "set_lidar_decoder":
             if self.conn is None:
                 raise RuntimeError("Connection not ready")
@@ -1658,6 +1946,61 @@ class EdgeGatewayService:
             return {
                 "executed": "set_lidar_decoder",
                 "decoder": decoder,
+            }
+
+        if cmd_type == "set_autonomy":
+            enabled = bool(payload.get("enabled", False))
+            self.autonomy_enabled = enabled
+            if not enabled:
+                self.drive_target = None
+                with contextlib.suppress(Exception):
+                    self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
+                self.move_active = False
+                self.pending_stop_deadline = 0.0
+                self.autonomy_driving = False
+            self._publish_event("autonomy_state", {"enabled": enabled})
+            return {
+                "executed": "set_autonomy",
+                "autonomy_enabled": self.autonomy_enabled,
+                "lidar_enabled": self.lidar_enabled,
+                "safety_enabled": self.safety_enabled,
+            }
+
+        if cmd_type == "drive_velocity":
+            # Continuous velocity goal from the server brain. The drive loop
+            # repeats it (through the safety guard) until it goes stale.
+            if not self.autonomy_enabled:
+                raise ValueError("autonomy is disabled; send set_autonomy first")
+            limits = self._speed_profiles().get(
+                self.speed_profile, self._speed_profiles()["normal"]
+            )
+            vx = clamp(float(payload.get("vx", 0.0)), -limits["reverse"], limits["forward"])
+            vy = clamp(float(payload.get("vy", 0.0)), -limits["lateral"], limits["lateral"])
+            wz = clamp(float(payload.get("wz", 0.0)), -limits["angular"], limits["angular"])
+            self.drive_target = {"vx": vx, "vy": vy, "wz": wz}
+            self.drive_target_set_at = time.monotonic()
+            return {"executed": "drive_velocity", "target": self.drive_target}
+
+        if cmd_type == "e_stop":
+            self.autonomy_enabled = False
+            self.drive_target = None
+            self.autonomy_driving = False
+            self.move_active = False
+            self.pending_stop_deadline = 0.0
+            for _ in range(2):
+                with contextlib.suppress(Exception):
+                    self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
+            self._publish_event("e_stop", {"source": str(command.get("issued_by", ""))})
+            return {"executed": "e_stop"}
+
+        if cmd_type == "set_safety":
+            if "enabled" in payload:
+                self.safety_enabled = bool(payload.get("enabled"))
+            updated = self.safety_guard.apply_settings(payload)
+            return {
+                "executed": "set_safety",
+                "safety_enabled": self.safety_enabled,
+                "config": updated,
             }
 
         if cmd_type in {"follow_target", "go_to"}:
@@ -1761,6 +2104,58 @@ class EdgeGatewayService:
                     )
 
             await asyncio.sleep(0.05)
+
+    async def _autonomy_drive_loop(self) -> None:
+        """Repeat the latest drive_velocity goal at a fixed rate, always filtered
+        by the safety guard. Decouples smooth motion from MQTT jitter and keeps a
+        short local TTL so the robot stops promptly if goals stop arriving or the
+        server heartbeat drops (the watchdog is the ultimate failsafe)."""
+        interval = 1.0 / max(self.args.autonomy_drive_hz, 1.0)
+        while not self.stop_event.is_set():
+            await asyncio.sleep(interval)
+
+            if not self.autonomy_enabled:
+                continue
+
+            now = time.monotonic()
+            heartbeat_age = now - self.last_heartbeat_monotonic
+            target = self.drive_target
+            target_stale = (
+                target is None
+                or (now - self.drive_target_set_at) > self.drive_target_ttl_s
+            )
+
+            if heartbeat_age > self.args.heartbeat_timeout_s:
+                # Lost the server: the watchdog will StopMove. Don't drive.
+                self.autonomy_driving = False
+                continue
+
+            if target_stale:
+                if self.autonomy_driving:
+                    with contextlib.suppress(Exception):
+                        self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
+                    self.move_active = False
+                    self.pending_stop_deadline = 0.0
+                    self.autonomy_driving = False
+                continue
+
+            vx, vy, wz, _info = self._guard_velocity(
+                target["vx"], target["vy"], target["wz"]
+            )
+            try:
+                self._sport_send_nowait(
+                    int(SPORT_CMD["Move"]), {"x": vx, "y": vy, "z": wz}
+                )
+            except Exception:
+                continue
+
+            self.autonomy_driving = True
+            self.move_active = True
+            self.last_move_command = {"x": vx, "y": vy, "z": wz}
+            self.last_move_sent_at = now
+            # Refreshed each cycle so the duration watchdog never fires mid-stream;
+            # if this loop dies the deadline lapses and the robot is stopped.
+            self.pending_stop_deadline = now + max(2.0 * interval, 0.4)
 
     async def _media_uplink_loop(self) -> None:
         if not self.args.media_ws_url:
@@ -2070,6 +2465,7 @@ class EdgeGatewayService:
             asyncio.create_task(self._robot_supervisor_loop()),
             asyncio.create_task(self._command_loop()),
             asyncio.create_task(self._watchdog_loop()),
+            asyncio.create_task(self._autonomy_drive_loop()),
             asyncio.create_task(self._telemetry_loop()),
             asyncio.create_task(self._media_uplink_loop()),
         ]
@@ -2177,6 +2573,68 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="LiDAR coordinate precision in centimeters before zlib compression.",
     )
+
+    # Camera colorization (approximate fisheye, tunable live via set_color).
+    parser.add_argument(
+        "--enable-colorization",
+        action="store_true",
+        help="Color each LiDAR point with the live camera frame (needs the camera on).",
+    )
+    parser.add_argument("--color-cam-fov-deg", type=float, default=150.0,
+                        help="Approx camera field of view (fisheye) in degrees.")
+    parser.add_argument("--color-cam-pitch-deg", type=float, default=0.0,
+                        help="Camera mount pitch tilt; positive looks down.")
+    parser.add_argument("--color-cam-height-m", type=float, default=0.30,
+                        help="Camera height above the pose origin (m).")
+    parser.add_argument("--color-cam-forward-m", type=float, default=0.25,
+                        help="Camera forward offset from the pose origin (m).")
+    parser.add_argument("--color-max-distance-m", type=float, default=12.0,
+                        help="Max point distance to colorize (m).")
+    parser.add_argument("--color-points-frame", choices=["world", "body"], default="world",
+                        help="Frame of the LiDAR points: 'world'/odom (default) or 'body'.")
+
+    # --- Reactive safety guard + autonomy ------------------------------------
+    parser.add_argument("--enable-safety-guard", dest="enable_safety_guard",
+                        action="store_true", default=True,
+                        help="Reactive LiDAR collision/cliff guard (default on).")
+    parser.add_argument("--disable-safety-guard", dest="enable_safety_guard",
+                        action="store_false",
+                        help="Disable the local safety guard (NOT recommended).")
+    parser.add_argument("--safety-points-frame", choices=["world", "body"], default="world",
+                        help="Frame of LiDAR points fed to the guard.")
+    parser.add_argument("--safety-update-hz", type=float, default=10.0,
+                        help="Max rate the guard ingests LiDAR scans.")
+    parser.add_argument("--safety-stop-distance-m", type=float, default=0.35,
+                        help="Below this clearance, motion toward it is vetoed.")
+    parser.add_argument("--safety-slow-distance-m", type=float, default=0.90,
+                        help="Between stop and this distance, speed is ramped down.")
+    parser.add_argument("--safety-robot-half-width-m", type=float, default=0.26,
+                        help="Robot footprint half width for corridor clearance.")
+    parser.add_argument("--safety-cone-half-deg", type=float, default=45.0,
+                        help="Half angle of the cone scanned around the motion direction.")
+    parser.add_argument("--safety-obstacle-min-height-m", type=float, default=0.06,
+                        help="Min height above ground for a point to count as obstacle.")
+    parser.add_argument("--safety-obstacle-max-height-m", type=float, default=1.20,
+                        help="Max obstacle height (above it the robot passes under).")
+    parser.add_argument("--safety-ground-z-m", type=float, default=-0.30,
+                        help="Calibrated floor height in body frame (z up).")
+    parser.add_argument("--safety-max-radius-m", type=float, default=4.0,
+                        help="Ignore obstacle points beyond this radius.")
+    parser.add_argument("--safety-scan-timeout-s", type=float, default=1.0,
+                        help="Scan older than this blocks translation (fail safe).")
+    parser.add_argument("--safety-cliff-enabled", dest="safety_cliff_enabled",
+                        action="store_true", default=True,
+                        help="Negative-obstacle (ledge/stair) guard (default on).")
+    parser.add_argument("--safety-cliff-disabled", dest="safety_cliff_enabled",
+                        action="store_false", help="Disable cliff guard.")
+    parser.add_argument("--safety-cliff-lookahead-m", type=float, default=0.55,
+                        help="How far ahead the cliff strip extends.")
+    parser.add_argument("--safety-cliff-drop-m", type=float, default=0.12,
+                        help="Floor drop below ground that counts as a ledge.")
+    parser.add_argument("--autonomy-drive-hz", type=float, default=8.0,
+                        help="Rate the autonomy loop repeats the drive goal.")
+    parser.add_argument("--drive-target-ttl-s", type=float, default=0.8,
+                        help="A drive_velocity goal older than this is dropped (robot stops).")
 
     parser.add_argument(
         "--media-ws-url",
@@ -2306,6 +2764,21 @@ def parse_args() -> argparse.Namespace:
 
     if args.lidar_quantization_cm < 0.1 or args.lidar_quantization_cm > 50:
         parser.error("--lidar-quantization-cm must be between 0.1 and 50")
+
+    if args.safety_update_hz <= 0:
+        parser.error("--safety-update-hz must be > 0")
+
+    if args.safety_stop_distance_m <= 0:
+        parser.error("--safety-stop-distance-m must be > 0")
+
+    if args.safety_slow_distance_m <= args.safety_stop_distance_m:
+        parser.error("--safety-slow-distance-m must be > --safety-stop-distance-m")
+
+    if args.autonomy_drive_hz <= 0:
+        parser.error("--autonomy-drive-hz must be > 0")
+
+    if args.drive_target_ttl_s <= 0:
+        parser.error("--drive-target-ttl-s must be > 0")
 
     if args.mqtt_port <= 0 or args.mqtt_port > 65535:
         parser.error("--mqtt-port must be between 1 and 65535")

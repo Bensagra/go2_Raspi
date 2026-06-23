@@ -17,9 +17,17 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 import paho.mqtt.client as mqtt
 import numpy as np
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+
+try:
+    from perception import Perception
+    from autonomy import AutonomyController, AutonomyConfig
+except ImportError:  # package import (server.server_core)
+    from server.perception import Perception  # type: ignore
+    from server.autonomy import AutonomyController, AutonomyConfig  # type: ignore
 
 
 ROLE_ALLOWED_COMMANDS = {
@@ -29,11 +37,15 @@ ROLE_ALLOWED_COMMANDS = {
         "turn",
         "stop",
         "enter_mode",
+        "e_stop",
+        "set_autonomy",
+        "set_safety",
         "set_video",
         "set_camera_stream",
         "set_audio",
         "set_lidar",
         "set_lidar_decoder",
+        "set_color",
         "set_speed_profile",
     },
     "admin": {
@@ -43,11 +55,16 @@ ROLE_ALLOWED_COMMANDS = {
         "enter_mode",
         "go_to",
         "follow_target",
+        "drive_velocity",
+        "e_stop",
+        "set_autonomy",
+        "set_safety",
         "set_video",
         "set_camera_stream",
         "set_audio",
         "set_lidar",
         "set_lidar_decoder",
+        "set_color",
         "set_speed_profile",
     },
 }
@@ -136,6 +153,297 @@ def zlib_inflate_limited(compressed: bytes, limit: int) -> bytes:
     return raw
 
 
+def _i16_xyz_to_points(raw: bytes, scale: float, offset: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if len(raw) % 6 != 0:
+        raise ValueError("invalid int16 xyz payload length")
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("invalid lidar quantization scale")
+    offset = np.asarray(offset, dtype=np.float32)
+    if offset.shape != (3,) or not np.isfinite(offset).all():
+        raise ValueError("invalid lidar quantization offset")
+    quantized = np.frombuffer(raw, dtype="<i2").reshape(-1, 3)
+    points = quantized.astype(np.float32) * scale + offset
+    finite = np.isfinite(points).all(axis=1)
+    return points, finite
+
+
+def encode_cloud_payload(
+    points: np.ndarray,
+    colors: Optional[np.ndarray],
+    quantization_cm: float,
+    compression_level: int = 6,
+) -> Tuple[bytes, str, float, List[float], int]:
+    """Quantize Nx3 points to int16+zlib, optionally with per-point RGBA color.
+    Colored layout: `u32 geom_len | zlib(int16 xyz) | zlib(uint8 rgba)`."""
+    compressed, scale, offset, count = quantize_points_i16(
+        points, quantization_cm, compression_level
+    )
+    if colors is None:
+        return compressed, "i16_xyz_zlib", scale, offset, count
+    rgba = np.ascontiguousarray(colors, dtype=np.uint8)
+    col = zlib.compress(rgba.tobytes(), compression_level)
+    payload = len(compressed).to_bytes(4, "little") + compressed + col
+    return payload, "i16_xyz_rgb_zlib", scale, offset, count
+
+
+def decode_cloud_payload(
+    header: Dict[str, Any],
+    payload: bytes,
+    limit: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Inverse of encode_cloud_payload. Returns (points Nx3, colors Nx4 or None),
+    both filtered to finite points."""
+    fmt = str(header.get("fmt", "i16_xyz_zlib"))
+    scale = float(header.get("scale", 0.0) or 0.0)
+    offset = np.asarray(header.get("offset", []), dtype=np.float32)
+
+    if fmt == "f32_xyz_zlib":
+        raw = zlib_inflate_limited(payload, limit)
+        if len(raw) % 12 != 0:
+            raise ValueError("invalid float32 xyz payload length")
+        points = np.frombuffer(raw, dtype="<f4").reshape(-1, 3)
+        finite = np.isfinite(points).all(axis=1)
+        return np.asarray(points[finite], dtype=np.float32), None
+
+    if fmt == "i16_xyz_zlib":
+        raw = zlib_inflate_limited(payload, limit)
+        points, finite = _i16_xyz_to_points(raw, scale, offset)
+        return np.asarray(points[finite], dtype=np.float32), None
+
+    if fmt == "i16_xyz_rgb_zlib":
+        if len(payload) < 4:
+            raise ValueError("invalid colored cloud payload")
+        geom_len = int.from_bytes(payload[:4], "little")
+        if 4 + geom_len > len(payload):
+            raise ValueError("invalid colored cloud geometry length")
+        geom = payload[4 : 4 + geom_len]
+        col = payload[4 + geom_len :]
+        raw = zlib_inflate_limited(geom, limit)
+        points, finite = _i16_xyz_to_points(raw, scale, offset)
+        craw = zlib_inflate_limited(col, limit)
+        colors = np.frombuffer(craw, dtype=np.uint8)
+        if colors.size != points.shape[0] * 4:
+            raise ValueError("lidar color/point count mismatch")
+        colors = colors.reshape(-1, 4)
+        return (
+            np.asarray(points[finite], dtype=np.float32),
+            np.ascontiguousarray(colors[finite], dtype=np.uint8),
+        )
+
+    raise ValueError("unsupported lidar point format")
+
+
+# ---------------------------------------------------------------------------
+# Solid mesh reconstruction (pure numpy, no external deps)
+# ---------------------------------------------------------------------------
+# Builds a watertight-ish surface mesh from the accumulated colored cloud by
+# voxelizing it and emitting only the faces that border empty space (the visible
+# shell), with shared corner vertices so Laplacian smoothing can round the
+# blocky surface. Per-vertex normals + camera color let the browser shade it as
+# a solid. It's not photogrammetry, but it reads as the real space.
+MESH_BLOB_MAGIC = b"MSH1"
+
+# Per face direction: axis, sign, and the 4 corner offsets (in unit-cube coords)
+# ordered counter-clockwise when viewed from outside.
+_FACE_DIRS = [
+    ((1, 0, 0), [(1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)]),
+    ((-1, 0, 0), [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)]),
+    ((0, 1, 0), [(0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)]),
+    ((0, -1, 0), [(0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)]),
+    ((0, 0, 1), [(0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]),
+    ((0, 0, -1), [(0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0)]),
+]
+
+
+def reconstruct_solid_mesh(
+    points: np.ndarray,
+    colors: Optional[np.ndarray],
+    voxel_size: float,
+    smooth_iters: int = 8,
+    max_vertices: int = 1_500_000,
+) -> Optional[Dict[str, Any]]:
+    """Return a solid mesh {vertices, normals, colors, faces, bounds} or None."""
+    if points is None or points.shape[0] < 16:
+        return None
+
+    grid = np.floor(points[:, :3] / voxel_size).astype(np.int64)
+    base = grid.min(axis=0)
+    rel = grid - base
+    dims = rel.max(axis=0) + 1
+    dy, dz = int(dims[1]), int(dims[2])
+
+    def pack(a: np.ndarray) -> np.ndarray:
+        return (a[:, 0] * dy + a[:, 1]) * dz + a[:, 2]
+
+    packed = pack(rel)
+    uniq, inv = np.unique(packed, return_index=False, return_inverse=True)
+    voxel_count = int(uniq.shape[0])
+    if voxel_count < 8:
+        return None
+
+    # Average camera color per voxel (fallback handled later if uncolored).
+    vox_rgb = np.zeros((voxel_count, 3), dtype=np.float64)
+    vox_has = np.zeros(voxel_count, dtype=np.int64)
+    if colors is not None and colors.shape[0] == points.shape[0]:
+        valid = colors[:, 3] > 0
+        if valid.any():
+            np.add.at(vox_rgb, inv[valid], colors[valid, :3].astype(np.float64))
+            np.add.at(vox_has, inv[valid], 1)
+    colored = vox_has > 0
+    vox_rgb[colored] /= vox_has[colored][:, None]
+
+    occupied = set(uniq.tolist())
+    # Unpack unique voxel coords (in the shifted grid).
+    vz = uniq % dz
+    tmp = uniq // dz
+    vy = tmp % dy
+    vx = tmp // dy
+    vcoord = np.stack([vx, vy, vz], axis=1)  # (M,3)
+
+    # Color lookup by packed voxel id (for vertex coloring).
+    color_by_id = {int(pid): vox_rgb[i] for i, pid in enumerate(uniq)}
+
+    vertex_index: Dict[Tuple[int, int, int], int] = {}
+    vertices: List[Tuple[int, int, int]] = []
+    vcolor_accum: List[List[float]] = []
+    vcolor_count: List[int] = []
+    faces: List[Tuple[int, int, int]] = []
+
+    def corner_id(c: Tuple[int, int, int], rgb: np.ndarray, has: bool) -> int:
+        idx = vertex_index.get(c)
+        if idx is None:
+            idx = len(vertices)
+            vertex_index[c] = idx
+            vertices.append(c)
+            vcolor_accum.append([0.0, 0.0, 0.0])
+            vcolor_count.append(0)
+        if has:
+            vcolor_accum[idx][0] += float(rgb[0])
+            vcolor_accum[idx][1] += float(rgb[1])
+            vcolor_accum[idx][2] += float(rgb[2])
+            vcolor_count[idx] += 1
+        return idx
+
+    for (dvec, corners) in _FACE_DIRS:
+        neigh = vcoord + np.asarray(dvec, dtype=np.int64)
+        in_bounds = (
+            (neigh[:, 0] >= 0) & (neigh[:, 0] < dims[0])
+            & (neigh[:, 1] >= 0) & (neigh[:, 1] < dims[1])
+            & (neigh[:, 2] >= 0) & (neigh[:, 2] < dims[2])
+        )
+        neigh_packed = np.full(voxel_count, -1, dtype=np.int64)
+        if in_bounds.any():
+            neigh_packed[in_bounds] = pack(neigh[in_bounds])
+        occupied_neighbor = np.isin(neigh_packed, uniq) & in_bounds
+        exposed = ~occupied_neighbor  # face borders empty space
+        exposed_idx = np.where(exposed)[0]
+        for i in exposed_idx:
+            pid = int(uniq[i])
+            rgb = color_by_id[pid]
+            has = bool(colored[i])
+            base_v = vcoord[i]
+            quad = []
+            for off in corners:
+                c = (
+                    int(base_v[0] + off[0]),
+                    int(base_v[1] + off[1]),
+                    int(base_v[2] + off[2]),
+                )
+                quad.append(corner_id(c, rgb, has))
+            faces.append((quad[0], quad[1], quad[2]))
+            faces.append((quad[0], quad[2], quad[3]))
+
+    if not faces or len(vertices) > max_vertices:
+        return None
+
+    verts = (np.asarray(vertices, dtype=np.float64) + base) * voxel_size
+    verts = verts.astype(np.float32)
+    face_arr = np.asarray(faces, dtype=np.int64)
+
+    # Per-vertex color (camera where available, else a neutral height tint).
+    vcount = np.asarray(vcolor_count, dtype=np.float64)
+    vcol = np.asarray(vcolor_accum, dtype=np.float64)
+    has_col = vcount > 0
+    vcol[has_col] /= vcount[has_col][:, None]
+    if (~has_col).any():
+        z = verts[:, 2]
+        z_lo, z_hi = float(z.min()), float(z.max())
+        span = max(z_hi - z_lo, 1e-3)
+        t = np.clip((z[~has_col] - z_lo) / span, 0, 1)
+        # cool->warm neutral tint so uncolored areas still read as solid
+        tint = np.stack([90 + 120 * t, 110 + 80 * t, 150 - 60 * t], axis=1)
+        vcol[~has_col] = tint
+    vcol = np.clip(vcol, 0, 255).astype(np.uint8)
+
+    verts = _laplacian_smooth(verts, face_arr, smooth_iters)
+    normals = _vertex_normals(verts, face_arr)
+
+    return {
+        "vertices": verts,
+        "normals": normals,
+        "colors": vcol,
+        "faces": face_arr.astype(np.uint32),
+        "bounds_min": verts.min(axis=0).tolist(),
+        "bounds_max": verts.max(axis=0).tolist(),
+        "voxel_count": voxel_count,
+    }
+
+
+def _laplacian_smooth(verts: np.ndarray, faces: np.ndarray, iters: int) -> np.ndarray:
+    if iters <= 0 or verts.shape[0] == 0:
+        return verts
+    edges = np.concatenate(
+        [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0
+    )
+    edges = np.concatenate([edges, edges[:, ::-1]], axis=0)
+    src = edges[:, 0]
+    dst = edges[:, 1]
+    deg = np.zeros(verts.shape[0], dtype=np.float64)
+    np.add.at(deg, src, 1.0)
+    deg = np.maximum(deg, 1.0)
+    out = verts.astype(np.float64)
+    for _ in range(iters):
+        acc = np.zeros_like(out)
+        np.add.at(acc, src, out[dst])
+        neighbor_avg = acc / deg[:, None]
+        out = out + 0.5 * (neighbor_avg - out)
+    return out.astype(np.float32)
+
+
+def _vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    normals = np.zeros(verts.shape, dtype=np.float64)
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    fn = np.cross(v1 - v0, v2 - v0)
+    for col in range(3):
+        np.add.at(normals[:, col], faces[:, 0], fn[:, col])
+        np.add.at(normals[:, col], faces[:, 1], fn[:, col])
+        np.add.at(normals[:, col], faces[:, 2], fn[:, col])
+    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    lengths = np.maximum(lengths, 1e-9)
+    return (normals / lengths).astype(np.float32)
+
+
+def encode_mesh_blob(mesh: Dict[str, Any], compression_level: int = 6) -> bytes:
+    """Pack a mesh into a compact zlib'd binary the browser parses directly."""
+    verts = np.ascontiguousarray(mesh["vertices"], dtype="<f4")
+    normals = np.clip(np.rint(mesh["normals"] * 127.0), -127, 127).astype("<i1")
+    colors = np.ascontiguousarray(mesh["colors"], dtype=np.uint8)
+    faces = np.ascontiguousarray(mesh["faces"], dtype="<u4")
+    vcount = verts.shape[0]
+    fcount = faces.shape[0]
+    body = bytearray()
+    body += MESH_BLOB_MAGIC
+    body += int(vcount).to_bytes(4, "little")
+    body += int(fcount).to_bytes(4, "little")
+    body += verts.tobytes()
+    body += np.ascontiguousarray(normals).tobytes()
+    body += colors.tobytes()
+    body += faces.tobytes()
+    return zlib.compress(bytes(body), compression_level)
+
+
 def extract_token_from_auth_header(authorization: Optional[str]) -> Optional[str]:
     if not authorization:
         return None
@@ -153,6 +461,16 @@ class CommandIn(BaseModel):
     type: str
     payload: Dict[str, Any] = Field(default_factory=dict)
     ttl_ms: int = 1500
+
+
+class AutonomyActionIn(BaseModel):
+    action: str = "start"  # start | stop | estop | status
+    overrides: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FaceLabelIn(BaseModel):
+    label: str = ""
+    known: bool = False
 
 
 SAFE_STORAGE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -192,10 +510,18 @@ class CoreRuntime:
             str,
             OrderedDict[Tuple[int, int, int], Tuple[float, float, float]],
         ] = defaultdict(OrderedDict)
-        self.lidar_latest_packets: Dict[str, np.ndarray] = {}
+        # Last known camera color per voxel (parallel to lidar_voxels).
+        self.lidar_voxel_colors: Dict[
+            str, Dict[Tuple[int, int, int], Tuple[int, int, int]]
+        ] = defaultdict(dict)
+        self.lidar_latest_packets: Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]] = {}
         self.lidar_last_keyframe_at: Dict[str, float] = defaultdict(lambda: 0.0)
         self.lidar_events: Dict[str, asyncio.Event] = {}
         self.lidar_tasks: Dict[str, asyncio.Task[None]] = {}
+        # Background solid-mesh reconstruction state.
+        self.mesh_task: Optional[asyncio.Task[None]] = None
+        self.mesh_built_revisions: Dict[str, int] = defaultdict(lambda: -1)
+        self.mesh_building: Set[str] = set()
         self.robot_paths: Dict[str, Deque[Tuple[float, float]]] = defaultdict(
             lambda: deque(maxlen=self.args.lidar_path_max_points)
         )
@@ -229,6 +555,23 @@ class CoreRuntime:
 
         self.audit_log_path = Path(self.args.audit_log).expanduser()
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Server-side perception (people + face recognition). Heavy ML deps are
+        # optional: this stays in mapping-only mode until they are installed.
+        self.perception: Optional[Perception] = None
+        if self.args.enable_perception:
+            self.perception = Perception(
+                faces_dir=Path(self.args.faces_dir).expanduser(),
+                device=self.args.perception_device,
+                person_model=self.args.person_model,
+                person_conf=self.args.person_conf,
+                match_threshold=self.args.face_match_threshold,
+                retention_days=self.args.face_retention_days,
+                enable_person=self.args.enable_person_detection,
+                enable_face=self.args.enable_face_recognition,
+            )
+        self.autonomy_controllers: Dict[str, AutonomyController] = {}
+        self.autonomy_drive_seq: Dict[str, int] = defaultdict(int)
 
     @staticmethod
     def _parse_api_tokens(entries: List[str]) -> Dict[str, Dict[str, str]]:
@@ -409,43 +752,67 @@ class CoreRuntime:
         offset = np.asarray(data.get("quantization_offset", []), dtype=np.float32)
         return self._points_from_raw(raw, point_format, scale, offset)
 
-    def _decode_lidar_frame(self, header: Dict[str, Any], payload: bytes) -> np.ndarray:
-        """Binary lidar frame from the edge (no base64)."""
-        point_format = str(header.get("fmt", "i16_xyz_zlib"))
-        raw = zlib_inflate_limited(payload, self.args.lidar_max_packet_bytes)
-        scale = float(header.get("scale", 0.0) or 0.0)
-        offset = np.asarray(header.get("offset", []), dtype=np.float32)
-        return self._points_from_raw(raw, point_format, scale, offset)
+    def _decode_lidar_frame(
+        self, header: Dict[str, Any], payload: bytes
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Binary lidar frame from the edge (no base64). Returns (points, colors)."""
+        return decode_cloud_payload(header, payload, self.args.lidar_max_packet_bytes)
 
-    def _update_lidar_voxels(self, robot_id: str, points: np.ndarray) -> np.ndarray:
-        """Insert points into the accumulated voxel map. Returns the subset whose
-        voxel was not already present — i.e. the delta to stream to clients."""
+    def _update_lidar_voxels(
+        self,
+        robot_id: str,
+        points: np.ndarray,
+        colors: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Insert points into the accumulated voxel map and update per-voxel color.
+        Returns (new_points, new_colors) for voxels first seen this frame — the
+        delta. Color updates to existing voxels ride the periodic keyframe."""
         if points.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
+            return np.empty((0, 3), dtype=np.float32), None
 
         resolution = self.args.lidar_voxel_size
         keys = np.floor(points / resolution).astype(np.int32)
         _, unique_indices = np.unique(keys, axis=0, return_index=True)
         unique_points = points[unique_indices]
         unique_keys = keys[unique_indices]
+        unique_colors = colors[unique_indices] if colors is not None else None
 
         new_points: List[Tuple[float, float, float]] = []
+        new_colors: List[Tuple[int, int, int, int]] = []
         with self.map_data_locks[robot_id]:
             voxels = self.lidar_voxels[robot_id]
-            for key_array, point in zip(unique_keys, unique_points):
+            color_map = self.lidar_voxel_colors[robot_id]
+            for i in range(unique_keys.shape[0]):
+                key_array = unique_keys[i]
+                point = unique_points[i]
                 key = (int(key_array[0]), int(key_array[1]), int(key_array[2]))
                 value = (float(point[0]), float(point[1]), float(point[2]))
-                if key not in voxels:
-                    new_points.append(value)
+                is_new = key not in voxels
                 voxels[key] = value
                 voxels.move_to_end(key)
+                if unique_colors is not None:
+                    c = unique_colors[i]
+                    if int(c[3]) != 0:
+                        color_map[key] = (int(c[0]), int(c[1]), int(c[2]))
+                if is_new:
+                    new_points.append(value)
+                    known = color_map.get(key)
+                    if known is not None:
+                        new_colors.append((known[0], known[1], known[2], 255))
+                    else:
+                        new_colors.append((0, 0, 0, 0))
 
             while len(voxels) > self.args.lidar_map_max_voxels:
-                voxels.popitem(last=False)
+                old_key, _ = voxels.popitem(last=False)
+                color_map.pop(old_key, None)
 
         if not new_points:
-            return np.empty((0, 3), dtype=np.float32)
-        return np.asarray(new_points, dtype=np.float32)
+            return np.empty((0, 3), dtype=np.float32), None
+        np_points = np.asarray(new_points, dtype=np.float32)
+        np_colors = (
+            np.asarray(new_colors, dtype=np.uint8) if colors is not None else None
+        )
+        return np_points, np_colors
 
     def _robot_pose_for_map(
         self,
@@ -473,37 +840,56 @@ class CoreRuntime:
         robot_id: str,
         mode: str,
         points: Optional[np.ndarray] = None,
+        colors: Optional[np.ndarray] = None,
         source_points: int = 0,
     ) -> Optional[Tuple[Dict[str, Any], bytes, bool]]:
         """Build a binary lidar frame. A *keyframe* carries the whole accumulated
         voxel cloud (downsampled to a budget) so a viewer can rebuild the map from
         scratch; a *delta* carries only the voxels first seen this frame. The
-        browser renders both in WebGL — no server-side rasterisation."""
+        browser renders both in WebGL — no server-side rasterisation. Points carry
+        per-voxel camera color (RGBA, alpha=validity) when available."""
         path: Optional[List[Tuple[float, float]]] = None
         if mode == "keyframe":
             with self.map_data_locks[robot_id]:
                 voxels = self.lidar_voxels.get(robot_id)
                 if not voxels:
                     return None
-                cloud = np.asarray(list(voxels.values()), dtype=np.float32)
+                items = list(voxels.items())
+                color_map = dict(self.lidar_voxel_colors.get(robot_id, {}))
                 voxel_count = len(voxels)
                 path = list(self.robot_paths.get(robot_id, ()))
+            cloud = np.asarray([value for _, value in items], dtype=np.float32)
+            if color_map:
+                cloud_colors = np.zeros((len(items), 4), dtype=np.uint8)
+                for i, (key, _value) in enumerate(items):
+                    c = color_map.get(key)
+                    if c is not None:
+                        cloud_colors[i, 0] = c[0]
+                        cloud_colors[i, 1] = c[1]
+                        cloud_colors[i, 2] = c[2]
+                        cloud_colors[i, 3] = 255
+            else:
+                cloud_colors = None
             limit = self.args.lidar_cloud_max_points
             if limit > 0 and cloud.shape[0] > limit:
                 step = max(int(np.ceil(cloud.shape[0] / limit)), 1)
                 cloud = cloud[::step]
+                if cloud_colors is not None:
+                    cloud_colors = cloud_colors[::step]
         else:
             if points is None or points.shape[0] == 0:
                 return None
             cloud = points
+            cloud_colors = colors
             with self.map_data_locks[robot_id]:
                 voxel_count = len(self.lidar_voxels.get(robot_id, ()))
 
         if cloud.shape[0] == 0:
             return None
 
-        compressed, scale, offset, count = quantize_points_i16(
+        payload, fmt, scale, offset, count = encode_cloud_payload(
             cloud,
+            cloud_colors,
             self.args.lidar_cloud_quantization_cm,
             self.args.lidar_cloud_compression_level,
         )
@@ -513,7 +899,7 @@ class CoreRuntime:
             "robot_id": robot_id,
             "stream": "lidar",
             "ts": time.time(),
-            "fmt": "i16_xyz_zlib",
+            "fmt": fmt,
             "mode": mode,
             "count": count,
             "scale": scale,
@@ -526,15 +912,16 @@ class CoreRuntime:
             header["path"] = [
                 [round(float(px), 3), round(float(py), 3)] for px, py in path
             ]
-        return header, compressed, mode == "keyframe"
+        return header, payload, mode == "keyframe"
 
     def _process_lidar_packet_sync(
         self,
         robot_id: str,
         points: np.ndarray,
+        colors: Optional[np.ndarray] = None,
     ) -> List[Tuple[Dict[str, Any], bytes, bool]]:
         started = time.monotonic()
-        new_points = self._update_lidar_voxels(robot_id, points)
+        new_points, new_colors = self._update_lidar_voxels(robot_id, points, colors)
         self.map_revisions[robot_id] += 1
 
         now = time.monotonic()
@@ -559,6 +946,7 @@ class CoreRuntime:
                 robot_id,
                 "delta",
                 points=new_points,
+                colors=new_colors,
                 source_points=int(points.shape[0]),
             )
             if delta is not None:
@@ -569,8 +957,13 @@ class CoreRuntime:
             header["processing_ms"] = processing_ms
         return messages
 
-    def _schedule_lidar_packet(self, robot_id: str, points: np.ndarray) -> None:
-        self.lidar_latest_packets[robot_id] = points
+    def _schedule_lidar_packet(
+        self,
+        robot_id: str,
+        points: np.ndarray,
+        colors: Optional[np.ndarray] = None,
+    ) -> None:
+        self.lidar_latest_packets[robot_id] = (points, colors)
         event = self.lidar_events.setdefault(robot_id, asyncio.Event())
         event.set()
         task = self.lidar_tasks.get(robot_id)
@@ -584,15 +977,17 @@ class CoreRuntime:
         while not self.stop_event.is_set():
             await event.wait()
             event.clear()
-            points = self.lidar_latest_packets.pop(robot_id, None)
-            if points is None:
+            packet = self.lidar_latest_packets.pop(robot_id, None)
+            if packet is None:
                 continue
+            points, colors = packet
 
             try:
                 messages = await asyncio.to_thread(
                     self._process_lidar_packet_sync,
                     robot_id,
                     points,
+                    colors,
                 )
             except Exception as exc:
                 self._audit(
@@ -611,9 +1006,9 @@ class CoreRuntime:
         stream = str(header.get("stream", "")).strip()
 
         if stream == "lidar":
-            points = self._decode_lidar_frame(header, payload)
+            points, colors = self._decode_lidar_frame(header, payload)
             if points.size:
-                self._schedule_lidar_packet(robot_id, points)
+                self._schedule_lidar_packet(robot_id, points, colors)
             return
 
         if stream == "video":
@@ -625,6 +1020,13 @@ class CoreRuntime:
             # H.264 deltas can't be decoded out of context, so never coalesce
             # them as a "latest snapshot"; the periodic keyframe resyncs viewers.
             is_h264 = out_header.get("image_format") == "h264"
+            # Feed perception only while an autonomy session is running for this
+            # robot (otherwise zero analysis overhead).
+            if self.perception is not None and robot_id in self.autonomy_controllers:
+                controller = self.autonomy_controllers.get(robot_id)
+                if controller and controller.task and not controller.task.done():
+                    with contextlib.suppress(Exception):
+                        self.perception.ingest(robot_id, header, payload)
             self._broadcast_media_frame(
                 robot_id, "video", out_header, payload, coalesce=not is_h264
             )
@@ -684,6 +1086,107 @@ class CoreRuntime:
                 path = np.empty((0, 2), dtype="<f4")
 
         return points, path
+
+    def _snapshot_cloud_for_mesh(
+        self, robot_id: str
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        with self.map_data_locks[robot_id]:
+            voxels = self.lidar_voxels.get(robot_id)
+            if not voxels:
+                return np.empty((0, 3), dtype=np.float32), None
+            items = list(voxels.items())
+            color_map = dict(self.lidar_voxel_colors.get(robot_id, {}))
+        points = np.asarray([value for _, value in items], dtype=np.float32)
+        colors: Optional[np.ndarray] = None
+        if color_map:
+            colors = np.zeros((len(items), 4), dtype=np.uint8)
+            for i, (key, _value) in enumerate(items):
+                c = color_map.get(key)
+                if c is not None:
+                    colors[i, 0] = c[0]
+                    colors[i, 1] = c[1]
+                    colors[i, 2] = c[2]
+                    colors[i, 3] = 255
+        return points, colors
+
+    def _mesh_dir(self, robot_id: str, create: bool = False) -> Path:
+        path = self._map_robot_dir(robot_id, create=create) / "mesh"
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _build_and_save_mesh_sync(self, robot_id: str) -> Optional[Dict[str, Any]]:
+        points, colors = self._snapshot_cloud_for_mesh(robot_id)
+        if points.shape[0] < self.args.mesh_min_voxels:
+            return None
+        started = time.monotonic()
+        mesh = reconstruct_solid_mesh(
+            points,
+            colors,
+            self.args.mesh_voxel_size,
+            self.args.mesh_smooth_iters,
+            self.args.mesh_max_vertices,
+        )
+        if mesh is None:
+            return None
+        blob = encode_mesh_blob(mesh, 6)
+        mesh_dir = self._mesh_dir(robot_id, create=True)
+        blob_path = mesh_dir / "latest.bin"
+        meta_path = mesh_dir / "latest.json"
+        tmp_blob = blob_path.with_name("latest.bin.tmp")
+        tmp_blob.write_bytes(blob)
+        tmp_blob.replace(blob_path)
+        metadata = {
+            "robot_id": robot_id,
+            "vertex_count": int(mesh["vertices"].shape[0]),
+            "face_count": int(mesh["faces"].shape[0]),
+            "voxel_count": int(mesh["voxel_count"]),
+            "bounds_min": mesh["bounds_min"],
+            "bounds_max": mesh["bounds_max"],
+            "voxel_size": float(self.args.mesh_voxel_size),
+            "blob_bytes": len(blob),
+            "build_ms": round((time.monotonic() - started) * 1000.0, 1),
+            "updated_at": time.time(),
+        }
+        tmp_meta = meta_path.with_name("latest.json.tmp")
+        tmp_meta.write_text(json.dumps(metadata), encoding="utf-8")
+        tmp_meta.replace(meta_path)
+        return metadata
+
+    async def _build_mesh_for_robot(self, robot_id: str) -> Optional[Dict[str, Any]]:
+        if robot_id in self.mesh_building:
+            return None
+        self.mesh_building.add(robot_id)
+        try:
+            revision = self.map_revisions.get(robot_id, 0)
+            metadata = await asyncio.to_thread(self._build_and_save_mesh_sync, robot_id)
+            if metadata is not None:
+                self.mesh_built_revisions[robot_id] = revision
+                self._audit("mesh_built", metadata)
+                await self._broadcast(
+                    {"type": "mesh_ready", "robot_id": robot_id, "data": metadata}
+                )
+            return metadata
+        finally:
+            self.mesh_building.discard(robot_id)
+
+    async def _mesh_reconstruction_loop(self) -> None:
+        """Periodically rebuild + save a solid mesh per robot whose map changed."""
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.sleep(self.args.mesh_interval_s)
+            except asyncio.CancelledError:
+                raise
+            if self.stop_event.is_set():
+                break
+            for robot_id in list(self.lidar_voxels.keys()):
+                revision = self.map_revisions.get(robot_id, 0)
+                if revision == self.mesh_built_revisions.get(robot_id, -1):
+                    continue
+                try:
+                    await self._build_mesh_for_robot(robot_id)
+                except Exception as exc:
+                    self._audit("mesh_error", {"robot_id": robot_id, "error": str(exc)})
 
     @staticmethod
     def _map_bounds(points: np.ndarray) -> Tuple[List[float], List[float]]:
@@ -1280,6 +1783,111 @@ class CoreRuntime:
         )
         return getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS
 
+    # ----------------------------------------------------------- autonomy glue
+    def autonomy_drive(self, robot_id: str, vx: float, vy: float, wz: float) -> bool:
+        """Publish a continuous velocity goal to the edge (filtered there by the
+        safety guard). Called by the AutonomyController at its control rate."""
+        if self.mqtt_client is None:
+            return False
+        self.autonomy_drive_seq[robot_id] += 1
+        seq = self.autonomy_drive_seq[robot_id]
+        limits = self._speed_profiles().get(
+            self._active_speed_profile(robot_id), self._speed_profiles()["normal"]
+        )
+        payload = {
+            "vx": clamp(float(vx), -limits["reverse"], limits["forward"]),
+            "vy": clamp(float(vy), -limits["lateral"], limits["lateral"]),
+            "wz": clamp(float(wz), -limits["angular"], limits["angular"]),
+        }
+        wire = {
+            "command_id": f"auto-{robot_id}-{seq}",
+            "robot_id": robot_id,
+            "type": "drive_velocity",
+            "payload": payload,
+            "issued_by": "autonomy",
+            "ts": time.time(),
+            "ttl_ms": 800,
+            "streaming": True,
+        }
+        self.last_control_activity[robot_id] = time.time()
+        result = self.mqtt_client.publish(
+            self._mqtt_topic(robot_id, "commands/in"),
+            json.dumps(wire, separators=(",", ":")),
+            qos=0,
+        )
+        return getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS
+
+    def autonomy_command(self, robot_id: str, cmd_type: str, payload: Dict[str, Any]) -> Optional[str]:
+        """Publish a one-shot control command on behalf of the autonomy brain
+        (set_autonomy / set_lidar / set_video / stop / e_stop)."""
+        if self.mqtt_client is None:
+            return None
+        command_id = f"auto-{cmd_type}-{uuid.uuid4().hex[:8]}"
+        wire = {
+            "command_id": command_id,
+            "robot_id": robot_id,
+            "type": cmd_type,
+            "payload": payload,
+            "issued_by": "autonomy",
+            "ts": time.time(),
+            "ttl_ms": 2000,
+        }
+        self.last_control_activity[robot_id] = time.time()
+        self.pending_commands[command_id] = {
+            "command_id": command_id,
+            "robot_id": robot_id,
+            "issued_by": "autonomy",
+            "type": cmd_type,
+            "ts": time.time(),
+        }
+        self.mqtt_client.publish(
+            self._mqtt_topic(robot_id, "commands/in"), json.dumps(wire), qos=1
+        )
+        self._audit("autonomy_command", wire)
+        return command_id
+
+    async def autonomy_event(self, robot_id: str, event_type: str, data: Dict[str, Any]) -> None:
+        message = {"type": "autonomy", "robot_id": robot_id, "event": event_type, "data": data, "ts": time.time()}
+        await self._broadcast(message)
+        self._audit("autonomy_event", {"robot_id": robot_id, "event": event_type, "data": data})
+
+    def start_autonomy(self, robot_id: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        existing = self.autonomy_controllers.get(robot_id)
+        if existing and existing.task and not existing.task.done():
+            return existing.snapshot()
+        cfg = AutonomyConfig(
+            control_hz=self.args.autonomy_control_hz,
+            v_max=self.args.autonomy_v_max,
+            w_max=self.args.autonomy_w_max,
+            grid_res=self.args.autonomy_grid_res,
+            robot_radius_m=self.args.autonomy_robot_radius_m,
+        )
+        for key, value in (overrides or {}).items():
+            if hasattr(cfg, key) and isinstance(value, (int, float)):
+                setattr(cfg, key, float(value))
+        controller = AutonomyController(self, robot_id, cfg)
+        self.autonomy_controllers[robot_id] = controller
+        controller.start()
+        self._audit("autonomy_start", {"robot_id": robot_id})
+        return controller.snapshot()
+
+    async def stop_autonomy(self, robot_id: str, estop: bool = False) -> Dict[str, Any]:
+        controller = self.autonomy_controllers.get(robot_id)
+        if controller:
+            await controller.stop("estopped" if estop else "stopped")
+        if estop:
+            self.autonomy_command(robot_id, "e_stop", {})
+        else:
+            self.autonomy_command(robot_id, "set_autonomy", {"enabled": False})
+        self._audit("autonomy_stop", {"robot_id": robot_id, "estop": estop})
+        return controller.snapshot() if controller else {"robot_id": robot_id, "state": "idle", "running": False}
+
+    def autonomy_status(self, robot_id: str) -> Dict[str, Any]:
+        controller = self.autonomy_controllers.get(robot_id)
+        if controller:
+            return controller.snapshot()
+        return {"robot_id": robot_id, "state": "idle", "running": False, "captures": 0}
+
     def _sanitize_command(
         self,
         command_type: str,
@@ -1392,11 +2000,49 @@ class CoreRuntime:
                 raise HTTPException(status_code=400, detail="set_lidar_decoder supports only 'libvoxel' or 'native'")
             output["decoder"] = decoder
 
+        if command_type == "set_color":
+            if "enabled" in output:
+                output["enabled"] = bool(output["enabled"])
+            if "fov_deg" in output:
+                output["fov_deg"] = clamp(float(output["fov_deg"]), 30.0, 220.0)
+            if "pitch_deg" in output:
+                output["pitch_deg"] = clamp(float(output["pitch_deg"]), -60.0, 60.0)
+            if "height_m" in output:
+                output["height_m"] = clamp(float(output["height_m"]), -1.0, 3.0)
+            if "forward_m" in output:
+                output["forward_m"] = clamp(float(output["forward_m"]), -1.0, 2.0)
+            if "max_distance_m" in output:
+                output["max_distance_m"] = clamp(float(output["max_distance_m"]), 0.5, 60.0)
+
         if command_type == "set_speed_profile":
             profile = str(output.get("profile", "normal")).strip().lower()
             if profile not in self._speed_profiles():
                 raise HTTPException(status_code=400, detail="profile must be 'normal' or 'max_api'")
             output = {"profile": profile}
+
+        if command_type == "set_autonomy":
+            output = {"enabled": bool(output.get("enabled", False))}
+
+        if command_type == "e_stop":
+            output = {}
+
+        if command_type == "drive_velocity":
+            output["vx"] = float(output.get("vx", 0.0))
+            output["vy"] = float(output.get("vy", 0.0))
+            output["wz"] = float(output.get("wz", 0.0))
+
+        if command_type == "set_safety":
+            allowed = {
+                "enabled", "stop_distance_m", "slow_distance_m", "robot_half_width_m",
+                "obstacle_min_height_m", "obstacle_max_height_m", "cliff_enabled",
+                "cliff_lookahead_m", "cliff_drop_m", "ground_z_default_m",
+                "max_consider_radius_m", "fail_safe_block",
+            }
+            output = {
+                k: (bool(v) if k in {"enabled", "cliff_enabled", "fail_safe_block"} else float(v))
+                for k, v in output.items()
+                if k in allowed
+            }
 
         return output
 
@@ -1436,11 +2082,21 @@ class CoreRuntime:
             self._setup_mqtt()
             self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             self.map_save_task = asyncio.create_task(self._map_persistence_loop())
+            if self.args.mesh_interval_s > 0:
+                self.mesh_task = asyncio.create_task(self._mesh_reconstruction_loop())
+            if self.perception is not None:
+                with contextlib.suppress(Exception):
+                    removed = self.perception.gallery.enforce_retention()
+                    if removed:
+                        self._audit("faces_retention_purge", {"removed": removed})
             self._audit("server_start", {"pid": str(uuid.uuid4())})
 
         @app.on_event("shutdown")
         async def _shutdown() -> None:
             self.stop_event.set()
+            for controller in list(self.autonomy_controllers.values()):
+                with contextlib.suppress(Exception):
+                    await controller.stop("stopped")
             for task in self.lidar_tasks.values():
                 task.cancel()
             for task in self.lidar_tasks.values():
@@ -1454,6 +2110,10 @@ class CoreRuntime:
                 self.map_save_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.map_save_task
+            if self.mesh_task:
+                self.mesh_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.mesh_task
 
             await self._save_all_maps()
 
@@ -1515,6 +2175,49 @@ class CoreRuntime:
                 raise HTTPException(status_code=404, detail="Map not found") from exc
             except (KeyError, OSError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @app.get("/api/meshes/{robot_id}")
+        async def mesh_info(
+            robot_id: str,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            try:
+                meta_path = self._mesh_dir(robot_id) / "latest.json"
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            metadata = self._read_json_file(meta_path)
+            return {
+                "robot_id": robot_id,
+                "has_mesh": bool(metadata),
+                "building": robot_id in self.mesh_building,
+                "metadata": metadata,
+            }
+
+        @app.get("/api/meshes/{robot_id}/latest")
+        async def get_mesh(
+            robot_id: str,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Response:
+            try:
+                blob_path = self._mesh_dir(robot_id) / "latest.bin"
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if not blob_path.exists():
+                raise HTTPException(status_code=404, detail="Mesh not found")
+            data = await asyncio.to_thread(blob_path.read_bytes)
+            return Response(content=data, media_type="application/octet-stream")
+
+        @app.post("/api/meshes/{robot_id}/rebuild")
+        async def rebuild_mesh(
+            robot_id: str,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            if auth["role"] not in {"operator", "admin"}:
+                raise HTTPException(status_code=403, detail="operator role required")
+            metadata = await self._build_mesh_for_robot(robot_id)
+            if metadata is None:
+                return {"ok": False, "reason": "not enough map data yet or already building"}
+            return {"ok": True, "metadata": metadata}
 
         @app.get("/api/robots/{robot_id}/state")
         async def robot_state(robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)) -> Dict[str, Any]:
@@ -1652,6 +2355,100 @@ class CoreRuntime:
             self.last_control_activity[robot_id] = time.time()
             self._audit("control_activate", {"robot_id": robot_id, "user_id": auth["user_id"]})
             return {"ok": True, "robot_id": robot_id}
+
+        # ---------------------------------------------------------- autonomy
+        @app.get("/api/perception/capabilities")
+        async def perception_caps(auth: Dict[str, str] = Depends(self._auth_dependency)) -> Dict[str, Any]:
+            if self.perception is None:
+                return {"enabled": False}
+            return {"enabled": True, **self.perception.capabilities()}
+
+        @app.get("/api/robots/{robot_id}/autonomy")
+        async def autonomy_get(
+            robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)
+        ) -> Dict[str, Any]:
+            return self.autonomy_status(robot_id)
+
+        @app.post("/api/robots/{robot_id}/autonomy")
+        async def autonomy_post(
+            robot_id: str,
+            body: AutonomyActionIn,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            role = auth["role"]
+            # Autonomy implies driving the robot: gate on the same permission.
+            self._validate_command_by_role(role, "set_autonomy")
+            if self.mqtt_client is None:
+                raise HTTPException(status_code=503, detail="MQTT broker is not connected")
+            action = body.action.strip().lower()
+            self.last_control_activity[robot_id] = time.time()
+            if action == "start":
+                return {"ok": True, **self.start_autonomy(robot_id, body.overrides)}
+            if action in {"stop", "estop"}:
+                snap = await self.stop_autonomy(robot_id, estop=(action == "estop"))
+                return {"ok": True, **snap}
+            if action == "status":
+                return {"ok": True, **self.autonomy_status(robot_id)}
+            raise HTTPException(status_code=400, detail="action must be start|stop|estop|status")
+
+        # ------------------------------------------------------- faces gallery
+        @app.get("/api/robots/{robot_id}/faces")
+        async def faces_list(
+            robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)
+        ) -> Dict[str, Any]:
+            if self.perception is None:
+                return {"people": []}
+            return {"people": self.perception.gallery.list_people(robot_id)}
+
+        @app.get("/api/robots/{robot_id}/faces/{person_id}/image")
+        async def faces_image(
+            robot_id: str, person_id: str,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Any:
+            if self.perception is None:
+                raise HTTPException(status_code=404, detail="perception disabled")
+            path = self.perception.gallery.crop_path(robot_id, person_id)
+            if path is None:
+                raise HTTPException(status_code=404, detail="no crop for this person")
+            return FileResponse(str(path), media_type="image/jpeg")
+
+        @app.post("/api/robots/{robot_id}/faces/{person_id}")
+        async def faces_label(
+            robot_id: str, person_id: str, body: FaceLabelIn,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            if auth["role"] not in {"operator", "admin"}:
+                raise HTTPException(status_code=403, detail="not allowed")
+            if self.perception is None:
+                raise HTTPException(status_code=404, detail="perception disabled")
+            ok = self.perception.gallery.set_label(robot_id, person_id, body.label, body.known)
+            if not ok:
+                raise HTTPException(status_code=404, detail="person not found")
+            return {"ok": True}
+
+        @app.delete("/api/robots/{robot_id}/faces")
+        async def faces_purge_all(
+            robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)
+        ) -> Dict[str, Any]:
+            if auth["role"] not in {"operator", "admin"}:
+                raise HTTPException(status_code=403, detail="not allowed")
+            if self.perception is None:
+                return {"ok": True, "removed": 0}
+            removed = self.perception.gallery.purge(robot_id)
+            self._audit("faces_purged", {"robot_id": robot_id, "removed": removed, "by": auth["user_id"]})
+            return {"ok": True, "removed": removed}
+
+        @app.delete("/api/robots/{robot_id}/faces/{person_id}")
+        async def faces_purge_one(
+            robot_id: str, person_id: str,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            if auth["role"] not in {"operator", "admin"}:
+                raise HTTPException(status_code=403, detail="not allowed")
+            if self.perception is None:
+                return {"ok": True, "removed": 0}
+            removed = self.perception.gallery.purge(robot_id, person_id)
+            return {"ok": True, "removed": removed}
 
         @app.websocket("/ws/live")
         async def ws_live(ws: WebSocket, token: str = Query(default="")) -> None:
@@ -1916,6 +2713,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lidar-cloud-quantization-cm", type=float, default=2.0)
     parser.add_argument("--lidar-cloud-compression-level", type=int, default=6)
+
+    # Automatic solid-mesh reconstruction (background; saved + served to viewer).
+    parser.add_argument(
+        "--mesh-interval-s",
+        type=float,
+        default=60.0,
+        help="Seconds between background mesh rebuilds (0 disables).",
+    )
+    parser.add_argument("--mesh-voxel-size", type=float, default=0.08,
+                        help="Mesh reconstruction resolution in meters.")
+    parser.add_argument("--mesh-min-voxels", type=int, default=300,
+                        help="Min accumulated voxels before a mesh is built.")
+    parser.add_argument("--mesh-smooth-iters", type=int, default=8,
+                        help="Laplacian smoothing iterations (rounds the blocky shell).")
+    parser.add_argument("--mesh-max-vertices", type=int, default=1_500_000,
+                        help="Skip mesh if it would exceed this many vertices.")
     parser.add_argument(
         "--map-storage-dir",
         default=str(Path(__file__).resolve().parent / "maps"),
@@ -1953,6 +2766,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-session-timeout-s", type=float, default=2.0)
 
     parser.add_argument("--prediction-low-battery-threshold", type=float, default=20.0)
+
+    # --- Autonomous exploration ----------------------------------------------
+    parser.add_argument("--autonomy-control-hz", type=float, default=5.0,
+                        help="Autonomy decision/drive rate.")
+    parser.add_argument("--autonomy-v-max", type=float, default=0.35,
+                        help="Max forward speed during autonomy (m/s).")
+    parser.add_argument("--autonomy-w-max", type=float, default=0.8,
+                        help="Max yaw rate during autonomy (rad/s).")
+    parser.add_argument("--autonomy-grid-res", type=float, default=0.15,
+                        help="Frontier occupancy grid resolution (m).")
+    parser.add_argument("--autonomy-robot-radius-m", type=float, default=0.30,
+                        help="Robot radius used to inflate obstacles for planning.")
+
+    # --- Server perception (people + faces) ----------------------------------
+    parser.add_argument("--enable-perception", dest="enable_perception",
+                        action="store_true", default=True,
+                        help="Enable server-side perception (default on; ML deps optional).")
+    parser.add_argument("--disable-perception", dest="enable_perception",
+                        action="store_false", help="Disable server-side perception.")
+    parser.add_argument("--enable-person-detection", dest="enable_person_detection",
+                        action="store_true", default=True)
+    parser.add_argument("--disable-person-detection", dest="enable_person_detection",
+                        action="store_false")
+    parser.add_argument("--enable-face-recognition", dest="enable_face_recognition",
+                        action="store_true", default=True)
+    parser.add_argument("--disable-face-recognition", dest="enable_face_recognition",
+                        action="store_false")
+    parser.add_argument("--perception-device", default="cuda", choices=["cuda", "cpu"],
+                        help="Device for YOLO/insightface (GPU server: cuda).")
+    parser.add_argument("--person-model", default="yolov8n.pt",
+                        help="Ultralytics model for person detection.")
+    parser.add_argument("--person-conf", type=float, default=0.45,
+                        help="Person detection confidence threshold.")
+    parser.add_argument("--face-match-threshold", type=float, default=0.35,
+                        help="Cosine similarity to consider two faces the same person.")
+    parser.add_argument("--face-retention-days", type=float, default=0.0,
+                        help="Auto-delete unknown faces older than N days (0 = keep; privacy).")
+    parser.add_argument("--faces-dir", default="./server/faces",
+                        help="Where face crops + embeddings are stored.")
 
     args = parser.parse_args()
 
@@ -2027,6 +2879,15 @@ def parse_args() -> argparse.Namespace:
 
     if args.frontend_drain_max <= 0:
         parser.error("--frontend-drain-max must be > 0")
+
+    if args.mesh_voxel_size <= 0:
+        parser.error("--mesh-voxel-size must be > 0")
+
+    if args.mesh_min_voxels <= 0 or args.mesh_max_vertices <= 0:
+        parser.error("mesh size limits must be > 0")
+
+    if args.mesh_smooth_iters < 0:
+        parser.error("--mesh-smooth-iters must be >= 0")
 
     if not str(args.map_storage_dir).strip():
         parser.error("--map-storage-dir must not be empty")

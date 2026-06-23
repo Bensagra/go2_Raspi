@@ -796,11 +796,35 @@ class EdgeGatewayService:
             index = nal_start
         return "avc1.42e01e"
 
+    def _make_h264_ctx(self, name: str, width: int, height: int, fps: int, gop: int, bitrate_kbps: int):
+        ctx = av.CodecContext.create(name, "w")
+        ctx.width = width
+        ctx.height = height
+        ctx.pix_fmt = "yuv420p"
+        ctx.bit_rate = max(64, int(bitrate_kbps)) * 1000
+        ctx.gop_size = gop
+        ctx.time_base = Fraction(1, fps)
+        with contextlib.suppress(Exception):
+            ctx.framerate = Fraction(fps, 1)
+        if name == "libx264":
+            ctx.options = {
+                "preset": "ultrafast",
+                "tune": "zerolatency",
+                "profile": "baseline",
+                "x264-params": (
+                    f"keyint={gop}:min-keyint={gop}:scenecut=0:bframes=0:"
+                    f"nal-hrd=cbr:vbv-maxrate={bitrate_kbps}:"
+                    f"vbv-bufsize={bitrate_kbps}"
+                ),
+            }
+        else:
+            ctx.options = {"profile": "baseline"}
+        return ctx
+
     def _build_video_encoder(self, width: int, height: int, fps: int, bitrate_kbps: int):
         width -= width % 2
         height -= height % 2
         gop = self.camera_gop if self.camera_gop > 0 else max(1, fps) * 2
-        bitrate = max(64, int(bitrate_kbps)) * 1000
 
         if self.args.camera_h264_encoder == "auto":
             candidates = ["h264_v4l2m2m", "libx264"]
@@ -809,44 +833,43 @@ class EdgeGatewayService:
 
         last_error: Optional[Exception] = None
         for name in candidates:
+            # av.CodecContext.create() does NOT call avcodec_open2(); a broken
+            # hardware encoder (e.g. h264_v4l2m2m on some Pi builds) only fails when
+            # it first encodes. Probe it with a throwaway frame so we can actually
+            # fall back to libx264 instead of looping on encode errors.
             try:
-                ctx = av.CodecContext.create(name, "w")
-                ctx.width = width
-                ctx.height = height
-                ctx.pix_fmt = "yuv420p"
-                ctx.bit_rate = bitrate
-                ctx.gop_size = gop
-                ctx.time_base = Fraction(1, fps)
+                probe = self._make_h264_ctx(name, width, height, fps, gop, bitrate_kbps)
+                test_frame = av.VideoFrame(width, height, "yuv420p")
+                for plane in test_frame.planes:
+                    plane.update(bytes(plane.buffer_size))
+                list(probe.encode(test_frame))
                 with contextlib.suppress(Exception):
-                    ctx.framerate = Fraction(fps, 1)
-                if name == "libx264":
-                    ctx.options = {
-                        "preset": "ultrafast",
-                        "tune": "zerolatency",
-                        "profile": "baseline",
-                        "x264-params": (
-                            f"keyint={gop}:min-keyint={gop}:scenecut=0:bframes=0:"
-                            f"nal-hrd=cbr:vbv-maxrate={bitrate_kbps}:"
-                            f"vbv-bufsize={bitrate_kbps}"
-                        ),
-                    }
-                else:
-                    ctx.options = {"profile": "baseline"}
-                self._publish_event(
-                    "video_encoder_ready",
-                    {
-                        "encoder": name,
-                        "width": width,
-                        "height": height,
-                        "fps": fps,
-                        "bitrate_kbps": bitrate_kbps,
-                        "gop": gop,
-                    },
-                )
-                return ctx, name
-            except Exception as exc:  # noqa: BLE001 - probe next encoder
+                    list(probe.encode(None))  # flush
+                with contextlib.suppress(Exception):
+                    probe.close()
+            except Exception as exc:  # noqa: BLE001 - this encoder is unusable
                 last_error = exc
+                self._publish_event(
+                    "video_encoder_unavailable",
+                    {"encoder": name, "error": str(exc)},
+                )
                 continue
+
+            # Probe succeeded: build a fresh context so the real stream starts on a
+            # clean keyframe.
+            ctx = self._make_h264_ctx(name, width, height, fps, gop, bitrate_kbps)
+            self._publish_event(
+                "video_encoder_ready",
+                {
+                    "encoder": name,
+                    "width": width,
+                    "height": height,
+                    "fps": fps,
+                    "bitrate_kbps": bitrate_kbps,
+                    "gop": gop,
+                },
+            )
+            return ctx, name
         raise RuntimeError(f"no usable H.264 encoder: {last_error}")
 
     def _encode_camera_frame_h264(self, frame) -> List[Tuple[bytes, bool, int, int]]:

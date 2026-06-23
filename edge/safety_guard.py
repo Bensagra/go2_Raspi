@@ -39,8 +39,8 @@ class SafetyGuard:
         robot_half_width_m: float = 0.26,
         # Clearance thresholds for translation (m): below stop_distance the motion
         # in that direction is vetoed; between stop and slow it is ramped down.
-        stop_distance_m: float = 0.35,
-        slow_distance_m: float = 0.90,
+        stop_distance_m: float = 0.50,
+        slow_distance_m: float = 1.20,
         # Half angle (deg) of the cone scanned around the direction of motion.
         motion_cone_half_deg: float = 45.0,
         # Cliff / negative-obstacle detection. We look at a strip in front of the

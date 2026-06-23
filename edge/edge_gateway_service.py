@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import gc
 import json
 import math
 import time
@@ -2393,6 +2394,7 @@ class EdgeGatewayService:
 
     async def _robot_supervisor_loop(self) -> None:
         bad_since = 0.0
+        consecutive_failures = 0
 
         while not self.stop_event.is_set():
             if self.conn is None:
@@ -2402,12 +2404,30 @@ class EdgeGatewayService:
                         timeout=self.args.robot_connect_timeout_s,
                     )
                     bad_since = 0.0
+                    consecutive_failures = 0
                 except asyncio.CancelledError:
                     raise
                 except (Exception, SystemExit) as exc:
                     await self._disconnect_robot()
-                    self._publish_event("robot_connect_retry", {"error": str(exc)})
-                    await asyncio.sleep(self.args.robot_reconnect_s)
+                    # A failed WebRTC connect can leak sockets/file descriptors in
+                    # the aiortc/ICE stack. Force a GC so they are reclaimed before
+                    # the next attempt, and back off exponentially so repeated
+                    # failures cannot exhaust the FD limit (Errno 24).
+                    gc.collect()
+                    consecutive_failures += 1
+                    backoff = min(
+                        self.args.robot_reconnect_s * (2 ** (consecutive_failures - 1)),
+                        self.args.robot_reconnect_max_s,
+                    )
+                    self._publish_event(
+                        "robot_connect_retry",
+                        {
+                            "error": str(exc),
+                            "attempt": consecutive_failures,
+                            "next_retry_s": round(backoff, 1),
+                        },
+                    )
+                    await asyncio.sleep(backoff)
                 continue
 
             connection = self.conn
@@ -2604,9 +2624,9 @@ def parse_args() -> argparse.Namespace:
                         help="Frame of LiDAR points fed to the guard.")
     parser.add_argument("--safety-update-hz", type=float, default=10.0,
                         help="Max rate the guard ingests LiDAR scans.")
-    parser.add_argument("--safety-stop-distance-m", type=float, default=0.35,
+    parser.add_argument("--safety-stop-distance-m", type=float, default=0.50,
                         help="Below this clearance, motion toward it is vetoed.")
-    parser.add_argument("--safety-slow-distance-m", type=float, default=0.90,
+    parser.add_argument("--safety-slow-distance-m", type=float, default=1.20,
                         help="Between stop and this distance, speed is ramped down.")
     parser.add_argument("--safety-robot-half-width-m", type=float, default=0.26,
                         help="Robot footprint half width for corridor clearance.")
@@ -2655,7 +2675,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--media-ws-max-size", type=int, default=8 * 1024 * 1024)
 
     parser.add_argument("--robot-connect-timeout-s", type=float, default=20.0)
-    parser.add_argument("--robot-reconnect-s", type=float, default=2.0)
+    parser.add_argument("--robot-reconnect-s", type=float, default=2.0,
+                        help="Base delay between reconnect attempts (grows exponentially on repeated failures).")
+    parser.add_argument("--robot-reconnect-max-s", type=float, default=30.0,
+                        help="Cap for the exponential reconnect backoff.")
     parser.add_argument("--robot-heartbeat-timeout-s", type=float, default=10.0)
     parser.add_argument("--robot-link-grace-s", type=float, default=3.0)
     parser.add_argument("--robot-request-timeout-s", type=float, default=2.0)
@@ -2740,6 +2763,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.robot_reconnect_s <= 0:
         parser.error("--robot-reconnect-s must be > 0")
+
+    if args.robot_reconnect_max_s < args.robot_reconnect_s:
+        parser.error("--robot-reconnect-max-s must be >= --robot-reconnect-s")
 
     if args.robot_heartbeat_timeout_s <= 0:
         parser.error("--robot-heartbeat-timeout-s must be > 0")

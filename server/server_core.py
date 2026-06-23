@@ -2901,7 +2901,24 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def raise_fd_limit() -> None:
+    """Raise the open-file limit toward the system hard limit. The media/WebSocket
+    fan-out plus perception decoding open many descriptors; avoids [Errno 24]."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = hard if hard != resource.RLIM_INFINITY else 1048576
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            new_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            print(f"[server] open-file limit raised {soft} -> {new_soft}", flush=True)
+    except Exception as exc:
+        print(f"[server] could not raise open-file limit: {exc}", flush=True)
+
+
 def main() -> None:
+    raise_fd_limit()
     args = parse_args()
     runtime = CoreRuntime(args)
 

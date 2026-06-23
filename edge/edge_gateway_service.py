@@ -2812,7 +2812,29 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def raise_fd_limit() -> None:
+    """Raise this process's open-file limit toward the system hard limit.
+
+    The Go2 WebRTC stack (aiortc/ICE) plus the LiDAR decoder (libvoxel.wasm via
+    wasmtime) open many file descriptors; the typical 1024 soft limit on a
+    Raspberry Pi is easily exhausted ([Errno 24] Too many open files), which then
+    blocks every reconnect. Bumping the soft limit to the hard limit in-process
+    means it works without anyone remembering `ulimit -n`."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = hard if hard != resource.RLIM_INFINITY else 1048576
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            new_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            print(f"[edge] open-file limit raised {soft} -> {new_soft}", flush=True)
+    except Exception as exc:  # non-Unix or not permitted; harmless
+        print(f"[edge] could not raise open-file limit: {exc}", flush=True)
+
+
 def main() -> None:
+    raise_fd_limit()
     args = parse_args()
     app = EdgeGatewayService(args)
 

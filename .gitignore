@@ -1,0 +1,11 @@
+# Python bytecode (was tracked by mistake — caused git pull conflicts)
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Server runtime data (do NOT commit captured faces — biometric/privacy)
+server/faces/
+server/audit/

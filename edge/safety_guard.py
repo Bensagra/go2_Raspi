@@ -93,6 +93,10 @@ class SafetyGuard:
         self._cliff_flag: bool = False
         self._last_update_monotonic: float = 0.0
         self._last_point_count: int = 0
+        # The guard only enforces once it has actually received a valid scan. With
+        # no LiDAR data at all (decoder down, robot not publishing) it stays
+        # disarmed and lets motion through, instead of fail-safe-blocking forever.
+        self._ever_scanned: bool = False
 
     # ------------------------------------------------------------------ update
     def update(self, points_body: Optional[np.ndarray], now: Optional[float] = None) -> None:
@@ -119,6 +123,7 @@ class SafetyGuard:
         if pts.shape[0] == 0:
             self._obst_xy = None
             return
+        self._ever_scanned = True
 
         x = pts[:, 0]
         y = pts[:, 1]
@@ -188,6 +193,11 @@ class SafetyGuard:
         if self._last_point_count >= 200:
             return True
         return False
+
+    def is_armed(self) -> bool:
+        """True once at least one valid LiDAR scan has been ingested. Until then
+        the guard does not enforce (so missing LiDAR never bricks driving)."""
+        return self._ever_scanned
 
     # ------------------------------------------------------------------ filter
     def _min_clearance(self, direction_rad: float) -> float:
@@ -312,6 +322,7 @@ class SafetyGuard:
                 clr = self._min_clearance(direction)
                 sectors[name] = None if math.isinf(clr) else round(clr, 3)
         return {
+            "armed": bool(self._ever_scanned),
             "sectors_m": sectors,
             "cliff": bool(self._cliff_flag),
             "ground_z_m": round(self._ground_z, 3),

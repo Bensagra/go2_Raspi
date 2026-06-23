@@ -1305,8 +1305,13 @@ class EdgeGatewayService:
         while the guard is armed (safety enabled AND LiDAR running, so we actually
         have a scan); otherwise the request passes through untouched and the
         diagnostics flag that safety is inactive."""
-        if not self.safety_enabled or not self.lidar_enabled:
-            info = {"active": False, "blocked": False, "reasons": ["safety_inactive"]}
+        if not self.safety_enabled or not self.lidar_enabled or not self.safety_guard.is_armed():
+            reason = (
+                "safety_disabled" if not self.safety_enabled
+                else "lidar_off" if not self.lidar_enabled
+                else "waiting_lidar"  # enabled but no scan yet -> don't block driving
+            )
+            info = {"active": False, "blocked": False, "reasons": [reason]}
             self.last_safety_info = info
             return vx, vy, wz, info
         result = self.safety_guard.filter_velocity(vx, vy, wz)
@@ -1537,7 +1542,7 @@ class EdgeGatewayService:
             alerts.append("control_heartbeat_timeout")
 
         safety_status = self.safety_guard.status() if self.safety_enabled else {}
-        safety_armed = self.safety_enabled and self.lidar_enabled
+        safety_armed = self.safety_enabled and self.lidar_enabled and self.safety_guard.is_armed()
         if safety_armed and safety_status.get("cliff"):
             alerts.append("cliff_front")
         last_reasons = self.last_safety_info.get("reasons", []) if isinstance(self.last_safety_info, dict) else []

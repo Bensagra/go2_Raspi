@@ -212,6 +212,14 @@ class EdgeGatewayService:
         self.lidar_quantization_cm = args.lidar_quantization_cm
         self.last_lidar_media_at = 0.0
 
+        # LiDAR pipeline counters (so we can see, from telemetry, exactly where
+        # the chain breaks: arriving -> extracted -> uploaded).
+        self.lidar_frames_in = 0
+        self.lidar_points_last = 0
+        self.lidar_media_sent = 0
+        self.lidar_extract_fail = 0
+        self.lidar_debug_dumped = False
+
         # Camera colorization: project each LiDAR point onto the live camera frame
         # (approximate fisheye, no calibration) and sample its RGB. Extrinsics are
         # tunable live via the set_color command so they can be eyeballed.
@@ -455,6 +463,15 @@ class EdgeGatewayService:
         self._mqtt_publish("topic_events", event_payload, qos=0)
 
         if self.lidar_enabled and topic_alias == "ULIDAR_ARRAY":
+            self.lidar_frames_in += 1
+            pts = self._extract_lidar_points(message)
+            n = 0 if pts is None else int(np.asarray(pts).reshape(-1, 3).shape[0]) if getattr(pts, "size", 0) else 0
+            self.lidar_points_last = n
+            if n == 0:
+                self.lidar_extract_fail += 1
+                if not self.lidar_debug_dumped:
+                    self.lidar_debug_dumped = True
+                    self._publish_event("lidar_debug", self._describe_lidar_message(message))
             self._update_safety_from_lidar(message)
             await self._maybe_publish_lidar_media(message)
 
@@ -1283,6 +1300,26 @@ class EdgeGatewayService:
         upper = topic_alias.upper()
         return "LIDAR" in upper or "ULIDAR" in upper or "CLOUD" in upper
 
+    def _describe_lidar_message(self, value: Any, depth: int = 0) -> Any:
+        """Compact, JSON-safe description of a LiDAR message so we can see its real
+        shape in telemetry/events when extraction fails (debugging aid)."""
+        if depth > 4:
+            return "…"
+        if isinstance(value, dict):
+            return {str(k): self._describe_lidar_message(v, depth + 1) for k, v in list(value.items())[:12]}
+        if isinstance(value, (list, tuple)):
+            head = self._describe_lidar_message(value[0], depth + 1) if value else None
+            return {"_list_len": len(value), "_first": head}
+        if isinstance(value, np.ndarray):
+            return {"_ndarray": True, "dtype": str(value.dtype), "shape": list(value.shape), "size": int(value.size)}
+        if isinstance(value, (bytes, bytearray)):
+            return {"_bytes": len(value)}
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        if isinstance(value, str):
+            return value[:60]
+        return f"<{type(value).__name__}>"
+
     def _extract_lidar_points(self, value: Any, depth: int = 0) -> Optional[np.ndarray]:
         if depth > 8 or value is None:
             return None
@@ -1581,6 +1618,7 @@ class EdgeGatewayService:
                 "payload": payload,
             }
         )
+        self.lidar_media_sent += 1
 
     def _telemetry_from_low_state(self) -> Dict[str, Any]:
         topic = TOPIC_ALIAS_TO_VALUE.get("LOW_STATE", "")
@@ -1721,6 +1759,14 @@ class EdgeGatewayService:
                 "lidar_quantization_cm": self.lidar_quantization_cm,
                 "uplink_max_kbps": self.media_max_kbps,
                 "uplink_budget_drops": dict(self.media_budget_drops),
+            },
+            "lidar_pipeline": {
+                "frames_in": self.lidar_frames_in,
+                "points_last": self.lidar_points_last,
+                "media_sent": self.lidar_media_sent,
+                "extract_fail": self.lidar_extract_fail,
+                "decoder": self.args.lidar_decoder,
+                "subscribed": TOPIC_ALIAS_TO_VALUE.get("ULIDAR_ARRAY", "") in self.subscribed_topics,
             },
             "temperatures": {
                 "ntc1": low.get("temperature_ntc1"),

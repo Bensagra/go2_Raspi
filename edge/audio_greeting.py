@@ -206,9 +206,14 @@ def prepare_go2_wav(path: str) -> Optional[str]:
 
 
 def find_audio_uuid(response: Any, name: str) -> Optional[str]:
-    """Extract a UUID from Unitree's nested, JSON-encoded audio-list response."""
+    """Extract a UUID from Unitree's nested, JSON-encoded audio-list response.
+
+    Tries (1) exact normalized name, (2) fuzzy name, (3) the most recently
+    created entry — the one we just uploaded, when the robot stores it under a
+    name we cannot match."""
     target = normalize_audio_name(name)
     found: Dict[str, str] = {}
+    newest: list = [-1.0, None]  # [create_time, uuid]
 
     def walk(obj: Any) -> None:
         if isinstance(obj, dict):
@@ -229,8 +234,18 @@ def find_audio_uuid(response: Any, name: str) -> Optional[str]:
                 ),
                 None,
             )
-            if audio_name and unique_id is not None:
-                found[normalize_audio_name(audio_name)] = str(unique_id)
+            if unique_id is not None:
+                if audio_name:
+                    found[normalize_audio_name(audio_name)] = str(unique_id)
+                ctime = next(
+                    (fields[key] for key in ("create_time", "created_at", "ctime", "timestamp")
+                     if isinstance(fields.get(key), (str, int, float))),
+                    None,
+                )
+                with contextlib.suppress(TypeError, ValueError):
+                    if ctime is not None and float(ctime) > newest[0]:
+                        newest[0] = float(ctime)
+                        newest[1] = str(unique_id)
             for value in obj.values():
                 walk(value)
         elif isinstance(obj, list):
@@ -248,7 +263,7 @@ def find_audio_uuid(response: Any, name: str) -> Optional[str]:
     for stored_name, unique_id in found.items():
         if target and (target in stored_name or stored_name in target):
             return unique_id
-    return None
+    return newest[1]  # fallback: newest uploaded entry (None if nothing has a uuid)
 
 
 class AudioGreetingError(RuntimeError):

@@ -40,6 +40,7 @@ ROLE_ALLOWED_COMMANDS = {
         "e_stop",
         "set_autonomy",
         "set_safety",
+        "play_audio",
         "set_video",
         "set_camera_stream",
         "set_audio",
@@ -59,6 +60,7 @@ ROLE_ALLOWED_COMMANDS = {
         "e_stop",
         "set_autonomy",
         "set_safety",
+        "play_audio",
         "set_video",
         "set_camera_stream",
         "set_audio",
@@ -572,6 +574,11 @@ class CoreRuntime:
             )
         self.autonomy_controllers: Dict[str, AutonomyController] = {}
         self.autonomy_drive_seq: Dict[str, int] = defaultdict(int)
+        # Greeter: play the Go2 greeting when a person is detected (manual OR
+        # autonomous). One background task per robot while enabled.
+        self.greeter_enabled: Set[str] = set()
+        self.greeter_tasks: Dict[str, asyncio.Task] = {}
+        self.last_greet_sent: Dict[str, float] = defaultdict(lambda: 0.0)
 
     @staticmethod
     def _parse_api_tokens(entries: List[str]) -> Dict[str, Dict[str, str]]:
@@ -1020,13 +1027,11 @@ class CoreRuntime:
             # H.264 deltas can't be decoded out of context, so never coalesce
             # them as a "latest snapshot"; the periodic keyframe resyncs viewers.
             is_h264 = out_header.get("image_format") == "h264"
-            # Feed perception only while an autonomy session is running for this
-            # robot (otherwise zero analysis overhead).
-            if self.perception is not None and robot_id in self.autonomy_controllers:
-                controller = self.autonomy_controllers.get(robot_id)
-                if controller and controller.task and not controller.task.done():
-                    with contextlib.suppress(Exception):
-                        self.perception.ingest(robot_id, header, payload)
+            # Feed perception only while something consumes it (autonomy session
+            # or the greeter); otherwise zero analysis overhead.
+            if self.perception is not None and self.perception_active_for(robot_id):
+                with contextlib.suppress(Exception):
+                    self.perception.ingest(robot_id, header, payload)
             self._broadcast_media_frame(
                 robot_id, "video", out_header, payload, coalesce=not is_h264
             )
@@ -1868,6 +1873,9 @@ class CoreRuntime:
         controller = AutonomyController(self, robot_id, cfg)
         self.autonomy_controllers[robot_id] = controller
         controller.start()
+        # Greet detected people during autonomous roaming too.
+        if self.args.greeter_with_autonomy:
+            self.start_greeter(robot_id)
         self._audit("autonomy_start", {"robot_id": robot_id})
         return controller.snapshot()
 
@@ -1887,6 +1895,68 @@ class CoreRuntime:
         if controller:
             return controller.snapshot()
         return {"robot_id": robot_id, "state": "idle", "running": False, "captures": 0}
+
+    # -------------------------------------------------------------- greeter
+    def perception_active_for(self, robot_id: str) -> bool:
+        """Whether the server should be decoding this robot's camera (for any
+        perception consumer: autonomy or the greeter)."""
+        if robot_id in self.greeter_enabled:
+            return True
+        controller = self.autonomy_controllers.get(robot_id)
+        return bool(controller and controller.task and not controller.task.done())
+
+    def start_greeter(self, robot_id: str) -> Dict[str, Any]:
+        self.greeter_enabled.add(robot_id)
+        task = self.greeter_tasks.get(robot_id)
+        if task is None or task.done():
+            self.greeter_tasks[robot_id] = asyncio.create_task(self._greeter_loop(robot_id))
+        self._audit("greeter_start", {"robot_id": robot_id})
+        return self.greeter_status(robot_id)
+
+    def stop_greeter(self, robot_id: str) -> Dict[str, Any]:
+        self.greeter_enabled.discard(robot_id)
+        task = self.greeter_tasks.pop(robot_id, None)
+        if task:
+            task.cancel()
+        self._audit("greeter_stop", {"robot_id": robot_id})
+        return self.greeter_status(robot_id)
+
+    def greeter_status(self, robot_id: str) -> Dict[str, Any]:
+        return {
+            "robot_id": robot_id,
+            "enabled": robot_id in self.greeter_enabled,
+            "available": self.perception is not None and self.perception.person is not None
+            and self.perception.person.available,
+        }
+
+    async def _greeter_loop(self, robot_id: str) -> None:
+        """While enabled, detect people on the latest camera frame and tell the
+        edge to play the greeting (rate-limited). Works in manual and autonomy."""
+        interval = 1.0 / max(self.args.greeter_detect_hz, 0.5)
+        while robot_id in self.greeter_enabled and not self.stop_event.is_set():
+            await asyncio.sleep(interval)
+            if self.perception is None:
+                continue
+            try:
+                boxes, dims = self.perception.detect_people(robot_id)
+            except Exception:
+                continue
+            if not boxes or dims is None:
+                continue
+            w, h = dims
+            best = max((b.score for b in boxes), default=0.0)
+            biggest = max((b.area for b in boxes), default=0.0) / float(max(1, w * h))
+            if best < self.args.greeter_person_conf or biggest < self.args.greeter_min_area_frac:
+                continue
+            now = time.time()
+            if now - self.last_greet_sent[robot_id] < self.args.greet_interval_s:
+                continue
+            self.last_greet_sent[robot_id] = now
+            self.autonomy_command(robot_id, "play_audio", {"force": True})
+            await self.autonomy_event(
+                robot_id, "greet",
+                {"person_score": round(best, 2), "area_frac": round(biggest, 3)},
+            )
 
     def _sanitize_command(
         self,
@@ -2026,6 +2096,9 @@ class CoreRuntime:
         if command_type == "e_stop":
             output = {}
 
+        if command_type == "play_audio":
+            output = {"force": bool(output.get("force", True))}
+
         if command_type == "drive_velocity":
             output["vx"] = float(output.get("vx", 0.0))
             output["vy"] = float(output.get("vy", 0.0))
@@ -2094,6 +2167,8 @@ class CoreRuntime:
         @app.on_event("shutdown")
         async def _shutdown() -> None:
             self.stop_event.set()
+            for task in list(self.greeter_tasks.values()):
+                task.cancel()
             for controller in list(self.autonomy_controllers.values()):
                 with contextlib.suppress(Exception):
                     await controller.stop("stopped")
@@ -2390,6 +2465,29 @@ class CoreRuntime:
             if action == "status":
                 return {"ok": True, **self.autonomy_status(robot_id)}
             raise HTTPException(status_code=400, detail="action must be start|stop|estop|status")
+
+        @app.get("/api/robots/{robot_id}/greeter")
+        async def greeter_get(
+            robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)
+        ) -> Dict[str, Any]:
+            return self.greeter_status(robot_id)
+
+        @app.post("/api/robots/{robot_id}/greeter")
+        async def greeter_post(
+            robot_id: str,
+            body: AutonomyActionIn,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            self._validate_command_by_role(auth["role"], "play_audio")
+            action = body.action.strip().lower()
+            self.last_control_activity[robot_id] = time.time()
+            if action in {"start", "on", "enable"}:
+                return {"ok": True, **self.start_greeter(robot_id)}
+            if action in {"stop", "off", "disable"}:
+                return {"ok": True, **self.stop_greeter(robot_id)}
+            if action == "status":
+                return {"ok": True, **self.greeter_status(robot_id)}
+            raise HTTPException(status_code=400, detail="action must be start|stop|status")
 
         # ------------------------------------------------------- faces gallery
         @app.get("/api/robots/{robot_id}/faces")
@@ -2805,6 +2903,21 @@ def parse_args() -> argparse.Namespace:
                         help="Auto-delete unknown faces older than N days (0 = keep; privacy).")
     parser.add_argument("--faces-dir", default="./server/faces",
                         help="Where face crops + embeddings are stored.")
+
+    # --- Greeter (play Go2 greeting on person detection) ---------------------
+    parser.add_argument("--greet-interval-s", type=float, default=5.0,
+                        help="Minimum seconds between greetings.")
+    parser.add_argument("--greeter-detect-hz", type=float, default=2.5,
+                        help="How often the greeter runs person detection.")
+    parser.add_argument("--greeter-person-conf", type=float, default=0.5,
+                        help="Person confidence needed to greet.")
+    parser.add_argument("--greeter-min-area-frac", type=float, default=0.03,
+                        help="Min person bbox area fraction of the frame to greet.")
+    parser.add_argument("--greeter-with-autonomy", dest="greeter_with_autonomy",
+                        action="store_true", default=True,
+                        help="Also greet while autonomous exploration runs (default on).")
+    parser.add_argument("--no-greeter-with-autonomy", dest="greeter_with_autonomy",
+                        action="store_false")
 
     args = parser.parse_args()
 

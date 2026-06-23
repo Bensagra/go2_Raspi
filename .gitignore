@@ -9,3 +9,6 @@ __pycache__/
 # Server runtime data (do NOT commit captured faces — biometric/privacy)
 server/faces/
 server/audit/
+
+# Generated greet-audio cache (converted from the committed source by ffmpeg)
+*.wav

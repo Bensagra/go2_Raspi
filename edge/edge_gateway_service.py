@@ -6,6 +6,7 @@ import contextlib
 import gc
 import json
 import math
+import os
 import time
 import uuid
 import zlib
@@ -91,6 +92,11 @@ try:
     from safety_guard import SafetyGuard
 except ImportError:  # when imported as a package (edge.edge_gateway_service)
     from edge.safety_guard import SafetyGuard  # type: ignore
+
+try:
+    from unitree_webrtc_connect.webrtc_audiohub import WebRTCAudioHub
+except Exception:  # optional: greeting/audio playback degrades gracefully
+    WebRTCAudioHub = None  # type: ignore
 
 
 TOPIC_ALIAS_TO_VALUE = dict(RTC_TOPIC)
@@ -246,6 +252,16 @@ class EdgeGatewayService:
         self.drive_target_set_at = 0.0
         self.drive_target_ttl_s = args.drive_target_ttl_s
         self.autonomy_driving = False
+
+        # Audio greeting: play a file through the Go2 speaker (audio hub). The
+        # server triggers it on person detection; the edge owns the playback.
+        self.audio_hub = None
+        self.audio_hub_lock = asyncio.Lock()
+        self.greet_audio_file = args.greet_audio_file
+        self.greet_audio_uuid = args.greet_audio_uuid or None
+        self.greet_audio_resolved = False
+        self.last_greet_at = 0.0
+        self.greet_min_interval_s = args.greet_min_interval_s
 
     def _reset_audio_pipeline(self) -> None:
         self.audio_resampler = AudioResampler(
@@ -458,6 +474,139 @@ class EdgeGatewayService:
 
         self.audio_enabled = enabled
         self.conn.audio.switchAudioChannel(enabled)
+
+    async def _ensure_audio_hub(self):
+        if WebRTCAudioHub is None or self.conn is None:
+            return None
+        if self.audio_hub is None:
+            self.audio_hub = WebRTCAudioHub(self.conn)
+        return self.audio_hub
+
+    @staticmethod
+    def _audio_list_find_uuid(response: Any, name: str) -> Optional[str]:
+        """Find a stored audio file's uuid by (fuzzy) name in a get_audio_list
+        response. The exact schema isn't documented, so walk it defensively for
+        any dict that carries both a name-like and an id-like field."""
+        target = name.strip().lower()
+        found: Dict[str, str] = {}
+
+        def walk(obj: Any) -> None:
+            if isinstance(obj, dict):
+                nm = next((obj[k] for k in ("custom_name", "name", "file_name", "title")
+                           if isinstance(obj.get(k), str)), None)
+                uid = next((obj[k] for k in ("unique_id", "uuid", "id")
+                            if isinstance(obj.get(k), str)), None)
+                if nm and uid:
+                    found[nm.strip().lower()] = uid
+                for v in obj.values():
+                    walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    walk(v)
+
+        walk(response)
+        if target in found:
+            return found[target]
+        for nm, uid in found.items():
+            if target and (target in nm or nm in target):
+                return uid
+        return None
+
+    def _prepare_wav(self, path: str) -> Optional[str]:
+        """Convert the greet audio (m4a/mp3/...) to a 44.1 kHz mono WAV the audio
+        hub accepts. Cached next to the source file. Prefers ffmpeg (robust, no
+        pydub/audioop dependency — pydub is broken on Python 3.13)."""
+        if not path or not os.path.exists(path):
+            return None
+        if path.lower().endswith(".wav"):
+            return path
+        out = os.path.splitext(path)[0] + ".wav"
+        if os.path.exists(out):
+            return out
+
+        import shutil
+        import subprocess
+
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            try:
+                subprocess.run(
+                    [ffmpeg, "-y", "-i", path, "-ar", "44100", "-ac", "1", out],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                if os.path.exists(out):
+                    return out
+            except Exception as exc:
+                self._publish_event("greet_audio_error", {"stage": "ffmpeg", "error": str(exc)})
+
+        try:  # fallback for environments with pydub + audioop (Python < 3.13)
+            from pydub import AudioSegment
+
+            seg = AudioSegment.from_file(path).set_frame_rate(44100).set_channels(1)
+            seg.export(out, format="wav", parameters=["-ar", "44100"])
+            return out
+        except Exception as exc:
+            self._publish_event("greet_audio_error", {"stage": "convert", "error": str(exc)})
+            return None
+
+    async def _resolve_greet_uuid(self) -> Optional[str]:
+        if self.greet_audio_uuid:
+            self.greet_audio_resolved = True
+            return self.greet_audio_uuid
+        hub = await self._ensure_audio_hub()
+        if hub is None:
+            return None
+        name = os.path.splitext(os.path.basename(self.greet_audio_file))[0]
+
+        async with self.audio_hub_lock:
+            if self.greet_audio_uuid:
+                return self.greet_audio_uuid
+            # 1) Already on the robot?
+            with contextlib.suppress(Exception):
+                resp = await asyncio.wait_for(hub.get_audio_list(), timeout=6.0)
+                uid = self._audio_list_find_uuid(resp, name)
+                if uid:
+                    self.greet_audio_uuid = uid
+                    self.greet_audio_resolved = True
+                    self._publish_event("greet_audio_ready", {"uuid": uid, "uploaded": False})
+                    return uid
+            # 2) Upload it, then look it up again.
+            wav = await asyncio.to_thread(self._prepare_wav, self.greet_audio_file)
+            if wav is None:
+                self._publish_event("greet_audio_error", {"stage": "missing_file", "file": self.greet_audio_file})
+                return None
+            with contextlib.suppress(Exception):
+                await hub.upload_audio_file(wav)
+            await asyncio.sleep(0.3)
+            with contextlib.suppress(Exception):
+                resp = await asyncio.wait_for(hub.get_audio_list(), timeout=6.0)
+                uid = self._audio_list_find_uuid(resp, name)
+                if uid:
+                    self.greet_audio_uuid = uid
+                    self.greet_audio_resolved = True
+                    self._publish_event("greet_audio_ready", {"uuid": uid, "uploaded": True})
+                    return uid
+        self._publish_event("greet_audio_error", {"stage": "resolve_uuid", "name": name})
+        return None
+
+    async def _prewarm_greet(self) -> None:
+        await asyncio.sleep(2.0)  # let the data channel settle
+        with contextlib.suppress(Exception):
+            await self._resolve_greet_uuid()
+
+    async def _play_greet(self, force: bool = False) -> Dict[str, Any]:
+        now = time.monotonic()
+        if not force and now - self.last_greet_at < self.greet_min_interval_s:
+            return {"played": False, "skipped": "rate_limited"}
+        uid = self.greet_audio_uuid or await self._resolve_greet_uuid()
+        if not uid:
+            raise RuntimeError("greet audio not available")
+        hub = await self._ensure_audio_hub()
+        if hub is None:
+            raise RuntimeError("audio hub unavailable")
+        await hub.play_by_uuid(uid)
+        self.last_greet_at = now
+        return {"played": True, "uuid": uid}
 
     async def _set_lidar(self, enabled: bool) -> None:
         if self.conn is None:
@@ -1645,6 +1794,7 @@ class EdgeGatewayService:
             "set_autonomy",
             "e_stop",
             "set_safety",
+            "play_audio",
             "set_video",
             "set_camera_stream",
             "set_audio",
@@ -2032,6 +2182,11 @@ class EdgeGatewayService:
                 "config": updated,
             }
 
+        if cmd_type == "play_audio":
+            force = bool(payload.get("force", False))
+            result = await self._play_greet(force=force)
+            return {"executed": "play_audio", **result}
+
         if cmd_type in {"follow_target", "go_to"}:
             raise ValueError(f"{cmd_type} not implemented yet on edge")
 
@@ -2363,6 +2518,11 @@ class EdgeGatewayService:
         if self.lidar_enabled:
             await self._set_lidar(True)
 
+        # Pre-warm the greeting audio (upload + resolve uuid) so the first greet
+        # plays instantly. Background task: never blocks the connection.
+        if WebRTCAudioHub is not None and not self.greet_audio_resolved:
+            asyncio.create_task(self._prewarm_greet())
+
         self._publish_event(
             "robot_connected",
             {
@@ -2683,6 +2843,14 @@ def parse_args() -> argparse.Namespace:
                         help="Rate the autonomy loop repeats the drive goal.")
     parser.add_argument("--drive-target-ttl-s", type=float, default=0.8,
                         help="A drive_velocity goal older than this is dropped (robot stops).")
+
+    # --- Audio greeting (Go2 speaker via audio hub) --------------------------
+    parser.add_argument("--greet-audio-file", default="Escuela Técnica Ort 3.m4a",
+                        help="Audio file played through the Go2 speaker on greet (m4a/mp3/wav).")
+    parser.add_argument("--greet-audio-uuid", default="",
+                        help="Skip upload: play this already-stored audio uuid directly.")
+    parser.add_argument("--greet-min-interval-s", type=float, default=5.0,
+                        help="Minimum seconds between greetings (rate limit).")
 
     parser.add_argument(
         "--media-ws-url",

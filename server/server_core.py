@@ -1948,14 +1948,22 @@ class CoreRuntime:
             biggest = max((b.area for b in boxes), default=0.0) / float(max(1, w * h))
             if best < self.args.greeter_person_conf or biggest < self.args.greeter_min_area_frac:
                 continue
-            now = time.time()
+            now = time.monotonic()
             if now - self.last_greet_sent[robot_id] < self.args.greet_interval_s:
                 continue
+            command_id = self.autonomy_command(
+                robot_id, "play_audio", {"force": True}
+            )
+            if not command_id:
+                continue
             self.last_greet_sent[robot_id] = now
-            self.autonomy_command(robot_id, "play_audio", {"force": True})
             await self.autonomy_event(
                 robot_id, "greet",
-                {"person_score": round(best, 2), "area_frac": round(biggest, 3)},
+                {
+                    "command_id": command_id,
+                    "person_score": round(best, 2),
+                    "area_frac": round(biggest, 3),
+                },
             )
 
     def _sanitize_command(
@@ -3010,6 +3018,9 @@ def parse_args() -> argparse.Namespace:
 
     if args.map_max_snapshots < 0:
         parser.error("--map-max-snapshots must be >= 0")
+
+    if args.greet_interval_s <= 0:
+        parser.error("--greet-interval-s must be > 0")
 
     return args
 

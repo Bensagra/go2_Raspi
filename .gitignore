@@ -10,5 +10,6 @@ __pycache__/
 server/faces/
 server/audit/
 
-# Generated greet-audio cache (converted from the committed source by ffmpeg)
+# Generated WAV files, except the greeting asset deployed to the edge.
 *.wav
+!Escuela-*-Ort-3.wav

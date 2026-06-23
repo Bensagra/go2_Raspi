@@ -1,7 +1,17 @@
+import asyncio
 import json
+import tempfile
 import unittest
+import wave
+from array import array
+from pathlib import Path
 
-from edge.audio_greeting import find_audio_uuid, resolve_audio_file
+from edge.audio_greeting import (
+    find_audio_uuid,
+    prepare_go2_wav,
+    resolve_audio_file,
+    resolve_audio_uuid_on_hub,
+)
 
 
 class AudioGreetingTests(unittest.TestCase):
@@ -41,11 +51,80 @@ class AudioGreetingTests(unittest.TestCase):
             "audio-456",
         )
 
-    def test_bundled_audio_resolves_from_any_working_directory(self) -> None:
-        path = resolve_audio_file("Escuela Técnica Ort 3.m4a")
-        self.assertTrue(path.endswith(".m4a"))
-        with open(path, "rb") as audio_file:
-            self.assertTrue(audio_file.read(8))
+    def test_resolves_hyphenated_unicode_wav_from_spaced_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            actual = Path(temp_dir) / "Escuela-Te\u0301cnica-Ort-3.wav"
+            actual.write_bytes(b"RIFF-test")
+            (Path(temp_dir) / "Escuela Técnica Ort 3.m4a").write_bytes(b"m4a")
+
+            resolved = resolve_audio_file(
+                str(Path(temp_dir) / "Escuela Técnica Ort 3.wav")
+            )
+
+            self.assertEqual(Path(resolved), actual.resolve())
+
+    def test_normalizes_48khz_pcm_wav_for_go2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "greeting.wav"
+            samples = array("h", [0, 1000, -1000, 500] * 12000)
+            with wave.open(str(source), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(48000)
+                wav_file.writeframes(samples.tobytes())
+
+            prepared = prepare_go2_wav(str(source))
+
+            self.assertIsNotNone(prepared)
+            self.assertNotEqual(Path(prepared), source)
+            with wave.open(str(prepared), "rb") as wav_file:
+                self.assertEqual(wav_file.getnchannels(), 1)
+                self.assertEqual(wav_file.getsampwidth(), 2)
+                self.assertEqual(wav_file.getframerate(), 44100)
+                self.assertEqual(wav_file.getcomptype(), "NONE")
+
+
+class FakeAudioHub:
+    def __init__(self) -> None:
+        self.uploaded_paths = []
+        self.list_calls = 0
+
+    async def get_audio_list(self):
+        self.list_calls += 1
+        audio_list = []
+        if self.uploaded_paths:
+            audio_list.append(
+                {
+                    "CUSTOM_NAME": Path(self.uploaded_paths[-1]).stem,
+                    "UNIQUE_ID": "uploaded-uuid",
+                }
+            )
+        return {"data": {"data": json.dumps({"audio_list": audio_list})}}
+
+    async def upload_audio_file(self, path: str) -> None:
+        self.uploaded_paths.append(path)
+
+
+class AudioGreetingFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uploads_then_resolves_uuid(self) -> None:
+        hub = FakeAudioHub()
+
+        async def no_sleep(_: float) -> None:
+            await asyncio.sleep(0)
+
+        uuid, uploaded = await resolve_audio_uuid_on_hub(
+            hub,
+            "/audio/Escuela-Técnica-Ort-3.wav",
+            lambda _: "/cache/Escuela-Técnica-Ort-3.wav",
+            sleep=no_sleep,
+        )
+
+        self.assertEqual(uuid, "uploaded-uuid")
+        self.assertTrue(uploaded)
+        self.assertEqual(
+            hub.uploaded_paths, ["/cache/Escuela-Técnica-Ort-3.wav"]
+        )
+        self.assertGreaterEqual(hub.list_calls, 2)
 
 
 if __name__ == "__main__":

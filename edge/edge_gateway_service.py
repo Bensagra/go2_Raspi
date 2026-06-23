@@ -94,6 +94,11 @@ except ImportError:  # when imported as a package (edge.edge_gateway_service)
     from edge.safety_guard import SafetyGuard  # type: ignore
 
 try:
+    from audio_greeting import find_audio_uuid, resolve_audio_file
+except ImportError:  # when imported as a package (edge.edge_gateway_service)
+    from edge.audio_greeting import find_audio_uuid, resolve_audio_file  # type: ignore
+
+try:
     from unitree_webrtc_connect.webrtc_audiohub import WebRTCAudioHub
 except Exception:  # optional: greeting/audio playback degrades gracefully
     WebRTCAudioHub = None  # type: ignore
@@ -257,7 +262,7 @@ class EdgeGatewayService:
         # server triggers it on person detection; the edge owns the playback.
         self.audio_hub = None
         self.audio_hub_lock = asyncio.Lock()
-        self.greet_audio_file = args.greet_audio_file
+        self.greet_audio_file = resolve_audio_file(args.greet_audio_file)
         self.greet_audio_uuid = args.greet_audio_uuid or None
         self.greet_audio_resolved = False
         self.last_greet_at = 0.0
@@ -484,33 +489,7 @@ class EdgeGatewayService:
 
     @staticmethod
     def _audio_list_find_uuid(response: Any, name: str) -> Optional[str]:
-        """Find a stored audio file's uuid by (fuzzy) name in a get_audio_list
-        response. The exact schema isn't documented, so walk it defensively for
-        any dict that carries both a name-like and an id-like field."""
-        target = name.strip().lower()
-        found: Dict[str, str] = {}
-
-        def walk(obj: Any) -> None:
-            if isinstance(obj, dict):
-                nm = next((obj[k] for k in ("custom_name", "name", "file_name", "title")
-                           if isinstance(obj.get(k), str)), None)
-                uid = next((obj[k] for k in ("unique_id", "uuid", "id")
-                            if isinstance(obj.get(k), str)), None)
-                if nm and uid:
-                    found[nm.strip().lower()] = uid
-                for v in obj.values():
-                    walk(v)
-            elif isinstance(obj, list):
-                for v in obj:
-                    walk(v)
-
-        walk(response)
-        if target in found:
-            return found[target]
-        for nm, uid in found.items():
-            if target and (target in nm or nm in target):
-                return uid
-        return None
+        return find_audio_uuid(response, name)
 
     def _prepare_wav(self, path: str) -> Optional[str]:
         """Convert the greet audio (m4a/mp3/...) to a 44.1 kHz mono WAV the audio
@@ -575,11 +554,25 @@ class EdgeGatewayService:
             if wav is None:
                 self._publish_event("greet_audio_error", {"stage": "missing_file", "file": self.greet_audio_file})
                 return None
-            with contextlib.suppress(Exception):
+            try:
                 await hub.upload_audio_file(wav)
-            await asyncio.sleep(0.3)
-            with contextlib.suppress(Exception):
-                resp = await asyncio.wait_for(hub.get_audio_list(), timeout=6.0)
+            except Exception as exc:
+                self._publish_event("greet_audio_error", {"stage": "upload", "error": str(exc)})
+                return None
+
+            # The audio hub indexes an upload asynchronously. Poll briefly rather
+            # than assuming it is visible after one fixed 300 ms sleep.
+            for attempt in range(8):
+                await asyncio.sleep(0.4 if attempt == 0 else 0.6)
+                try:
+                    resp = await asyncio.wait_for(hub.get_audio_list(), timeout=6.0)
+                except Exception as exc:
+                    if attempt == 7:
+                        self._publish_event(
+                            "greet_audio_error",
+                            {"stage": "list_after_upload", "error": str(exc)},
+                        )
+                    continue
                 uid = self._audio_list_find_uuid(resp, name)
                 if uid:
                     self.greet_audio_uuid = uid

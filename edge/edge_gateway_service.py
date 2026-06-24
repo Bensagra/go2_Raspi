@@ -11,6 +11,7 @@ import time
 import uuid
 import zlib
 from fractions import Fraction
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import av
@@ -100,6 +101,7 @@ try:
         AudioGreetingError,
         DirectAudioHub,
         find_audio_uuid,
+        normalize_audio_name,
         prepare_go2_wav,
         resolve_audio_file,
         resolve_audio_uuid_on_hub,
@@ -109,6 +111,7 @@ except ImportError:  # when imported as a package (edge.edge_gateway_service)
         AudioGreetingError,
         DirectAudioHub,
         find_audio_uuid,
+        normalize_audio_name,
         prepare_go2_wav,
         resolve_audio_file,
         resolve_audio_uuid_on_hub,
@@ -131,6 +134,12 @@ PROFILE_TOPICS = {
     "audio": ["AUDIO_HUB_PLAY_STATE"],
     "all": sorted(TOPIC_ALIAS_TO_VALUE.keys()),
 }
+
+DEFAULT_AUDIO_BUTTON_FILES = [
+    "Escuela-Técnica-Ort-3.wav",
+    "correte_pancho.m4a",
+    "no_molestes.m4a",
+]
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -303,6 +312,11 @@ class EdgeGatewayService:
         self.greet_audio_uuid = args.greet_audio_uuid or None
         self.greet_audio_uuid_configured = bool(args.greet_audio_uuid)
         self.greet_audio_resolved = False
+        self.audio_uuid_cache: Dict[str, str] = {}
+        self.audio_button_assets = self._build_audio_button_assets(args.audio_button_file)
+        self.greet_audio_key = normalize_audio_name(self.greet_audio_file)
+        if self.greet_audio_uuid:
+            self.audio_uuid_cache[self.greet_audio_file] = self.greet_audio_uuid
         self.last_greet_at = 0.0
         self.greet_min_interval_s = args.greet_min_interval_s
         # Speaker volume (0-10) pushed to the Go2 VUI service before greeting, so
@@ -581,36 +595,147 @@ class EdgeGatewayService:
         """Return a cached 44.1 kHz mono PCM16 WAV accepted by the Go2."""
         return prepare_go2_wav(path)
 
-    async def _resolve_greet_uuid(self) -> Optional[str]:
-        if self.greet_audio_uuid:
+    @staticmethod
+    def _split_audio_button_values(values: List[str]) -> List[str]:
+        out: List[str] = []
+        for value in values:
+            for part in str(value or "").split(","):
+                part = part.strip()
+                if part:
+                    out.append(part)
+        return out
+
+    @staticmethod
+    def _audio_asset_label(path: str) -> str:
+        stem = Path(path).stem.replace("_", " ").replace("-", " ")
+        return " ".join(stem.split()).title()
+
+    def _build_audio_button_assets(self, configured_files: List[str]) -> List[Dict[str, str]]:
+        requested = [self.greet_audio_file]
+        requested.extend(DEFAULT_AUDIO_BUTTON_FILES)
+        requested.extend(self._split_audio_button_values(configured_files or []))
+
+        assets: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for value in requested:
+            resolved = resolve_audio_file(value)
+            key = normalize_audio_name(resolved)
+            if not key or key in seen:
+                continue
+            if not os.path.isfile(resolved) and not (
+                key == normalize_audio_name(self.greet_audio_file)
+                and self.greet_audio_uuid_configured
+            ):
+                continue
+            seen.add(key)
+            assets.append(
+                {
+                    "key": key,
+                    "name": self._audio_asset_label(resolved),
+                    "file": Path(resolved).name,
+                    "path": resolved,
+                }
+            )
+        return assets
+
+    def _audio_button_status(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": asset["key"],
+                "name": asset["name"],
+                "file": asset["file"],
+                "ready": asset["path"] in self.audio_uuid_cache,
+            }
+            for asset in self.audio_button_assets
+        ]
+
+    def _audio_asset_for_request(
+        self,
+        audio_name: Optional[Any] = None,
+        audio_file: Optional[Any] = None,
+    ) -> Optional[Dict[str, str]]:
+        requested = str(audio_name or audio_file or "").strip()
+        if not requested:
+            requested = self.greet_audio_file
+        target = normalize_audio_name(requested)
+        if not target:
+            return None
+
+        for asset in self.audio_button_assets:
+            names = {
+                asset["key"],
+                normalize_audio_name(asset["name"]),
+                normalize_audio_name(asset["file"]),
+            }
+            if target in names:
+                return asset
+        for asset in self.audio_button_assets:
+            key = asset["key"]
+            if target and (target in key or key in target):
+                return asset
+        return None
+
+    def _default_audio_asset(self) -> Optional[Dict[str, str]]:
+        return self._audio_asset_for_request(audio_file=self.greet_audio_file)
+
+    async def _resolve_audio_asset_uuid(
+        self,
+        asset: Dict[str, str],
+    ) -> Optional[Tuple[str, bool]]:
+        path = asset["path"]
+        if path in self.audio_uuid_cache:
+            return self.audio_uuid_cache[path], False
+
+        if asset["key"] == self.greet_audio_key and self.greet_audio_uuid:
+            self.audio_uuid_cache[path] = self.greet_audio_uuid
             self.greet_audio_resolved = True
-            return self.greet_audio_uuid
+            return self.greet_audio_uuid, False
+
         hub = await self._ensure_audio_hub()
         if hub is None:
             return None
 
         async with self.audio_hub_lock:
-            if self.greet_audio_uuid:
-                return self.greet_audio_uuid
+            if path in self.audio_uuid_cache:
+                return self.audio_uuid_cache[path], False
             try:
                 uid, uploaded = await resolve_audio_uuid_on_hub(
                     hub,
-                    self.greet_audio_file,
+                    path,
                     self._prepare_wav,
                 )
             except AudioGreetingError as exc:
                 self._publish_event(
-                    "greet_audio_error",
-                    {"stage": exc.stage, "error": str(exc), "file": self.greet_audio_file},
+                    "greet_audio_error"
+                    if asset["key"] == self.greet_audio_key
+                    else "audio_button_error",
+                    {"stage": exc.stage, "error": str(exc), "file": asset["file"]},
                 )
                 return None
-            self.greet_audio_uuid = uid
-            self.greet_audio_resolved = True
+            self.audio_uuid_cache[path] = uid
+            if asset["key"] == self.greet_audio_key:
+                self.greet_audio_uuid = uid
+                self.greet_audio_resolved = True
             self._publish_event(
-                "greet_audio_ready",
-                {"uuid": uid, "uploaded": uploaded, "audio_hub": self.audio_hub_kind},
+                "greet_audio_ready"
+                if asset["key"] == self.greet_audio_key
+                else "audio_button_ready",
+                {
+                    "name": asset["name"],
+                    "file": asset["file"],
+                    "uuid": uid,
+                    "uploaded": uploaded,
+                    "audio_hub": self.audio_hub_kind,
+                },
             )
-            return uid
+            return uid, uploaded
+
+    async def _resolve_greet_uuid(self) -> Optional[str]:
+        asset = self._default_audio_asset()
+        if asset is None:
+            return None
+        resolved = await self._resolve_audio_asset_uuid(asset)
+        return resolved[0] if resolved else None
 
     async def _prewarm_greet(self) -> None:
         await asyncio.sleep(2.0)  # let the data channel settle
@@ -632,18 +757,28 @@ class EdgeGatewayService:
         except Exception:
             return False
 
-    async def _play_greet(self, force: bool = False) -> Dict[str, Any]:
+    async def _play_greet(
+        self,
+        force: bool = False,
+        audio_name: Optional[Any] = None,
+        audio_file: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         now = time.monotonic()
         if not force and now - self.last_greet_at < self.greet_min_interval_s:
             return {"played": False, "skipped": "rate_limited"}
+        asset = self._audio_asset_for_request(audio_name=audio_name, audio_file=audio_file)
+        if asset is None:
+            requested = audio_name or audio_file or self.greet_audio_file
+            raise RuntimeError(f"audio not configured: {requested}")
         # Crank the speaker up once (best-effort, in the background so it never
         # adds latency to the greeting nor retries on every loop iteration).
         if not self.greet_volume_applied:
             self.greet_volume_applied = True
             asyncio.create_task(self._set_speaker_volume(self.greet_volume))
-        uid = self.greet_audio_uuid or await self._resolve_greet_uuid()
-        if not uid:
+        resolved = await self._resolve_audio_asset_uuid(asset)
+        if not resolved:
             raise RuntimeError("greet audio not available")
+        uid, uploaded = resolved
         hub = await self._ensure_audio_hub()
         if hub is None:
             raise RuntimeError("audio hub unavailable")
@@ -652,14 +787,17 @@ class EdgeGatewayService:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(hub.resume(), timeout=2.0)
         except Exception:
-            if self.greet_audio_uuid_configured:
+            if asset["key"] == self.greet_audio_key and self.greet_audio_uuid_configured:
                 raise
             # Refresh a stale UUID once (for example after a robot reset).
-            self.greet_audio_uuid = None
-            self.greet_audio_resolved = False
-            uid = await self._resolve_greet_uuid()
-            if not uid:
+            self.audio_uuid_cache.pop(asset["path"], None)
+            if asset["key"] == self.greet_audio_key:
+                self.greet_audio_uuid = None
+                self.greet_audio_resolved = False
+            resolved = await self._resolve_audio_asset_uuid(asset)
+            if not resolved:
                 raise RuntimeError("greet audio unavailable after UUID refresh")
+            uid, uploaded = resolved
             hub = await self._ensure_audio_hub()
             if hub is None:
                 raise RuntimeError("audio hub unavailable after UUID refresh")
@@ -669,9 +807,21 @@ class EdgeGatewayService:
         self.last_greet_at = time.monotonic()
         self._publish_event(
             "greet_audio_play",
-            {"uuid": uid, "audio_hub": self.audio_hub_kind},
+            {
+                "name": asset["name"],
+                "file": asset["file"],
+                "uuid": uid,
+                "uploaded": uploaded,
+                "audio_hub": self.audio_hub_kind,
+            },
         )
-        return {"played": True, "uuid": uid}
+        return {
+            "played": True,
+            "name": asset["name"],
+            "file": asset["file"],
+            "uuid": uid,
+            "uploaded": uploaded,
+        }
 
     async def _set_lidar(self, enabled: bool) -> None:
         if self.conn is None:
@@ -1965,6 +2115,7 @@ class EdgeGatewayService:
                 "driving": self.autonomy_driving,
                 "has_target": self.drive_target is not None,
             },
+            "audio_buttons": self._audio_button_status(),
             "alerts": alerts,
         }
 
@@ -2380,7 +2531,11 @@ class EdgeGatewayService:
 
         if cmd_type == "play_audio":
             force = bool(payload.get("force", False))
-            result = await self._play_greet(force=force)
+            result = await self._play_greet(
+                force=force,
+                audio_name=payload.get("audio_name"),
+                audio_file=payload.get("audio_file"),
+            )
             return {"executed": "play_audio", **result}
 
         if cmd_type in {"follow_target", "go_to"}:
@@ -3072,6 +3227,15 @@ def parse_args() -> argparse.Namespace:
                         help="WAV played through the Go2 speaker (normalized to PCM16 mono 44.1 kHz).")
     parser.add_argument("--greet-audio-uuid", default="",
                         help="Skip upload: play this already-stored audio uuid directly.")
+    parser.add_argument(
+        "--audio-button-file",
+        action="append",
+        default=[],
+        help=(
+            "Audio asset exposed in the dashboard selector. Repeat or pass comma-separated "
+            "values. Defaults include the greeting plus bundled local audio files."
+        ),
+    )
     parser.add_argument("--greet-min-interval-s", type=float, default=5.0,
                         help="Minimum seconds between greetings (rate limit).")
     parser.add_argument("--greet-volume", type=int, default=9,

@@ -99,6 +99,11 @@
       accent-color: var(--err);
     }
 
+    .audio-select {
+      min-width: 220px;
+      max-width: min(100%, 360px);
+    }
+
     .grid2 {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -580,6 +585,12 @@
         <button id="greetTestBtn" type="button">🔈 Probar saludo</button>
         <span id="greeterStatus" class="status">saludo: --</span>
       </div>
+      <div class="row" style="margin-top:6px;">
+        <label for="audioSelect">Audio</label>
+        <select id="audioSelect" class="audio-select" aria-label="audio precargado"></select>
+        <button id="playSelectedAudioBtn" type="button">🔈 Reproducir audio</button>
+        <span id="audioButtonStatus" class="status">audios: --</span>
+      </div>
 
       <h2 class="title" style="margin-top:12px;">🛡 Seguridad (anti-choque LiDAR)</h2>
       <div class="row" style="margin-bottom:6px;">
@@ -941,6 +952,11 @@
         lastChannels: 0,
         lastDecodeErrorAt: 0,
       },
+      audioButtons: [
+        { key: "escuela tecnica ort 3", name: "Escuela Técnica Ort 3", file: "Escuela-Técnica-Ort-3.wav", ready: false },
+        { key: "correte pancho", name: "Correte Pancho", file: "correte_pancho.m4a", ready: false },
+        { key: "no molestes", name: "No Molestes", file: "no_molestes.m4a", ready: false },
+      ],
     };
 
     const els = {
@@ -978,6 +994,9 @@
       unlockAudioBtn: document.getElementById("unlockAudioBtn"),
       mediaStatus: document.getElementById("mediaStatus"),
       audioStatus: document.getElementById("audioStatus"),
+      audioSelect: document.getElementById("audioSelect"),
+      playSelectedAudioBtn: document.getElementById("playSelectedAudioBtn"),
+      audioButtonStatus: document.getElementById("audioButtonStatus"),
       netMetrics: document.getElementById("netMetrics"),
       autoQuality: document.getElementById("autoQuality"),
       liveLidarShell: document.getElementById("liveLidarShell"),
@@ -1184,6 +1203,114 @@
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;");
+    }
+
+    function normalizeAudioKey(value) {
+      return String(value || "")
+        .replace(/\.[^.]+$/, "")
+        .normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim()
+        .replace(/\s+/g, " ");
+    }
+
+    function audioLabelFromFile(value) {
+      return String(value || "")
+        .replace(/\.[^.]+$/, "")
+        .replace(/[_-]+/g, " ")
+        .trim()
+        .replace(/\s+/g, " ")
+        .replace(/\b\w/g, char => char.toUpperCase());
+    }
+
+    function coerceAudioButton(item) {
+      const file = String((item && (item.file || item.audio_file)) || "").trim();
+      const name = String((item && (item.name || item.audio_name)) || "").trim()
+        || audioLabelFromFile(file)
+        || String((item && item.key) || "").trim();
+      const key = String((item && item.key) || normalizeAudioKey(file || name)).trim();
+      if (!key && !name && !file) return null;
+      return { key, name: name || file || key, file, ready: !!(item && item.ready) };
+    }
+
+    function renderAudioButtons() {
+      if (!els.audioSelect || !els.playSelectedAudioBtn) return;
+      const previous = els.audioSelect.value;
+      els.audioSelect.replaceChildren();
+
+      for (const asset of state.audioButtons) {
+        const option = document.createElement("option");
+        option.value = asset.key;
+        option.textContent = asset.name;
+        option.dataset.file = asset.file || "";
+        option.dataset.name = asset.name || "";
+        els.audioSelect.appendChild(option);
+      }
+
+      if (previous && state.audioButtons.some(asset => asset.key === previous)) {
+        els.audioSelect.value = previous;
+      }
+
+      const total = state.audioButtons.length;
+      const ready = state.audioButtons.filter(asset => asset.ready).length;
+      els.playSelectedAudioBtn.disabled = total === 0;
+      if (els.audioButtonStatus) {
+        const text = total
+          ? `audios: ${total}${ready ? ` · cache ${ready}` : ""}`
+          : "audios: sin archivos";
+        setBadge(els.audioButtonStatus, text, total ? "ok" : "warn");
+      }
+    }
+
+    function updateAudioButtonsFromTelemetry(telemetry) {
+      const incoming = telemetry && Array.isArray(telemetry.audio_buttons)
+        ? telemetry.audio_buttons
+        : [];
+      if (!incoming.length) return;
+
+      const seen = new Set();
+      const next = [];
+      for (const item of incoming) {
+        const asset = coerceAudioButton(item);
+        if (!asset || seen.has(asset.key)) continue;
+        seen.add(asset.key);
+        next.push(asset);
+      }
+      if (!next.length) return;
+      state.audioButtons = next;
+      renderAudioButtons();
+    }
+
+    async function playSelectedAudio() {
+      if (!state.connected) {
+        setBadge(els.audioButtonStatus, "conectate antes de reproducir", "warn");
+        return;
+      }
+      const option = els.audioSelect && els.audioSelect.selectedOptions[0];
+      if (!option) {
+        setBadge(els.audioButtonStatus, "sin audio seleccionado", "warn");
+        return;
+      }
+
+      const audioName = option.dataset.name || option.textContent || option.value;
+      const audioFile = option.dataset.file || "";
+      const payload = { force: true };
+      if (audioFile) {
+        payload.audio_file = audioFile;
+      } else {
+        payload.audio_name = audioName;
+      }
+
+      try {
+        setBadge(els.audioButtonStatus, `enviando: ${audioName}`, "warn");
+        await sendCommand("play_audio", payload, 5000);
+        setBadge(els.audioButtonStatus, `audio enviado: ${audioName}`, "ok");
+        addEvent("audio_button_play", payload);
+      } catch (e) {
+        setBadge(els.audioButtonStatus, "no se pudo enviar audio", "err");
+      }
     }
 
     function formatImageMime(imageFormat) {
@@ -3492,7 +3619,9 @@
       bind("greeterToggleBtn", greeterToggle);
       bind("greetLoopBtn", greetLoopToggle);
       bind("greetTestBtn", greetTest);
+      bind("playSelectedAudioBtn", playSelectedAudio);
       bind("safetyToggleBtn", safetyToggle);
+      renderAudioButtons();
     }
     document.addEventListener("DOMContentLoaded", setupAutonomyUI);
 
@@ -3505,6 +3634,7 @@
         els.telemetryBox.textContent = JSON.stringify(telemetry, null, 2);
         updateMeasuredMotion(telemetry);
         updateSafetyReadout(telemetry);
+        updateAudioButtonsFromTelemetry(telemetry);
         return;
       }
 

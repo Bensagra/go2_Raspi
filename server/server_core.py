@@ -2126,6 +2126,11 @@ class CoreRuntime:
 
         if command_type == "play_audio":
             output = {"force": bool(output.get("force", True))}
+            for key in ("audio_name", "audio_file"):
+                if key in payload:
+                    value = str(payload.get(key, "")).strip()
+                    if value:
+                        output[key] = value[:160]
 
         if command_type == "drive_velocity":
             output["vx"] = float(output.get("vx", 0.0))

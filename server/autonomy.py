@@ -340,15 +340,28 @@ class AutonomyController:
 
     def _pose(self) -> Optional[Tuple[float, float, float]]:
         tel = self.rt.latest_telemetry.get(self.robot_id, {})
-        pose = tel.get("pose", {}) if isinstance(tel, dict) else {}
-        try:
-            x = float(pose.get("x"))
-            y = float(pose.get("y"))
-            yaw = float(pose.get("yaw", 0.0) or 0.0)
+        # Use the LiDAR-frame pose (rt/utlidar/robot_pose): it is in the SAME frame
+        # as the accumulated voxel map the explorer plans on. Mixing the sport-leg
+        # odometry pose with map-frame walls puts the robot in the wrong grid cell,
+        # so walls/distances (and the heading toward goals) come out wrong. Fall
+        # back to the sport pose only when the LiDAR pose is unavailable.
+        candidates = []
+        if isinstance(tel, dict):
+            mp = tel.get("map_pose")
+            if isinstance(mp, dict):
+                candidates.append(mp)
+            sp = tel.get("pose")
+            if isinstance(sp, dict):
+                candidates.append(sp)
+        for pose in candidates:
+            try:
+                x = float(pose.get("x"))
+                y = float(pose.get("y"))
+                yaw = float(pose.get("yaw", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
             if math.isfinite(x) and math.isfinite(y) and math.isfinite(yaw):
                 return x, y, yaw
-        except (TypeError, ValueError):
-            pass
         return None
 
     def _drive(self, vx: float, vy: float, wz: float) -> None:

@@ -305,6 +305,10 @@ class EdgeGatewayService:
         self.greet_audio_resolved = False
         self.last_greet_at = 0.0
         self.greet_min_interval_s = args.greet_min_interval_s
+        # Speaker volume (0-10) pushed to the Go2 VUI service before greeting, so
+        # the greeting is loud. Applied once (cached) once it succeeds.
+        self.greet_volume = int(max(0, min(10, args.greet_volume)))
+        self.greet_volume_applied = False
 
     def _reset_audio_pipeline(self) -> None:
         self.audio_resampler = AudioResampler(
@@ -613,10 +617,30 @@ class EdgeGatewayService:
         with contextlib.suppress(Exception):
             await self._resolve_greet_uuid()
 
+    async def _set_speaker_volume(self, level: int) -> bool:
+        """Best-effort: set the Go2 speaker volume via the VUI service (0-10).
+        Returns True on success. Never raises (volume is a nice-to-have)."""
+        if self.conn is None:
+            return False
+        level = int(max(0, min(10, level)))
+        try:
+            await asyncio.wait_for(
+                self._robot_request(TOPIC_ALIAS_TO_VALUE["VUI"], 1005, {"volume": level}),
+                timeout=2.0,
+            )
+            return True
+        except Exception:
+            return False
+
     async def _play_greet(self, force: bool = False) -> Dict[str, Any]:
         now = time.monotonic()
         if not force and now - self.last_greet_at < self.greet_min_interval_s:
             return {"played": False, "skipped": "rate_limited"}
+        # Crank the speaker up once (best-effort, in the background so it never
+        # adds latency to the greeting nor retries on every loop iteration).
+        if not self.greet_volume_applied:
+            self.greet_volume_applied = True
+            asyncio.create_task(self._set_speaker_volume(self.greet_volume))
         uid = self.greet_audio_uuid or await self._resolve_greet_uuid()
         if not uid:
             raise RuntimeError("greet audio not available")
@@ -3050,6 +3074,8 @@ def parse_args() -> argparse.Namespace:
                         help="Skip upload: play this already-stored audio uuid directly.")
     parser.add_argument("--greet-min-interval-s", type=float, default=5.0,
                         help="Minimum seconds between greetings (rate limit).")
+    parser.add_argument("--greet-volume", type=int, default=9,
+                        help="Go2 speaker volume (0-10) set before the greeting.")
 
     parser.add_argument(
         "--media-ws-url",

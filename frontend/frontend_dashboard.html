@@ -576,6 +576,7 @@
       </div>
       <div class="row" style="margin-top:6px;">
         <button id="greeterToggleBtn" type="button">🔊 Saludar al detectar: OFF</button>
+        <button id="greetLoopBtn" type="button">🔁 Saludo Laika (5s): OFF</button>
         <button id="greetTestBtn" type="button">🔈 Probar saludo</button>
         <span id="greeterStatus" class="status">saludo: --</span>
       </div>
@@ -1175,7 +1176,7 @@
       while (els.events.children.length > 100) {
         els.events.removeChild(els.events.lastChild);
       }
-    }
+    }pene
 
     function escapeHtml(text) {
       return String(text)
@@ -3372,6 +3373,33 @@
       }
     }
 
+    // Auto-loop: play the "Hola, acercate a conocer a Laika" greeting every 5s
+    // while enabled. force:true bypasses the edge rate limit so it really repeats.
+    const GREET_LOOP_MS = 5000;
+    function setGreetLoopButton(on) {
+      const btn = autoEl("greetLoopBtn");
+      if (!btn) return;
+      btn.textContent = "🔁 Saludo Laika (5s): " + (on ? "ON" : "OFF");
+      btn.classList.toggle("primary", on);
+    }
+    function greetLoopToggle() {
+      const turnOn = !state.greetLoopOn;
+      state.greetLoopOn = turnOn;
+      if (state.greetLoopTimer) { clearInterval(state.greetLoopTimer); state.greetLoopTimer = null; }
+      setGreetLoopButton(turnOn);
+      if (turnOn) {
+        const fire = () => {
+          if (!state.connected) return;   // resumes automatically on reconnect
+          sendCommand("play_audio", { force: true }, 4000).catch(() => {});
+        };
+        fire();                            // play once right away
+        state.greetLoopTimer = setInterval(fire, GREET_LOOP_MS);
+        setBadge(autoEl("greeterStatus"), "🔁 saludo en bucle cada 5s", "ok");
+      } else {
+        setBadge(autoEl("greeterStatus"), "bucle detenido", "warn");
+      }
+    }
+
     async function autonomyAction(action) {
       try {
         const res = await fetch(api(`/api/robots/${encodeURIComponent(state.robotId)}/autonomy`), {
@@ -3462,6 +3490,7 @@
       bind("facesRefreshBtn", () => { loadFacesGallery(); loadPerceptionCaps(); });
       bind("facesPurgeBtn", purgeFaces);
       bind("greeterToggleBtn", greeterToggle);
+      bind("greetLoopBtn", greetLoopToggle);
       bind("greetTestBtn", greetTest);
       bind("safetyToggleBtn", safetyToggle);
     }

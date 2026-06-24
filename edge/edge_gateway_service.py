@@ -263,6 +263,7 @@ class EdgeGatewayService:
             slow_distance_m=args.safety_slow_distance_m,
             motion_cone_half_deg=args.safety_cone_half_deg,
             cliff_enabled=args.safety_cliff_enabled,
+            cliff_void_enabled=args.safety_cliff_void_enabled,
             cliff_lookahead_m=args.safety_cliff_lookahead_m,
             cliff_drop_m=args.safety_cliff_drop_m,
             ground_z_default_m=args.safety_ground_z_m,
@@ -2975,6 +2976,11 @@ def parse_args() -> argparse.Namespace:
                         help="Negative-obstacle (ledge/stair) guard (default on).")
     parser.add_argument("--safety-cliff-disabled", dest="safety_cliff_enabled",
                         action="store_false", help="Disable cliff guard.")
+    parser.add_argument("--safety-cliff-void-enabled", dest="safety_cliff_void_enabled",
+                        action="store_true", default=False,
+                        help="Treat an empty frontal strip as a ledge/void. Off by "
+                             "default: with the L1 blind cone it false-triggers "
+                             "'borde detectado' far from any real edge.")
     parser.add_argument("--safety-cliff-lookahead-m", type=float, default=0.55,
                         help="How far ahead the cliff strip extends.")
     parser.add_argument("--safety-cliff-drop-m", type=float, default=0.12,

@@ -44,13 +44,18 @@ class SafetyGuard:
         # Half angle (deg) of the cone scanned around the direction of motion.
         motion_cone_half_deg: float = 45.0,
         # Cliff / negative-obstacle detection. We look at a strip in front of the
-        # robot; if the floor there drops below ground - cliff_drop, or the strip
-        # is unexpectedly empty (a void), forward motion is vetoed.
+        # robot; if the floor there drops below ground - cliff_drop forward motion
+        # is vetoed.
         cliff_enabled: bool = True,
         cliff_lookahead_m: float = 0.55,
         cliff_min_range_m: float = 0.12,
         cliff_drop_m: float = 0.12,
         cliff_strip_half_width_m: float = 0.22,
+        # Treat an *empty* frontal strip as a void/ledge. Off by default: the Go2 L1
+        # has a near blind cone and its obstacle voxel map rarely populates the floor
+        # right in front, so "empty strip" is the normal case, not a cliff — leaving
+        # this on produces a permanent false "borde detectado" that blocks driving.
+        cliff_void_enabled: bool = False,
         # Ground level estimation. The ground z is taken as a low percentile of the
         # nearby point heights, clamped around ground_z_default to stay robust when
         # the L1 barely sees the floor.
@@ -78,6 +83,7 @@ class SafetyGuard:
         self.cliff_min_range_m = cliff_min_range_m
         self.cliff_drop_m = cliff_drop_m
         self.cliff_strip_half_width_m = cliff_strip_half_width_m
+        self.cliff_void_enabled = cliff_void_enabled
         self.ground_z_default_m = ground_z_default_m
         self.ground_z_tolerance_m = ground_z_tolerance_m
         self.max_consider_radius_m = max_consider_radius_m
@@ -187,10 +193,11 @@ class SafetyGuard:
             if float(np.percentile(zs, 20.0)) < ground_ref - self.cliff_drop_m:
                 return True
             return False
-        # Few/no returns in a strip where the robot is about to step: only treat
-        # as a void if the scan otherwise has plenty of nearby points (so it is a
-        # genuine hole, not just a sparse scan).
-        if self._last_point_count >= 200:
+        # Few/no returns in the frontal strip. With the L1 this is the *normal*
+        # case (near blind cone + obstacle-only voxel map), so by default we do NOT
+        # treat it as a cliff. Only when void detection is explicitly enabled — and
+        # the scan otherwise has plenty of nearby points — do we flag a genuine hole.
+        if self.cliff_void_enabled and self._last_point_count >= 200:
             return True
         return False
 
@@ -340,6 +347,7 @@ class SafetyGuard:
             "obstacle_min_height_m": "obstacle_min_height_m",
             "obstacle_max_height_m": "obstacle_max_height_m",
             "cliff_enabled": "cliff_enabled",
+            "cliff_void_enabled": "cliff_void_enabled",
             "cliff_lookahead_m": "cliff_lookahead_m",
             "cliff_drop_m": "cliff_drop_m",
             "ground_z_default_m": "ground_z_default_m",
@@ -349,7 +357,7 @@ class SafetyGuard:
         for key, attr in mapping.items():
             if key in payload:
                 value = payload[key]
-                if key in {"cliff_enabled", "fail_safe_block"}:
+                if key in {"cliff_enabled", "cliff_void_enabled", "fail_safe_block"}:
                     setattr(self, attr, bool(value))
                 else:
                     setattr(self, attr, float(value))
@@ -364,6 +372,7 @@ class SafetyGuard:
             "obstacle_min_height_m": self.obstacle_min_height_m,
             "obstacle_max_height_m": self.obstacle_max_height_m,
             "cliff_enabled": self.cliff_enabled,
+            "cliff_void_enabled": self.cliff_void_enabled,
             "cliff_lookahead_m": self.cliff_lookahead_m,
             "cliff_drop_m": self.cliff_drop_m,
             "ground_z_default_m": self.ground_z_default_m,

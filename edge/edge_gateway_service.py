@@ -267,7 +267,11 @@ class EdgeGatewayService:
             cliff_lookahead_m=args.safety_cliff_lookahead_m,
             cliff_drop_m=args.safety_cliff_drop_m,
             ground_z_default_m=args.safety_ground_z_m,
+            ground_z_tolerance_m=args.safety_ground_z_tolerance_m,
+            min_consider_range_m=args.safety_min_consider_range_m,
             max_consider_radius_m=args.safety_max_radius_m,
+            min_cluster_points=args.safety_min_cluster_points,
+            obstacle_cluster_radius_m=args.safety_obstacle_cluster_radius_m,
             scan_timeout_s=args.safety_scan_timeout_s,
         )
         self.last_safety_info: Dict[str, Any] = {}
@@ -587,6 +591,8 @@ class EdgeGatewayService:
             raise RuntimeError("audio hub unavailable")
         try:
             await asyncio.wait_for(hub.play_by_uuid(uid), timeout=6.0)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(hub.resume(), timeout=2.0)
         except Exception:
             if self.greet_audio_uuid_configured:
                 raise
@@ -600,7 +606,10 @@ class EdgeGatewayService:
             if hub is None:
                 raise RuntimeError("audio hub unavailable after UUID refresh")
             await asyncio.wait_for(hub.play_by_uuid(uid), timeout=6.0)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(hub.resume(), timeout=2.0)
         self.last_greet_at = time.monotonic()
+        self._publish_event("greet_audio_play", {"uuid": uid})
         return {"played": True, "uuid": uid}
 
     async def _set_lidar(self, enabled: bool) -> None:
@@ -2967,8 +2976,16 @@ def parse_args() -> argparse.Namespace:
                         help="Max obstacle height (above it the robot passes under).")
     parser.add_argument("--safety-ground-z-m", type=float, default=-0.30,
                         help="Calibrated floor height in body frame (z up).")
+    parser.add_argument("--safety-ground-z-tolerance-m", type=float, default=0.45,
+                        help="How far adaptive floor height may move around --safety-ground-z-m.")
+    parser.add_argument("--safety-min-consider-range-m", type=float, default=0.20,
+                        help="Ignore LiDAR points closer than this range as self/near-field noise.")
     parser.add_argument("--safety-max-radius-m", type=float, default=4.0,
                         help="Ignore obstacle points beyond this radius.")
+    parser.add_argument("--safety-min-cluster-points", type=int, default=3,
+                        help="Minimum nearby obstacle points required before blocking motion.")
+    parser.add_argument("--safety-obstacle-cluster-radius-m", type=float, default=0.20,
+                        help="Radius used to decide whether obstacle points form a real cluster.")
     parser.add_argument("--safety-scan-timeout-s", type=float, default=1.0,
                         help="Scan older than this blocks translation (fail safe).")
     parser.add_argument("--safety-cliff-enabled", dest="safety_cliff_enabled",
@@ -3144,6 +3161,21 @@ def parse_args() -> argparse.Namespace:
 
     if args.safety_slow_distance_m <= args.safety_stop_distance_m:
         parser.error("--safety-slow-distance-m must be > --safety-stop-distance-m")
+
+    if args.safety_ground_z_tolerance_m < 0:
+        parser.error("--safety-ground-z-tolerance-m must be >= 0")
+
+    if args.safety_min_consider_range_m < 0:
+        parser.error("--safety-min-consider-range-m must be >= 0")
+
+    if args.safety_max_radius_m <= args.safety_min_consider_range_m:
+        parser.error("--safety-max-radius-m must be > --safety-min-consider-range-m")
+
+    if args.safety_min_cluster_points <= 0:
+        parser.error("--safety-min-cluster-points must be > 0")
+
+    if args.safety_obstacle_cluster_radius_m <= 0:
+        parser.error("--safety-obstacle-cluster-radius-m must be > 0")
 
     if args.autonomy_drive_hz <= 0:
         parser.error("--autonomy-drive-hz must be > 0")

@@ -60,7 +60,11 @@ class SafetyGuard:
         # nearby point heights, clamped around ground_z_default to stay robust when
         # the L1 barely sees the floor.
         ground_z_default_m: float = -0.30,
-        ground_z_tolerance_m: float = 0.25,
+        ground_z_tolerance_m: float = 0.45,
+        # Ignore returns inside the robot/LiDAR blind-zone envelope. These are
+        # usually self returns or voxel-map smear and otherwise look like a wall
+        # touching the nose.
+        min_consider_range_m: float = 0.20,
         # Points beyond this radius are ignored by the guard (keeps it cheap and
         # focused on imminent collisions).
         max_consider_radius_m: float = 4.0,
@@ -71,6 +75,7 @@ class SafetyGuard:
         # Minimum obstacle points inside a cone to count as a real obstacle (reject
         # isolated noise returns).
         min_cluster_points: int = 3,
+        obstacle_cluster_radius_m: float = 0.20,
     ) -> None:
         self.obstacle_min_height_m = obstacle_min_height_m
         self.obstacle_max_height_m = obstacle_max_height_m
@@ -86,10 +91,12 @@ class SafetyGuard:
         self.cliff_void_enabled = cliff_void_enabled
         self.ground_z_default_m = ground_z_default_m
         self.ground_z_tolerance_m = ground_z_tolerance_m
+        self.min_consider_range_m = min_consider_range_m
         self.max_consider_radius_m = max_consider_radius_m
         self.scan_timeout_s = scan_timeout_s
         self.fail_safe_block = fail_safe_block
-        self.min_cluster_points = min_cluster_points
+        self.min_cluster_points = max(1, int(min_cluster_points))
+        self.obstacle_cluster_radius_m = obstacle_cluster_radius_m
 
         # Latest obstacle scan in body frame (x fwd, y left), polar precomputed.
         self._obst_xy: Optional[np.ndarray] = None  # (N, 2)
@@ -135,7 +142,10 @@ class SafetyGuard:
         y = pts[:, 1]
         z = pts[:, 2]
         planar = np.hypot(x, y)
-        near = planar <= self.max_consider_radius_m
+        near = (
+            (planar >= self.min_consider_range_m)
+            & (planar <= self.max_consider_radius_m)
+        )
         x, y, z, planar = x[near], y[near], z[near], planar[near]
         if x.shape[0] == 0:
             self._obst_xy = None
@@ -231,9 +241,26 @@ class SafetyGuard:
         mask = in_cone | in_corridor
         if not np.any(mask):
             return math.inf
-        if int(np.count_nonzero(mask)) < self.min_cluster_points:
+        count = int(np.count_nonzero(mask))
+        if count < self.min_cluster_points:
             return math.inf
-        return float(np.min(rng[mask]))
+        return self._nearest_cluster_clearance(np.flatnonzero(mask))
+
+    def _nearest_cluster_clearance(self, indices: np.ndarray) -> float:
+        """Return the closest range that belongs to a compact local cluster."""
+        if self._obst_xy is None or self._obst_range is None or indices.shape[0] == 0:
+            return math.inf
+
+        xy = self._obst_xy[indices]
+        rng = self._obst_range[indices]
+        order = np.argsort(rng)
+        radius_sq = max(self.obstacle_cluster_radius_m, 0.01) ** 2
+        for sorted_index in order:
+            delta = xy - xy[sorted_index]
+            close = np.sum(np.einsum("ij,ij->i", delta, delta) <= radius_sq)
+            if int(close) >= self.min_cluster_points:
+                return float(rng[sorted_index])
+        return math.inf
 
     def _scale_for_clearance(self, clearance: float) -> float:
         if clearance <= self.stop_distance_m:
@@ -351,14 +378,20 @@ class SafetyGuard:
             "cliff_lookahead_m": "cliff_lookahead_m",
             "cliff_drop_m": "cliff_drop_m",
             "ground_z_default_m": "ground_z_default_m",
+            "ground_z_tolerance_m": "ground_z_tolerance_m",
+            "min_consider_range_m": "min_consider_range_m",
             "max_consider_radius_m": "max_consider_radius_m",
             "fail_safe_block": "fail_safe_block",
+            "min_cluster_points": "min_cluster_points",
+            "obstacle_cluster_radius_m": "obstacle_cluster_radius_m",
         }
         for key, attr in mapping.items():
             if key in payload:
                 value = payload[key]
                 if key in {"cliff_enabled", "cliff_void_enabled", "fail_safe_block"}:
                     setattr(self, attr, bool(value))
+                elif key == "min_cluster_points":
+                    setattr(self, attr, max(1, int(value)))
                 else:
                     setattr(self, attr, float(value))
         self.slow_distance_m = max(self.slow_distance_m, self.stop_distance_m + 1e-3)
@@ -376,6 +409,10 @@ class SafetyGuard:
             "cliff_lookahead_m": self.cliff_lookahead_m,
             "cliff_drop_m": self.cliff_drop_m,
             "ground_z_default_m": self.ground_z_default_m,
+            "ground_z_tolerance_m": self.ground_z_tolerance_m,
+            "min_consider_range_m": self.min_consider_range_m,
             "max_consider_radius_m": self.max_consider_radius_m,
             "fail_safe_block": self.fail_safe_block,
+            "min_cluster_points": self.min_cluster_points,
+            "obstacle_cluster_radius_m": self.obstacle_cluster_radius_m,
         }

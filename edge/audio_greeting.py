@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 
+TARGET_PCM16_PEAK = 30000
+
+
 def normalize_audio_name(value: str) -> str:
     name = os.path.splitext(os.path.basename(value.strip()))[0]
     decomposed = unicodedata.normalize("NFKD", name).casefold()
@@ -65,6 +68,53 @@ def resolve_audio_file(value: str) -> str:
     return str(candidates[-1].resolve())
 
 
+def _normalize_pcm16_samples(samples: array) -> Tuple[array, bool]:
+    peak = max((abs(int(sample)) for sample in samples), default=0)
+    if peak <= 0 or peak >= TARGET_PCM16_PEAK:
+        return samples, False
+
+    gain = TARGET_PCM16_PEAK / float(peak)
+    normalized = array("h")
+    for sample in samples:
+        value = int(round(int(sample) * gain))
+        normalized.append(max(-32768, min(32767, value)))
+    return normalized, True
+
+
+def _write_pcm16_mono_wav(path: Path, samples: array, sample_rate: int = 44100) -> None:
+    out = array("h", samples)
+    if sys.byteorder != "little":
+        out.byteswap()
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(out.tobytes())
+
+
+def _normalize_wav_file(path: Path) -> None:
+    with wave.open(str(path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        compression = wav_file.getcomptype()
+        raw_frames = wav_file.readframes(wav_file.getnframes())
+    if channels != 1 or sample_width != 2 or sample_rate != 44100 or compression != "NONE":
+        return
+
+    samples = array("h")
+    samples.frombytes(raw_frames)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    normalized, changed = _normalize_pcm16_samples(samples)
+    if not changed:
+        return
+
+    tmp = path.with_suffix(".normalize.tmp.wav")
+    _write_pcm16_mono_wav(tmp, normalized)
+    os.replace(tmp, path)
+
+
 def prepare_go2_wav(path: str) -> Optional[str]:
     """Normalize an audio asset to mono, PCM16, 44.1 kHz without altering it."""
     if not path or not os.path.isfile(path):
@@ -73,7 +123,7 @@ def prepare_go2_wav(path: str) -> Optional[str]:
     source = Path(path).resolve()
     stat = source.stat()
     cache_key = hashlib.sha256(
-        f"{source}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
+        f"v2-normalized:{source}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
     ).hexdigest()[:16]
     cache_dir = Path(tempfile.gettempdir()) / "go2-audio-cache" / cache_key
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -99,7 +149,16 @@ def prepare_go2_wav(path: str) -> Optional[str]:
                 and sample_rate == 44100
                 and compression == "NONE"
             ):
-                return str(source)
+                samples = array("h")
+                samples.frombytes(raw_frames)
+                if sys.byteorder != "little":
+                    samples.byteswap()
+                normalized, changed = _normalize_pcm16_samples(samples)
+                if not changed:
+                    return str(source)
+                _write_pcm16_mono_wav(temporary_output, normalized)
+                os.replace(temporary_output, output)
+                return str(output)
 
             # Pure-Python conversion covers normal PCM16 WAVs, including the
             # common 48 kHz files produced by phones and audio editors.
@@ -140,14 +199,9 @@ def prepare_go2_wav(path: str) -> Optional[str]:
                         converted.append(
                             int(max(-32768, min(32767, round(value))))
                         )
-                if sys.byteorder != "little":
-                    converted.byteswap()
+                normalized, _ = _normalize_pcm16_samples(converted)
 
-                with wave.open(str(temporary_output), "wb") as wav_file:
-                    wav_file.setnchannels(1)
-                    wav_file.setsampwidth(2)
-                    wav_file.setframerate(44100)
-                    wav_file.writeframes(converted.tobytes())
+                _write_pcm16_mono_wav(temporary_output, normalized)
                 os.replace(temporary_output, output)
                 return str(output)
         except (OSError, EOFError, wave.Error, ValueError):
@@ -177,6 +231,8 @@ def prepare_go2_wav(path: str) -> Optional[str]:
             )
             if temporary_output.is_file():
                 os.replace(temporary_output, output)
+                with contextlib.suppress(Exception):
+                    _normalize_wav_file(output)
                 return str(output)
         except (OSError, subprocess.CalledProcessError):
             pass
@@ -197,6 +253,8 @@ def prepare_go2_wav(path: str) -> Optional[str]:
         )
         if temporary_output.is_file():
             os.replace(temporary_output, output)
+            with contextlib.suppress(Exception):
+                _normalize_wav_file(output)
             return str(output)
         return None
     except Exception:
@@ -205,12 +263,17 @@ def prepare_go2_wav(path: str) -> Optional[str]:
         return None
 
 
-def find_audio_uuid(response: Any, name: str) -> Optional[str]:
+def find_audio_uuid(
+    response: Any,
+    name: str,
+    *,
+    allow_newest_fallback: bool = True,
+) -> Optional[str]:
     """Extract a UUID from Unitree's nested, JSON-encoded audio-list response.
 
-    Tries (1) exact normalized name, (2) fuzzy name, (3) the most recently
-    created entry — the one we just uploaded, when the robot stores it under a
-    name we cannot match."""
+    Tries (1) exact normalized name, (2) fuzzy name, (3) optionally the most
+    recently created entry. The newest fallback is only safe immediately after
+    uploading, when the robot may index the file under an unexpected name."""
     target = normalize_audio_name(name)
     found: Dict[str, str] = {}
     newest: list = [-1.0, None]  # [create_time, uuid]
@@ -263,7 +326,7 @@ def find_audio_uuid(response: Any, name: str) -> Optional[str]:
     for stored_name, unique_id in found.items():
         if target and (target in stored_name or stored_name in target):
             return unique_id
-    return newest[1]  # fallback: newest uploaded entry (None if nothing has a uuid)
+    return newest[1] if allow_newest_fallback else None
 
 
 class AudioGreetingError(RuntimeError):
@@ -290,7 +353,11 @@ async def resolve_audio_uuid_on_hub(
     except Exception:
         response = None
 
-    existing_uuid = find_audio_uuid(response, source_name)
+    existing_uuid = find_audio_uuid(
+        response,
+        source_name,
+        allow_newest_fallback=False,
+    )
     if existing_uuid:
         return existing_uuid, False
 
@@ -317,9 +384,17 @@ async def resolve_audio_uuid_on_hub(
             last_list_error = exc
             continue
 
-        uploaded_uuid = find_audio_uuid(response, uploaded_name)
+        uploaded_uuid = find_audio_uuid(
+            response,
+            uploaded_name,
+            allow_newest_fallback=True,
+        )
         if not uploaded_uuid and uploaded_name != source_name:
-            uploaded_uuid = find_audio_uuid(response, source_name)
+            uploaded_uuid = find_audio_uuid(
+                response,
+                source_name,
+                allow_newest_fallback=True,
+            )
         if uploaded_uuid:
             return uploaded_uuid, True
 

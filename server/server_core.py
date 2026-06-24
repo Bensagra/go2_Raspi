@@ -2127,11 +2127,20 @@ class CoreRuntime:
             allowed = {
                 "enabled", "stop_distance_m", "slow_distance_m", "robot_half_width_m",
                 "obstacle_min_height_m", "obstacle_max_height_m", "cliff_enabled",
-                "cliff_lookahead_m", "cliff_drop_m", "ground_z_default_m",
-                "max_consider_radius_m", "fail_safe_block",
+                "cliff_void_enabled", "cliff_lookahead_m", "cliff_drop_m",
+                "ground_z_default_m", "ground_z_tolerance_m",
+                "min_consider_range_m", "max_consider_radius_m",
+                "min_cluster_points", "obstacle_cluster_radius_m",
+                "fail_safe_block",
             }
             output = {
-                k: (bool(v) if k in {"enabled", "cliff_enabled", "fail_safe_block"} else float(v))
+                k: (
+                    bool(v)
+                    if k in {"enabled", "cliff_enabled", "cliff_void_enabled", "fail_safe_block"}
+                    else int(v)
+                    if k == "min_cluster_points"
+                    else float(v)
+                )
                 for k, v in output.items()
                 if k in allowed
             }

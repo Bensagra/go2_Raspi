@@ -578,6 +578,10 @@
       </div>
 
       <h2 class="title" style="margin-top:12px;">🛡 Seguridad (anti-choque LiDAR)</h2>
+      <div class="row" style="margin-bottom:6px;">
+        <button id="safetyToggleBtn" type="button">🛡 Anti-choque: --</button>
+        <span id="safetyToggleStatus" class="status">--</span>
+      </div>
       <div class="row">
         <span id="safArmed" class="status">guard: --</span>
         <span id="safFront" class="status">frente: --</span>
@@ -3242,6 +3246,14 @@
 
     function updateSafetyReadout(t) {
       const saf = (t && t.safety) || {};
+      // Keep the toggle button in sync with the robot's real state (telemetry is
+      // the source of truth, so it self-corrects if toggled elsewhere/on connect).
+      if (typeof saf.enabled === "boolean") {
+        state.safetyOn = saf.enabled;
+        updateSafetyButton(saf.enabled);
+        const tEl = autoEl("safetyToggleStatus");
+        if (tEl) setBadge(tEl, saf.enabled ? "activado" : "DESACTIVADO", saf.enabled ? "ok" : "err");
+      }
       const armed = saf.armed;
       const armedEl = autoEl("safArmed");
       if (armedEl) {
@@ -3293,6 +3305,32 @@
         addEvent("greet", `👋 Saludo (persona ${d.person_score})`);
       } else if (ev === "autonomy_error") {
         addEvent("autonomy_error", d.error || "error");
+      }
+    }
+
+    function updateSafetyButton(on) {
+      const btn = autoEl("safetyToggleBtn");
+      if (!btn) return;
+      btn.textContent = "🛡 Anti-choque: " + (on ? "ON" : "OFF");
+      // Red when OFF (the robot can now collide) so it is obvious at a glance.
+      btn.style.background = on ? "" : "#a11";
+      btn.style.color = on ? "" : "#fff";
+      btn.style.fontWeight = on ? "" : "700";
+    }
+
+    async function safetyToggle() {
+      const turnOn = !state.safetyOn;
+      const sEl = autoEl("safetyToggleStatus");
+      try {
+        const res = await sendCommand("set_safety", { enabled: turnOn }, 3000);
+        // Trust the edge ack when present; otherwise assume the requested state.
+        const applied = (res && res.safety_enabled !== undefined) ? !!res.safety_enabled : turnOn;
+        state.safetyOn = applied;
+        updateSafetyButton(applied);
+        if (sEl) setBadge(sEl, applied ? "activado" : "DESACTIVADO", applied ? "ok" : "err");
+        addEvent("set_safety", "Anti-choque " + (applied ? "ACTIVADO" : "DESACTIVADO"));
+      } catch (e) {
+        if (sEl) setBadge(sEl, "no se pudo cambiar", "err");
       }
     }
 
@@ -3414,6 +3452,7 @@
       bind("facesPurgeBtn", purgeFaces);
       bind("greeterToggleBtn", greeterToggle);
       bind("greetTestBtn", greetTest);
+      bind("safetyToggleBtn", safetyToggle);
     }
     document.addEventListener("DOMContentLoaded", setupAutonomyUI);
 

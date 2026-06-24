@@ -827,7 +827,13 @@ class CoreRuntime:
         points: np.ndarray,
     ) -> Tuple[float, float, float]:
         telemetry = self.latest_telemetry.get(robot_id, {})
-        pose = telemetry.get("pose", {}) if isinstance(telemetry, dict) else {}
+        # Prefer the LiDAR-frame pose (rt/utlidar/robot_pose): it is in the same
+        # frame as the accumulated voxel cloud, so the pose marker + path line up
+        # with the map. Fall back to the sport pose for older edges.
+        pose = {}
+        if isinstance(telemetry, dict):
+            mp = telemetry.get("map_pose")
+            pose = mp if isinstance(mp, dict) and mp.get("x") is not None else telemetry.get("pose", {})
         try:
             x = float(pose.get("x"))
             y = float(pose.get("y"))
@@ -1558,7 +1564,12 @@ class CoreRuntime:
         if suffix == "telemetry":
             self.latest_telemetry[robot_id] = payload
             self.telemetry_history[robot_id].append(payload)
-            pose = payload.get("pose", {}) if isinstance(payload, dict) else {}
+            # Build the path from the LiDAR-frame pose so it overlays the voxel
+            # cloud (same frame); fall back to the sport pose for older edges.
+            pose = {}
+            if isinstance(payload, dict):
+                mp = payload.get("map_pose")
+                pose = mp if isinstance(mp, dict) and mp.get("x") is not None else payload.get("pose", {})
             if isinstance(pose, dict):
                 with contextlib.suppress(TypeError, ValueError):
                     x = float(pose.get("x"))

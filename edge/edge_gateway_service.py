@@ -219,6 +219,9 @@ class EdgeGatewayService:
         self.lidar_media_sent = 0
         self.lidar_extract_fail = 0
         self.lidar_debug_dumped = False
+        # One-time dump of the raw rt/utlidar/robot_pose message so its real schema
+        # can be confirmed from events when pose parsing falls back.
+        self.robot_pose_debug_dumped = False
 
         # Camera colorization: project each LiDAR point onto the live camera frame
         # (approximate fisheye, no calibration) and sample its RGB. Extrinsics are
@@ -1417,12 +1420,103 @@ class EdgeGatewayService:
             yaw = float(rpy[2])
         return x, y, z, yaw
 
+    @staticmethod
+    def _xyz_from(position: Any) -> Optional[Tuple[float, float, float]]:
+        """Read an (x, y, z) triple from a {x,y,z} dict or an [x, y, z] list."""
+        if isinstance(position, dict):
+            with contextlib.suppress(TypeError, ValueError):
+                return (
+                    float(position.get("x", 0.0)),
+                    float(position.get("y", 0.0)),
+                    float(position.get("z", 0.0)),
+                )
+            return None
+        if isinstance(position, (list, tuple)) and len(position) >= 2:
+            with contextlib.suppress(TypeError, ValueError):
+                z = float(position[2]) if len(position) >= 3 else 0.0
+                return (float(position[0]), float(position[1]), z)
+        return None
+
+    @staticmethod
+    def _yaw_from(orientation: Any, node: Dict[str, Any]) -> float:
+        """Yaw (rad) from a quaternion ({x,y,z,w} dict or [x,y,z,w] list); falls
+        back to an rpy[2] field on the node, else 0."""
+        qx = qy = qz = qw = None
+        if isinstance(orientation, dict):
+            qx, qy, qz, qw = (
+                orientation.get("x"),
+                orientation.get("y"),
+                orientation.get("z"),
+                orientation.get("w"),
+            )
+        elif isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+            qx, qy, qz, qw = orientation[0], orientation[1], orientation[2], orientation[3]
+        if None not in (qx, qy, qz, qw):
+            with contextlib.suppress(TypeError, ValueError):
+                qx, qy, qz, qw = float(qx), float(qy), float(qz), float(qw)
+                return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        rpy = node.get("rpy") if isinstance(node, dict) else None
+        if isinstance(rpy, (list, tuple)) and len(rpy) >= 3:
+            with contextlib.suppress(TypeError, ValueError):
+                return float(rpy[2])
+        return 0.0
+
+    def _parse_pose_stamped(self, data: Any) -> Optional[Tuple[float, float, float, float]]:
+        """Parse (x, y, z, yaw) out of a PoseStamped-like payload. Handles both
+        {position, orientation} at the top level and the nested {pose:{...}} shape
+        the Go2 may send, with position/orientation as dicts or lists."""
+        if not isinstance(data, dict):
+            return None
+        nodes = [data]
+        if isinstance(data.get("pose"), dict):
+            nodes.insert(0, data["pose"])
+        # Orientation / rpy may sit on a different level than position, so look for
+        # them across all candidate nodes.
+        orientation = next(
+            (n.get("orientation") for n in nodes if n.get("orientation") is not None),
+            None,
+        )
+        rpy_node = next((n for n in nodes if isinstance(n.get("rpy"), (list, tuple))), {})
+        for node in nodes:
+            xyz = self._xyz_from(node.get("position"))
+            if xyz is None:
+                continue
+            yaw = self._yaw_from(orientation, rpy_node)
+            return xyz[0], xyz[1], xyz[2], yaw
+        return None
+
+    def _lidar_frame_pose_raw(self) -> Optional[Tuple[float, float, float, float]]:
+        """Robot pose (x, y, z, yaw) from rt/utlidar/robot_pose (ROBOTODOM), i.e.
+        in the SAME odometry frame as the decoded voxel map. Returns None when the
+        topic is missing/unparseable."""
+        topic = TOPIC_ALIAS_TO_VALUE.get("ROBOTODOM", "")
+        msg = self.latest_by_topic.get(topic)
+        if not isinstance(msg, dict) or not msg:
+            return None
+        data = msg.get("data", msg)
+        pose = self._parse_pose_stamped(data)
+        if pose is None and not self.robot_pose_debug_dumped:
+            self.robot_pose_debug_dumped = True
+            self._publish_event("robot_pose_debug", self._describe_lidar_message(msg))
+        return pose
+
+    def _lidar_frame_pose(self) -> Tuple[float, float, float, float]:
+        """Pose used to relate world-frame LiDAR points to the robot. The voxel map
+        (rt/utlidar/voxel_map_compressed) lives in the LiDAR/LIO odometry frame,
+        which is a *different* estimator from the sport-mode leg odometry. Mixing
+        them places obstacles at the wrong body position and makes both the
+        reactive brake and the accumulated map/path drift. So we anchor on the pose
+        published in the same frame as the points (rt/utlidar/robot_pose); only if
+        that is unavailable do we fall back to the sport pose (never worse than the
+        previous behaviour)."""
+        return self._lidar_frame_pose_raw() or self._current_camera_pose()
+
     def _world_points_to_body(self, points: np.ndarray) -> np.ndarray:
         """Transform odom/world-frame LiDAR points into the robot body frame
         (x forward, y left, z up relative to the robot) used by the safety guard."""
         if self.safety_points_frame == "body":
             return points
-        x, y, z, yaw = self._current_camera_pose()
+        x, y, z, yaw = self._lidar_frame_pose()
         d = points[:, :3] - np.array([x, y, z], dtype=np.float32)
         cos_y, sin_y = math.cos(yaw), math.sin(yaw)
         bx = cos_y * d[:, 0] + sin_y * d[:, 1]
@@ -1520,7 +1614,7 @@ class EdgeGatewayService:
             )
             bx, by, bz = d[:, 0], d[:, 1], d[:, 2]
         else:
-            x, y, z, yaw = self._current_camera_pose()
+            x, y, z, yaw = self._lidar_frame_pose()
             cam_x = x + self.color_cam_forward_m * math.cos(yaw)
             cam_y = y + self.color_cam_forward_m * math.sin(yaw)
             cam_z = z + self.color_cam_height_m
@@ -1710,11 +1804,22 @@ class EdgeGatewayService:
         if safety_armed and ("obstacle_front" in last_reasons or "cliff_front" in last_reasons):
             alerts.append("obstacle_front")
 
+        # Pose in the LiDAR/voxel-map frame for the accumulated map + path overlay,
+        # so they line up with the cloud (which is in that same frame). Falls back
+        # to the sport pose when rt/utlidar/robot_pose is unavailable.
+        lidar_pose = self._lidar_frame_pose_raw()
+        map_pose = (
+            {"x": lidar_pose[0], "y": lidar_pose[1], "yaw": lidar_pose[3]}
+            if lidar_pose is not None
+            else sport.get("pose", {})
+        )
+
         return {
             "robot_id": self.args.robot_id,
             "ts": time.time(),
             "mode": self.last_heartbeat_payload.get("mode", "manual"),
             "pose": sport.get("pose", {}),
+            "map_pose": map_pose,
             "velocity": sport.get("velocity", {}),
             "speed_control": {
                 "profile": self.speed_profile,

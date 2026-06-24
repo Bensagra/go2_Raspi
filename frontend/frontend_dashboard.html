@@ -472,8 +472,11 @@
         </div>
         <div class="joy-wrap">
           <div class="joy-base" id="joyRight"><div class="joy-knob" id="joyRightKnob"></div></div>
-          <div class="hint" style="margin-top:6px;">Girar · izquierda/derecha</div>
+          <div class="hint" style="margin-top:6px;">Girar · avance fino</div>
         </div>
+      </div>
+      <div class="row" style="justify-content:center; margin-top:6px;">
+        <span id="gamepadStatus" class="status">gamepad: no detectado</span>
       </div>
 
       <div class="row" style="margin-top: 10px;">
@@ -762,8 +765,15 @@
       lastMoveSignature: "",
       driveSequence: 0,
       keyState: new Set(),
-      // On-screen joysticks (normalized -1..1). left = translate, right = turn.
+      // On-screen joysticks (normalized -1..1). left = translate, right = turn
+      // plus a small forward/reverse trim so both sticks can be blended.
       joystick: { left: { x: 0, y: 0 }, right: { x: 0, y: 0 } },
+      gamepad: {
+        index: null,
+        name: "",
+        left: { x: 0, y: 0 },
+        right: { x: 0, y: 0 },
+      },
       token: "",
       apiBase: "",
       robotId: "go2_01",
@@ -949,6 +959,7 @@
       speedLabel: document.getElementById("speedLabel"),
       maxApiToggle: document.getElementById("maxApiToggle"),
       speedProfileStatus: document.getElementById("speedProfileStatus"),
+      gamepadStatus: document.getElementById("gamepadStatus"),
       requestedSpeedStatus: document.getElementById("requestedSpeedStatus"),
       measuredSpeedStatus: document.getElementById("measuredSpeedStatus"),
       loopMs: document.getElementById("loopMs"),
@@ -3560,17 +3571,34 @@
       return { x, y, z };
     }
 
+    function shapedAxis(value, deadzone = 0.08) {
+      const v = clamp(parseNum(value, 0), -1, 1);
+      const abs = Math.abs(v);
+      if (abs <= deadzone) return 0;
+      const normalized = (abs - deadzone) / (1 - deadzone);
+      return Math.sign(v) * normalized * normalized;
+    }
+
+    function blendAxis(a, b) {
+      return clamp(shapedAxis(a) + shapedAxis(b), -1, 1);
+    }
+
     // Combined drive command from keyboard + on-screen joysticks, clamped to the
     // current speed preset. Left stick = translate (up=forward, left=strafe left),
-    // right stick = yaw (left=turn left).
+    // right stick = yaw (left=turn left) plus a smaller forward/reverse trim.
     function currentMove() {
       const speed = currentPreset();
       const k = currentMoveFromKeys();
       const L = state.joystick.left;
       const R = state.joystick.right;
-      const jLinear = -L.y;   // screen up (negative y) = forward
-      const jLateral = -L.x;  // screen left (negative x) = strafe left (+y)
-      const jYaw = -R.x;      // screen left = turn left (+z)
+      const G = state.gamepad;
+      const leftX = blendAxis(L.x, G.left.x);
+      const leftY = blendAxis(L.y, G.left.y);
+      const rightX = blendAxis(R.x, G.right.x);
+      const rightY = blendAxis(R.y, G.right.y);
+      const jLinear = clamp(-leftY + (-rightY * 0.35), -1, 1);
+      const jLateral = -leftX;  // screen/gamepad left = strafe left (+y)
+      const jYaw = -rightX;     // screen/gamepad left = turn left (+z)
 
       let x = k.x + (jLinear >= 0 ? jLinear * speed.forward : jLinear * speed.reverse);
       let y = k.y + jLateral * speed.lateral;
@@ -3912,6 +3940,7 @@
       const loopMs = parseLoopMs();
 
       state.controlLoop = setInterval(() => {
+        readGamepadState();
         sendDriveState(false);
       }, loopMs);
 
@@ -3941,6 +3970,8 @@
       state.lastMoveSignature = "";
       state.lastMoveSentAt = 0;
       state.lastRequestedMove = { x: 0, y: 0, z: 0 };
+      state.gamepad.left = { x: 0, y: 0 };
+      state.gamepad.right = { x: 0, y: 0 };
       updateMotionReadouts();
       state.controlSending = false;
       state.stopSending = false;
@@ -4407,6 +4438,66 @@
         if (pointerId !== null) { pointerId = null; reset(); }
       });
     }
+
+    function resetGamepadState(message = "gamepad: no detectado") {
+      state.gamepad.index = null;
+      state.gamepad.name = "";
+      state.gamepad.left = { x: 0, y: 0 };
+      state.gamepad.right = { x: 0, y: 0 };
+      if (els.gamepadStatus) setBadge(els.gamepadStatus, message, "");
+    }
+
+    function selectGamepad() {
+      if (!navigator.getGamepads) return null;
+      const pads = Array.from(navigator.getGamepads()).filter(Boolean);
+      const selected = pads.find(pad => pad.axes && pad.axes.length >= 4) || pads[0] || null;
+      if (!selected) return null;
+      state.gamepad.index = selected.index;
+      state.gamepad.name = selected.id || `gamepad ${selected.index}`;
+      return selected;
+    }
+
+    function readGamepadState() {
+      if (!navigator.getGamepads) return;
+      let pad = null;
+      if (state.gamepad.index !== null) {
+        pad = navigator.getGamepads()[state.gamepad.index] || null;
+      }
+      if (!pad) pad = selectGamepad();
+      if (!pad || !pad.connected) {
+        if (state.gamepad.index !== null) resetGamepadState();
+        return;
+      }
+
+      const axes = pad.axes || [];
+      state.gamepad.left = {
+        x: clamp(parseNum(axes[0], 0), -1, 1),
+        y: clamp(parseNum(axes[1], 0), -1, 1),
+      };
+      state.gamepad.right = {
+        x: clamp(parseNum(axes[2], 0), -1, 1),
+        y: clamp(parseNum(axes[3], 0), -1, 1),
+      };
+      if (els.gamepadStatus) {
+        setBadge(els.gamepadStatus, `gamepad: ${state.gamepad.name}`, "ok");
+      }
+    }
+
+    window.addEventListener("gamepadconnected", (event) => {
+      const pad = event.gamepad;
+      state.gamepad.index = pad.index;
+      state.gamepad.name = pad.id || `gamepad ${pad.index}`;
+      if (els.gamepadStatus) setBadge(els.gamepadStatus, `gamepad: ${state.gamepad.name}`, "ok");
+      addEvent("gamepad_connected", { id: state.gamepad.name, index: pad.index });
+    });
+
+    window.addEventListener("gamepaddisconnected", (event) => {
+      if (state.gamepad.index === event.gamepad.index) {
+        resetGamepadState("gamepad: desconectado");
+        sendDriveState(true);
+      }
+      addEvent("gamepad_disconnected", { index: event.gamepad.index });
+    });
 
     els.maxApiToggle.disabled = true;
     applyNetworkProfileValues();

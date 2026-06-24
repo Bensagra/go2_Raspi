@@ -1,6 +1,7 @@
 """Small, dependency-free helpers for Go2 greeting audio playback."""
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import wave
 from array import array
@@ -333,6 +335,82 @@ class AudioGreetingError(RuntimeError):
     def __init__(self, stage: str, message: str) -> None:
         super().__init__(message)
         self.stage = stage
+
+
+class DirectAudioHub:
+    """Dependency-light AudioHub client matching unitree_webrtc_connect.
+
+    The library's WebRTCAudioHub imports pydub at module import time; on some
+    Python builds that fails even though the robot request protocol is available.
+    This class sends the same AUDIO_API requests and upload chunk payloads while
+    relying on prepare_go2_wav for any transcoding/normalization.
+    """
+
+    def __init__(
+        self,
+        request: Callable[[int, Optional[Any]], Awaitable[Any]],
+        audio_api: Dict[str, int],
+    ) -> None:
+        self._request = request
+        self._api = audio_api
+
+    async def get_audio_list(self):
+        return await self._request(int(self._api["GET_AUDIO_LIST"]), {})
+
+    async def play_by_uuid(self, unique_id: str):
+        return await self._request(
+            int(self._api["SELECT_START_PLAY"]),
+            {"unique_id": str(unique_id)},
+        )
+
+    async def pause(self):
+        return await self._request(int(self._api["PAUSE"]), {})
+
+    async def resume(self):
+        return await self._request(int(self._api["UNSUSPEND"]), {})
+
+    async def set_play_mode(self, play_mode: str):
+        return await self._request(
+            int(self._api["SET_PLAY_MODE"]),
+            {"play_mode": str(play_mode)},
+        )
+
+    async def get_play_mode(self):
+        return await self._request(int(self._api["GET_PLAY_MODE"]), {})
+
+    async def upload_audio_file(self, audiofile_path: str):
+        with open(audiofile_path, "rb") as audio_file:
+            audio_data = audio_file.read()
+
+        b64_data = base64.b64encode(audio_data).decode("utf-8")
+        chunk_size = 4096
+        chunks = [
+            b64_data[index : index + chunk_size]
+            for index in range(0, len(b64_data), chunk_size)
+        ] or [""]
+        file_name = os.path.splitext(os.path.basename(audiofile_path))[0]
+        file_md5 = hashlib.md5(audio_data).hexdigest()
+        create_time = int(time.time() * 1000)
+        last_response = None
+
+        for index, chunk in enumerate(chunks, 1):
+            last_response = await self._request(
+                int(self._api["UPLOAD_AUDIO_FILE"]),
+                {
+                    "file_name": file_name,
+                    "file_type": "wav",
+                    "file_size": len(audio_data),
+                    "current_block_index": index,
+                    "total_block_number": len(chunks),
+                    "block_content": chunk,
+                    "current_block_size": len(chunk),
+                    "file_md5": file_md5,
+                    "create_time": create_time,
+                },
+            )
+            await asyncio.sleep(0.1)
+
+        return last_response
 
 
 async def resolve_audio_uuid_on_hub(

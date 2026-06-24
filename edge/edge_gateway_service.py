@@ -72,6 +72,7 @@ def encode_cloud_payload(points, colors, quantization_cm: float, compression_lev
 
 try:
     from unitree_webrtc_connect import (
+        AUDIO_API,
         DATA_CHANNEL_TYPE,
         RTC_TOPIC,
         SPORT_CMD,
@@ -80,6 +81,7 @@ try:
     )
 except ImportError:
     from unitree_webrtc_connect.constants import (  # type: ignore
+        AUDIO_API,
         DATA_CHANNEL_TYPE,
         RTC_TOPIC,
         SPORT_CMD,
@@ -96,6 +98,7 @@ except ImportError:  # when imported as a package (edge.edge_gateway_service)
 try:
     from audio_greeting import (
         AudioGreetingError,
+        DirectAudioHub,
         find_audio_uuid,
         prepare_go2_wav,
         resolve_audio_file,
@@ -104,6 +107,7 @@ try:
 except ImportError:  # when imported as a package (edge.edge_gateway_service)
     from edge.audio_greeting import (  # type: ignore
         AudioGreetingError,
+        DirectAudioHub,
         find_audio_uuid,
         prepare_go2_wav,
         resolve_audio_file,
@@ -112,8 +116,10 @@ except ImportError:  # when imported as a package (edge.edge_gateway_service)
 
 try:
     from unitree_webrtc_connect.webrtc_audiohub import WebRTCAudioHub
-except Exception:  # optional: greeting/audio playback degrades gracefully
+    AUDIO_HUB_IMPORT_ERROR = ""
+except Exception as exc:  # optional: greeting/audio playback has a direct fallback
     WebRTCAudioHub = None  # type: ignore
+    AUDIO_HUB_IMPORT_ERROR = str(exc)
 
 
 TOPIC_ALIAS_TO_VALUE = dict(RTC_TOPIC)
@@ -289,6 +295,7 @@ class EdgeGatewayService:
         # Audio greeting: play a file through the Go2 speaker (audio hub). The
         # server triggers it on person detection; the edge owns the playback.
         self.audio_hub = None
+        self.audio_hub_kind = ""
         self.audio_hub_play_mode_ready = False
         self.audio_hub_lock = asyncio.Lock()
         self.greet_prewarm_task: Optional[asyncio.Task[None]] = None
@@ -521,10 +528,34 @@ class EdgeGatewayService:
         self.conn.audio.switchAudioChannel(enabled)
 
     async def _ensure_audio_hub(self):
-        if WebRTCAudioHub is None or self.conn is None:
+        if self.conn is None:
             return None
         if self.audio_hub is None:
-            self.audio_hub = WebRTCAudioHub(self.conn)
+            if WebRTCAudioHub is not None:
+                try:
+                    self.audio_hub = WebRTCAudioHub(self.conn)
+                    self.audio_hub_kind = "library"
+                except Exception as exc:
+                    self._publish_event(
+                        "audiohub_library_error",
+                        {"error": str(exc), "fallback": "direct"},
+                    )
+                    self.audio_hub = None
+            if self.audio_hub is None:
+                async def request(api_id: int, parameter: Optional[Any] = None) -> Any:
+                    return await self._robot_request(
+                        TOPIC_ALIAS_TO_VALUE["AUDIO_HUB_REQ"],
+                        api_id,
+                        parameter or {},
+                    )
+
+                self.audio_hub = DirectAudioHub(request, AUDIO_API)
+                self.audio_hub_kind = "direct"
+                if AUDIO_HUB_IMPORT_ERROR:
+                    self._publish_event(
+                        "audiohub_direct_fallback",
+                        {"reason": AUDIO_HUB_IMPORT_ERROR},
+                    )
             self.audio_hub_play_mode_ready = False
         if not self.audio_hub_play_mode_ready:
             try:
@@ -571,7 +602,10 @@ class EdgeGatewayService:
                 return None
             self.greet_audio_uuid = uid
             self.greet_audio_resolved = True
-            self._publish_event("greet_audio_ready", {"uuid": uid, "uploaded": uploaded})
+            self._publish_event(
+                "greet_audio_ready",
+                {"uuid": uid, "uploaded": uploaded, "audio_hub": self.audio_hub_kind},
+            )
             return uid
 
     async def _prewarm_greet(self) -> None:
@@ -609,7 +643,10 @@ class EdgeGatewayService:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(hub.resume(), timeout=2.0)
         self.last_greet_at = time.monotonic()
-        self._publish_event("greet_audio_play", {"uuid": uid})
+        self._publish_event(
+            "greet_audio_play",
+            {"uuid": uid, "audio_hub": self.audio_hub_kind},
+        )
         return {"played": True, "uuid": uid}
 
     async def _set_lidar(self, enabled: bool) -> None:
@@ -2656,8 +2693,7 @@ class EdgeGatewayService:
         # Pre-warm the greeting audio (upload + resolve uuid) so the first greet
         # plays instantly. Background task: never blocks the connection.
         if (
-            WebRTCAudioHub is not None
-            and not self.greet_audio_resolved
+            not self.greet_audio_resolved
             and (
                 self.greet_prewarm_task is None
                 or self.greet_prewarm_task.done()

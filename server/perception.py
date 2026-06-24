@@ -169,6 +169,8 @@ class FaceResult:
     bbox: Tuple[float, float, float, float]
     det_score: float
     quality: float
+    sharpness: float = 0.0
+    face_frac: float = 0.0
     embedding: Optional[np.ndarray] = None
     crop: Optional[np.ndarray] = None
 
@@ -243,6 +245,63 @@ class FaceAnalyzer:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _crop_with_padding(
+        bgr: np.ndarray,
+        bbox: Tuple[float, float, float, float],
+        pad_frac: float = 0.42,
+        min_output_px: int = 160,
+    ) -> Optional[np.ndarray]:
+        try:
+            import cv2
+        except Exception:
+            cv2 = None
+
+        h, w = bgr.shape[:2]
+        x1, y1, x2, y2 = bbox
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        pad_x = bw * pad_frac
+        pad_y = bh * pad_frac
+        xi1 = max(0, int(math.floor(x1 - pad_x)))
+        yi1 = max(0, int(math.floor(y1 - pad_y * 1.15)))
+        xi2 = min(w, int(math.ceil(x2 + pad_x)))
+        yi2 = min(h, int(math.ceil(y2 + pad_y)))
+        if xi2 <= xi1 or yi2 <= yi1:
+            return None
+        crop = bgr[yi1:yi2, xi1:xi2].copy()
+        if cv2 is not None and min(crop.shape[:2]) < min_output_px:
+            scale = min_output_px / max(1, min(crop.shape[:2]))
+            crop = cv2.resize(
+                crop,
+                (
+                    max(1, int(round(crop.shape[1] * scale))),
+                    max(1, int(round(crop.shape[0] * scale))),
+                ),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        return crop
+
+    @staticmethod
+    def _enhance_crop(crop: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if crop is None or crop.size == 0:
+            return crop
+        try:
+            import cv2
+
+            lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
+            l_channel = clahe.apply(l_channel)
+            enhanced = cv2.cvtColor(
+                cv2.merge((l_channel, a_channel, b_channel)),
+                cv2.COLOR_LAB2BGR,
+            )
+            blur = cv2.GaussianBlur(enhanced, (0, 0), 0.7)
+            return cv2.addWeighted(enhanced, 1.18, blur, -0.18, 0)
+        except Exception:
+            return crop
+
     def analyze(self, bgr: np.ndarray) -> List[FaceResult]:
         if not self.available or bgr is None:
             return []
@@ -259,20 +318,33 @@ class FaceAnalyzer:
         h, w = bgr.shape[:2]
         for f in faces:
             x1, y1, x2, y2 = [float(v) for v in f.bbox]
-            xi1, yi1 = max(0, int(x1)), max(0, int(y1))
-            xi2, yi2 = min(w, int(x2)), min(h, int(y2))
-            crop = bgr[yi1:yi2, xi1:xi2].copy() if xi2 > xi1 and yi2 > yi1 else None
+            tight_crop = self._crop_with_padding(
+                bgr,
+                (x1, y1, x2, y2),
+                pad_frac=0.05,
+                min_output_px=1,
+            )
+            crop = self._enhance_crop(
+                self._crop_with_padding(bgr, (x1, y1, x2, y2))
+            )
             emb = getattr(f, "normed_embedding", None)
             if emb is not None:
                 emb = np.asarray(emb, dtype=np.float32)
             face_h = y2 - y1
-            sharp = self._sharpness(crop) if crop is not None else 0.0
-            quality = self._quality(face_h, h, float(f.det_score), sharp)
+            sharp = self._sharpness(tight_crop) if tight_crop is not None else 0.0
+            quality = self._quality(
+                (x1, y1, x2, y2),
+                (w, h),
+                float(f.det_score),
+                sharp,
+            )
             out.append(
                 FaceResult(
                     bbox=(x1, y1, x2, y2),
                     det_score=float(f.det_score),
                     quality=quality,
+                    sharpness=round(sharp, 2),
+                    face_frac=round(float(face_h / max(h, 1)), 4),
                     embedding=emb,
                     crop=crop,
                 )
@@ -283,15 +355,19 @@ class FaceAnalyzer:
         gray = self._cv2.cvtColor(bgr, self._cv2.COLOR_BGR2GRAY)
         rects = self._haar.detectMultiScale(gray, 1.1, 5, minSize=(48, 48))
         out: List[FaceResult] = []
-        h = bgr.shape[0]
+        h, w = bgr.shape[:2]
         for (x, y, fw, fh) in rects:
-            crop = bgr[y : y + fh, x : x + fw].copy()
-            sharp = self._sharpness(crop)
+            bbox = (float(x), float(y), float(x + fw), float(y + fh))
+            tight_crop = bgr[y : y + fh, x : x + fw].copy()
+            crop = self._enhance_crop(self._crop_with_padding(bgr, bbox))
+            sharp = self._sharpness(tight_crop)
             out.append(
                 FaceResult(
-                    bbox=(float(x), float(y), float(x + fw), float(y + fh)),
+                    bbox=bbox,
                     det_score=1.0,
-                    quality=self._quality(float(fh), h, 1.0, sharp),
+                    quality=self._quality(bbox, (w, h), 1.0, sharp),
+                    sharpness=round(sharp, 2),
+                    face_frac=round(float(fh / max(h, 1)), 4),
                     embedding=None,
                     crop=crop,
                 )
@@ -299,12 +375,32 @@ class FaceAnalyzer:
         return out
 
     @staticmethod
-    def _quality(face_h: float, img_h: int, det_score: float, sharpness: float) -> float:
+    def _quality(
+        bbox: Tuple[float, float, float, float],
+        image_size: Tuple[int, int],
+        det_score: float,
+        sharpness: float,
+    ) -> float:
         """Heuristic 0..1 capture quality: bigger, sharper, higher-confidence
         faces score higher. Used to keep the single best shot per person."""
-        size_term = min(1.0, (face_h / max(img_h, 1)) / 0.30)  # ~30% of height = full
-        sharp_term = min(1.0, sharpness / 120.0)
-        return round(float(0.5 * size_term + 0.3 * sharp_term + 0.2 * det_score), 4)
+        x1, y1, x2, y2 = bbox
+        img_w, img_h = image_size
+        face_w = max(1.0, x2 - x1)
+        face_h = max(1.0, y2 - y1)
+        size_term = min(1.0, (face_h / max(img_h, 1)) / 0.24)
+        sharp_term = min(1.0, sharpness / 180.0)
+        edge_margin = min(x1, y1, img_w - x2, img_h - y2)
+        edge_term = min(1.0, max(0.0, edge_margin) / max(1.0, min(img_w, img_h) * 0.06))
+        aspect = face_w / face_h
+        aspect_term = max(0.0, 1.0 - abs(aspect - 0.78) / 0.65)
+        score = (
+            0.40 * size_term
+            + 0.27 * sharp_term
+            + 0.18 * min(1.0, max(0.0, det_score))
+            + 0.10 * edge_term
+            + 0.05 * aspect_term
+        )
+        return round(float(max(0.0, min(1.0, score))), 4)
 
 
 # -------------------------------------------------------------------------- gallery
@@ -455,7 +551,11 @@ class FaceGallery:
                 robot_dir = self._robot_dir(robot_id)
                 crop_path = robot_dir / f"{person.person_id}.jpg"
                 try:
-                    cv2_module.imwrite(str(crop_path), face.crop)
+                    cv2_module.imwrite(
+                        str(crop_path),
+                        face.crop,
+                        [int(cv2_module.IMWRITE_JPEG_QUALITY), 95],
+                    )
                     person.best_crop_path = crop_path.name
                     person.best_quality = face.quality
                 except Exception:
@@ -545,11 +645,13 @@ class Perception:
         retention_days: float = 0.0,
         enable_person: bool = True,
         enable_face: bool = True,
+        min_face_quality: float = 0.30,
     ) -> None:
         self.decoder = FrameDecoder()
         self.person = PersonDetector(person_model, device, person_conf) if enable_person else None
         self.face = FaceAnalyzer(device) if enable_face else None
         self.gallery = FaceGallery(faces_dir, match_threshold, retention_days)
+        self.min_face_quality = float(min_face_quality)
         self._frames: Dict[str, Tuple[np.ndarray, float]] = {}
         self._lock = threading.RLock()
         try:
@@ -582,8 +684,8 @@ class Perception:
         h, w = frame.shape[:2]
         return self.person.detect(frame), (w, h)
 
-    def capture_face(self, robot_id: str) -> Optional[Dict[str, Any]]:
-        """Analyse the latest frame, keep the best face, recognise + persist it."""
+    def best_face_candidate(self, robot_id: str) -> Optional[FaceResult]:
+        """Analyse the latest frame and return the best face without persisting."""
         if self.face is None:
             return None
         frame = self.latest_frame(robot_id)
@@ -592,9 +694,14 @@ class Perception:
         faces = self.face.analyze(frame)
         if not faces:
             return None
-        best = max(faces, key=lambda f: f.quality)
+        return max(faces, key=lambda f: f.quality)
+
+    def commit_face_capture(self, robot_id: str, face: FaceResult) -> Optional[Dict[str, Any]]:
+        """Persist a selected face candidate in the gallery."""
+        if self.face is None or face.quality < self.min_face_quality:
+            return None
         person, is_new, score = self.gallery.match_or_create(
-            robot_id, best, self._cv2, self.face.has_recognition
+            robot_id, face, self._cv2, self.face.has_recognition
         )
         return {
             "person_id": person.person_id,
@@ -602,11 +709,20 @@ class Perception:
             "known": person.known,
             "is_new": is_new,
             "match_score": round(score, 3),
-            "quality": best.quality,
+            "quality": face.quality,
+            "sharpness": face.sharpness,
+            "face_frac": face.face_frac,
             "recognition": self.face.has_recognition,
-            "bbox": [round(v, 1) for v in best.bbox],
+            "bbox": [round(v, 1) for v in face.bbox],
             "captures": person.captures,
         }
+
+    def capture_face(self, robot_id: str) -> Optional[Dict[str, Any]]:
+        """Analyse the latest frame, keep the best face, recognise + persist it."""
+        best = self.best_face_candidate(robot_id)
+        if best is None:
+            return None
+        return self.commit_face_capture(robot_id, best)
 
     def capabilities(self) -> Dict[str, Any]:
         return {

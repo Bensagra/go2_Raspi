@@ -47,17 +47,17 @@ class AutonomyConfig:
     obstacle_min_height_m: float = 0.10
     obstacle_max_height_m: float = 1.60
     # Perception cadence + triggers.
-    detect_interval_s: float = 0.6
+    detect_interval_s: float = 0.4
     person_trigger_score: float = 0.55
     person_trigger_area_frac: float = 0.03  # bbox area fraction of frame to engage
     # APPROACH: stop and capture when the person bbox fills this fraction of the
     # frame height (a proxy for "close enough for a good face"). The edge guard
     # keeps the actual safe distance.
-    approach_fill_frac: float = 0.55
+    approach_fill_frac: float = 0.50
     approach_timeout_s: float = 18.0
-    person_lost_timeout_s: float = 2.5
+    person_lost_timeout_s: float = 3.0
     # CAPTURE window: collect frames and keep the best face.
-    capture_window_s: float = 1.6
+    capture_window_s: float = 2.4
     # After capturing, ignore people for this long / within this radius so we
     # don't re-capture the same person on the spot.
     capture_cooldown_s: float = 15.0
@@ -91,7 +91,7 @@ class AutonomyController:
         self._approach_started_at = 0.0
         self._person_last_seen_at = 0.0
         self._capture_started_at = 0.0
-        self._best_capture: Optional[Dict[str, Any]] = None
+        self._best_capture: Optional[Any] = None
         self._capture_positions: List[Tuple[float, float, float]] = []  # x,y,ts
         self._last_progress_pose: Optional[Tuple[float, float]] = None
         self._last_progress_at = 0.0
@@ -134,7 +134,14 @@ class AutonomyController:
         self.started_at = time.time()
         # Make sure the robot is streaming what we need and accepts autonomy.
         self._cmd("set_lidar", {"enabled": True, "subscribe": True})
-        self._cmd("set_video", {"enabled": True})
+        self._cmd("set_camera_stream", {
+            "enabled": True,
+            "format": "h264",
+            "target_fps": 24,
+            "max_width": 960,
+            "bitrate_kbps": 2200,
+            "gop": 24,
+        })
         self._cmd("set_autonomy", {"enabled": True})
         self._set_state("explore")
         interval = 1.0 / max(self.cfg.control_hz, 1.0)
@@ -249,21 +256,41 @@ class AutonomyController:
         self._drive(0.0, 0.0, 0.0)
         now = time.monotonic()
         if self.rt.perception is not None:
-            shot = self.rt.perception.capture_face(self.robot_id)
-            if shot and (self._best_capture is None or shot["quality"] > self._best_capture["quality"]):
-                self._best_capture = shot
+            candidate = self.rt.perception.best_face_candidate(self.robot_id)
+            if candidate and (
+                self._best_capture is None
+                or candidate.quality > self._best_capture.quality
+            ):
+                self._best_capture = candidate
 
         if now - self._capture_started_at < self.cfg.capture_window_s:
             return
 
-        if self._best_capture is not None:
+        if self._best_capture is not None and self.rt.perception is not None:
+            capture = self.rt.perception.commit_face_capture(
+                self.robot_id,
+                self._best_capture,
+            )
+        else:
+            capture = None
+
+        if capture is not None:
             self.captures_count += 1
             await self.rt.autonomy_event(
                 self.robot_id, "person_captured",
-                {**self._best_capture, "robot_pose": [round(rx, 2), round(ry, 2)]},
+                {**capture, "robot_pose": [round(rx, 2), round(ry, 2)]},
             )
         else:
-            await self.rt.autonomy_event(self.robot_id, "capture_empty", {})
+            quality = (
+                None
+                if self._best_capture is None
+                else round(float(self._best_capture.quality), 4)
+            )
+            await self.rt.autonomy_event(
+                self.robot_id,
+                "capture_empty",
+                {"best_quality": quality},
+            )
         self._target_person = None
         self._best_capture = None
         self._set_state("explore")

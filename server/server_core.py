@@ -571,6 +571,7 @@ class CoreRuntime:
                 retention_days=self.args.face_retention_days,
                 enable_person=self.args.enable_person_detection,
                 enable_face=self.args.enable_face_recognition,
+                min_face_quality=self.args.min_face_capture_quality,
             )
         self.autonomy_controllers: Dict[str, AutonomyController] = {}
         self.autonomy_drive_seq: Dict[str, int] = defaultdict(int)
@@ -2023,8 +2024,8 @@ class CoreRuntime:
 
             if "format" in output:
                 image_format = str(output["format"]).strip().lower()
-                if image_format not in {"jpg", "webp"}:
-                    raise HTTPException(status_code=400, detail="camera format must be 'jpg' or 'webp'")
+                if image_format not in {"jpg", "webp", "h264"}:
+                    raise HTTPException(status_code=400, detail="camera format must be 'jpg', 'webp' or 'h264'")
                 output["format"] = image_format
 
             if "emit_every" in output:
@@ -2052,6 +2053,14 @@ class CoreRuntime:
                     if uplink_max_kbps <= 0
                     else int(clamp(uplink_max_kbps, 256, 50000))
                 )
+
+            if "bitrate_kbps" in output:
+                output["bitrate_kbps"] = int(
+                    clamp(float(output["bitrate_kbps"]), 64, 12000)
+                )
+
+            if "gop" in output:
+                output["gop"] = int(clamp(float(output["gop"]), 0, 600))
 
         if command_type == "set_audio":
             if "enabled" in output:
@@ -2927,6 +2936,8 @@ def parse_args() -> argparse.Namespace:
                         help="Person detection confidence threshold.")
     parser.add_argument("--face-match-threshold", type=float, default=0.35,
                         help="Cosine similarity to consider two faces the same person.")
+    parser.add_argument("--min-face-capture-quality", type=float, default=0.30,
+                        help="Skip persisting face captures below this 0..1 quality score.")
     parser.add_argument("--face-retention-days", type=float, default=0.0,
                         help="Auto-delete unknown faces older than N days (0 = keep; privacy).")
     parser.add_argument("--faces-dir", default="./server/faces",

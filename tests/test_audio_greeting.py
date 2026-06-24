@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from array import array
 from pathlib import Path
 
 from edge.audio_greeting import (
+    DirectAudioHub,
     find_audio_uuid,
     prepare_go2_wav,
     resolve_audio_file,
@@ -144,6 +146,38 @@ class AudioGreetingFlowTests(unittest.IsolatedAsyncioTestCase):
             hub.uploaded_paths, ["/cache/Escuela-Técnica-Ort-3.wav"]
         )
         self.assertGreaterEqual(hub.list_calls, 2)
+
+
+class DirectAudioHubTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_audiohub_upload_matches_unitree_chunk_contract(self) -> None:
+        calls = []
+
+        async def request(api_id, parameter):
+            calls.append((api_id, parameter))
+            return {"ok": True, "api_id": api_id}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "hello.wav"
+            source.write_bytes(b"RIFF" + b"\x00" * 5000)
+
+            response = await DirectAudioHub(
+                request,
+                {"UPLOAD_AUDIO_FILE": 2001},
+            ).upload_audio_file(str(source))
+
+        self.assertEqual(response, {"ok": True, "api_id": 2001})
+        self.assertGreaterEqual(len(calls), 2)
+        first_api_id, first_param = calls[0]
+        self.assertEqual(first_api_id, 2001)
+        self.assertEqual(first_param["file_name"], "hello")
+        self.assertEqual(first_param["file_type"], "wav")
+        self.assertEqual(first_param["current_block_index"], 1)
+        self.assertEqual(first_param["total_block_number"], len(calls))
+        self.assertEqual(first_param["file_size"], 5004)
+        self.assertEqual(
+            base64.b64decode("".join(param["block_content"] for _, param in calls)),
+            b"RIFF" + b"\x00" * 5000,
+        )
 
     async def test_does_not_play_unrelated_existing_audio_before_upload(self) -> None:
         class HubWithUnrelatedExisting(FakeAudioHub):

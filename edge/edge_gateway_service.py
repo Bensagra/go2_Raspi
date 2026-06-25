@@ -91,6 +91,46 @@ except ImportError:
     from unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection  # type: ignore
 
 
+def _patch_webrtc_json_inf() -> None:
+    """Make the library tolerant of the robot's non-standard JSON.
+
+    Some topics (e.g. rt/utlidar/lidar_state when the LIDAR is not spinning)
+    serialize floats as bare ``inf``/``nan``, which ``json.loads`` rejects,
+    flooding the logs with JSONDecodeError tracebacks. We swap the data-channel
+    module's ``json`` for a thin wrapper that rewrites those bare tokens into
+    the JSON-parseable ``Infinity``/``NaN`` before decoding. No-op if the
+    library layout changes."""
+    import re
+    import json as _real_json
+
+    try:
+        from unitree_webrtc_connect import webrtc_datachannel  # type: ignore
+    except Exception:
+        return
+
+    _bad = re.compile(r"(?<=[:,\[\s])-?(?:inf|nan)(?=[,\]}\s])", re.IGNORECASE)
+
+    def _repl(m: "re.Match[str]") -> str:
+        tok = m.group(0)
+        if tok.lower().endswith("nan"):
+            return "NaN"
+        return "-Infinity" if tok.startswith("-") else "Infinity"
+
+    class _TolerantJson:
+        def __getattr__(self, name):
+            return getattr(_real_json, name)
+
+        def loads(self, s, *args, **kwargs):
+            if isinstance(s, str) and ("inf" in s or "nan" in s):
+                s = _bad.sub(_repl, s)
+            return _real_json.loads(s, *args, **kwargs)
+
+    webrtc_datachannel.json = _TolerantJson()
+
+
+_patch_webrtc_json_inf()
+
+
 try:
     from safety_guard import SafetyGuard
 except ImportError:  # when imported as a package (edge.edge_gateway_service)

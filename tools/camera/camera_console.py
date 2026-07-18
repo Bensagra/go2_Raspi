@@ -155,7 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Connect to Unitree camera via unitree_webrtc_connect and print "
-            "JSON frame values to stdout for piping into camera_viewer.py. "
+            "JSON frame values to stdout for piping into tools/camera/camera_viewer.py. "
             f"Mode is fixed to LocalSTA ({FIXED_ROBOT_IP})."
         )
     )

@@ -1,5 +1,9 @@
 # Metodologia de conexion 3 capas (recomendada)
 
+Para el arranque cotidiano usa `./go2 server`, `./go2 edge` y
+`./go2 dashboard` como explica el [`README`](../README.md). Los comandos largos
+de este documento quedan como referencia de todas las opciones disponibles.
+
 Esta implementacion reemplaza la conexion SSH directa como flujo principal.
 
 Arquitectura:
@@ -53,7 +57,7 @@ Bajada:
 Instala en entorno Python compartido:
 
 ```bash
-pip install -r requirements_3layer.txt
+pip install -r requirements/full.txt
 ```
 
 ## Arranque por capas

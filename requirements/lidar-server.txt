@@ -1,0 +1,13 @@
+# Server: receiver, TULIP/AdaPoinTr inference adapters, and PLY/mesh export.
+# Install the CUDA-matched PyTorch wheel first when using an NVIDIA GPU:
+# https://pytorch.org/get-started/locally/
+# Official TULIP/AdaPoinTr stacks include extensions built against NumPy 1.x.
+numpy>=1.26,<2
+websockets>=13.1,<16
+torch>=2.0
+PyYAML>=6.0
+easydict>=1.13
+einops>=0.7
+timm>=0.4.5,<1.0
+matplotlib>=3.7
+open3d>=0.18

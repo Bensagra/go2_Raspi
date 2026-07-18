@@ -1,0 +1,4 @@
+# Raspberry Pi: standalone Unitree LiDAR capture + binary WebSocket uplink.
+numpy>=1.26,<3
+websockets>=13.1,<16
+unitree-webrtc-connect>=2.1.2,<3

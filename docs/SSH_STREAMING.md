@@ -25,64 +25,55 @@ Esto evita mezclar datos operativos con datos pesados y permite evolucionar a We
 Server:
 
 ```bash
-python server/server_core.py --host 0.0.0.0 --port 8000 --mqtt-host 127.0.0.1 --mqtt-port 1883
+./go2 server
 ```
 
 Edge (Raspi):
 
 ```bash
-python edge/edge_gateway_service.py \
-  --robot-id go2_01 \
-  --go2-ip 192.168.123.161 \
-  --mqtt-host 192.168.1.10 \
-  --mqtt-port 1883 \
-  --enable-camera --enable-audio --enable-lidar \
-  --subscribe-profile core,lidar,audio \
-  --disable-traffic-saving \
-  --media-ws-url ws://192.168.1.10:8000/ws/edge-media/{robot_id} \
-  --media-ws-token edge-media-dev-token
+./go2 edge
 ```
 
-Frontend:
+Frontend (en el server):
 
-- Abrir `frontend/frontend_dashboard.html`
+- Ejecutar `./go2 dashboard` y abrir la URL mostrada
 - Configurar API, token y robot_id
 
 ## Modo legacy: solo camara binaria por SSH
 
 Si solo quieres video y no necesitas telemetria/lidar/control/audio, puedes usar:
 
-- `camera_ssh_sender.py` en la maquina junto al robot
-- `camera_ssh_receiver.py` en el servidor
+- `tools/camera/camera_ssh_sender.py` en la maquina junto al robot
+- `tools/camera/camera_ssh_receiver.py` en el servidor
 
 Comando base:
 
 ```bash
-/home/bensagra/Documents/go2/.venv/bin/python -u /home/bensagra/Documents/go2/camera_ssh_sender.py \
+.venv/bin/python -u tools/camera/camera_ssh_sender.py \
   --ip 192.168.123.161 \
   --emit-every 1 \
   --image-format jpg \
   --jpeg-quality 75 \
 | ssh -T -o Compression=no user@tu-servidor \
-  "python3 /ruta/en/servidor/camera_ssh_receiver.py --stats-every 30"
+  "python3 /ruta/go2_Raspi/tools/camera/camera_ssh_receiver.py --stats-every 30"
 ```
 
 Metadata JSON (legacy):
 
 ```bash
-/home/bensagra/Documents/go2/.venv/bin/python -u /home/bensagra/Documents/go2/camera_ssh_sender.py \
+.venv/bin/python -u tools/camera/camera_ssh_sender.py \
   --ip 192.168.123.161 --image-format jpg --jpeg-quality 75 \
 | ssh -T -o Compression=no user@tu-servidor \
-  "python3 /ruta/en/servidor/camera_ssh_receiver.py --stdout-json > /tmp/go2_frames_meta.jsonl"
+  "python3 /ruta/go2_Raspi/tools/camera/camera_ssh_receiver.py --stdout-json > /tmp/go2_frames_meta.jsonl"
 ```
 
 Viewer remoto (legacy):
 
 ```bash
-/home/bensagra/Documents/go2/.venv/bin/python -u /home/bensagra/Documents/go2/camera_ssh_sender.py \
+.venv/bin/python -u tools/camera/camera_ssh_sender.py \
   --ip 192.168.123.161 \
 | ssh -T -Y -o Compression=no user@tu-servidor \
-  "python3 /ruta/en/servidor/camera_ssh_receiver.py --show"
+  "python3 /ruta/go2_Raspi/tools/camera/camera_ssh_receiver.py --show"
 ```
 
 ## Tuning rapido

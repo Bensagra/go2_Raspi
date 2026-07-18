@@ -1,0 +1,4 @@
+-r full.txt
+
+pytest>=8.0
+ruff>=0.9

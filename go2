@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${GO2_CONFIG_FILE:-$PROJECT_ROOT/config/.env}"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  set +a
+fi
+
+FULL_VENV="${GO2_VENV:-$PROJECT_ROOT/.venv}"
+LIDAR_RASPI_VENV="${GO2_LIDAR_RASPI_VENV:-$PROJECT_ROOT/.venv-lidar-raspi}"
+LIDAR_SERVER_VENV="${GO2_LIDAR_SERVER_VENV:-$PROJECT_ROOT/.venv-lidar-server}"
+
+FULL_PYTHON="${GO2_PYTHON:-$FULL_VENV/bin/python}"
+LIDAR_RASPI_PYTHON="${GO2_LIDAR_RASPI_PYTHON:-$LIDAR_RASPI_VENV/bin/python}"
+LIDAR_SERVER_PYTHON="${GO2_LIDAR_SERVER_PYTHON:-$LIDAR_SERVER_VENV/bin/python}"
+
+# Several legacy defaults are intentionally relative to the repository.
+cd "$PROJECT_ROOT"
+
+usage() {
+  cat <<'EOF'
+Uso: ./go2 <comando> [opciones extra]
+
+Primer uso:
+  ./go2 init                    Crea config/.env desde el ejemplo
+  ./go2 install full            Instala el sistema de 3 capas
+
+Comandos principales:
+  server                        Inicia API, control y recepción de datos
+  edge                          Inicia el gateway en la Raspberry Pi
+  dashboard                     Publica el dashboard en http://localhost:8080
+  lidar-server                  Inicia el receptor LiDAR 3D independiente
+  lidar-edge                    Envía LiDAR desde la Raspberry al receptor
+
+Utilidades:
+  install <perfil>              full | dev | lidar-raspi | lidar-server
+  ssh <usuario@host>            Abre el cliente SSH interactivo legado
+  camera                        Abre la cámara local del Go2
+  test                          Ejecuta las pruebas
+  doctor                        Revisa configuración y dependencias
+  service-install              Instala el edge como servicio systemd
+  help                          Muestra esta ayuda
+
+Todo argumento ubicado después del comando se pasa al programa Python. Ejemplo:
+  ./go2 server --port 9000
+EOF
+}
+
+is_true() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_python() {
+  local python_path="$1"
+  local profile="$2"
+  if [[ ! -x "$python_path" ]]; then
+    echo "Falta el entorno Python: $python_path" >&2
+    echo "Instálalo con: ./go2 install $profile" >&2
+    exit 1
+  fi
+}
+
+init_config() {
+  mkdir -p "$(dirname -- "$CONFIG_FILE")" "$PROJECT_ROOT/logs"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    echo "La configuración ya existe: $CONFIG_FILE"
+    return
+  fi
+  cp "$PROJECT_ROOT/config/.env.example" "$CONFIG_FILE"
+  echo "Configuración creada: $CONFIG_FILE"
+  echo "Edita las IP antes de iniciar el server o el edge."
+}
+
+install_profile() {
+  local profile="${1:-full}"
+  local venv requirements_file
+
+  case "$profile" in
+    full)
+      venv="$FULL_VENV"
+      requirements_file="$PROJECT_ROOT/requirements/full.txt"
+      ;;
+    dev)
+      venv="$FULL_VENV"
+      requirements_file="$PROJECT_ROOT/requirements/dev.txt"
+      ;;
+    lidar-raspi)
+      venv="$LIDAR_RASPI_VENV"
+      requirements_file="$PROJECT_ROOT/requirements/lidar-raspi.txt"
+      ;;
+    lidar-server)
+      venv="$LIDAR_SERVER_VENV"
+      requirements_file="$PROJECT_ROOT/requirements/lidar-server.txt"
+      ;;
+    *)
+      echo "Perfil desconocido: $profile" >&2
+      echo "Perfiles: full, dev, lidar-raspi, lidar-server" >&2
+      exit 2
+      ;;
+  esac
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "No encuentro python3. Instálalo junto con python3-venv." >&2
+    exit 1
+  fi
+  if [[ ! -x "$venv/bin/python" ]]; then
+    echo "Creando entorno: $venv"
+    python3 -m venv "$venv"
+  fi
+  "$venv/bin/python" -m pip install --upgrade pip
+  "$venv/bin/python" -m pip install -r "$requirements_file"
+  echo "Listo. Perfil '$profile' instalado."
+}
+
+run_server() {
+  require_python "$FULL_PYTHON" full
+  local cmd=(
+    "$FULL_PYTHON" -u "$PROJECT_ROOT/server/server_core.py"
+    --host "${GO2_SERVER_BIND:-0.0.0.0}"
+    --port "${GO2_SERVER_PORT:-8000}"
+    --mqtt-host "${GO2_SERVER_MQTT_HOST:-127.0.0.1}"
+    --mqtt-port "${GO2_MQTT_PORT:-1883}"
+    --edge-media-token "${GO2_EDGE_MEDIA_TOKEN:-edge-media-dev-token}"
+  )
+  [[ -n "${GO2_MQTT_USERNAME:-}" ]] && cmd+=(--mqtt-username "$GO2_MQTT_USERNAME")
+  [[ -n "${GO2_MQTT_PASSWORD:-}" ]] && cmd+=(--mqtt-password "$GO2_MQTT_PASSWORD")
+  is_true "${GO2_MQTT_TLS:-0}" && cmd+=(--mqtt-tls)
+  exec "${cmd[@]}" "$@"
+}
+
+run_edge() {
+  require_python "$FULL_PYTHON" full
+  local public_host="${GO2_SERVER_PUBLIC_HOST:-127.0.0.1}"
+  local robot_id="${GO2_ROBOT_ID:-go2_01}"
+  local server_port="${GO2_SERVER_PORT:-8000}"
+  local media_url="${GO2_MEDIA_WS_URL:-ws://$public_host:$server_port/ws/edge-media/$robot_id}"
+  local cmd=(
+    "$FULL_PYTHON" -u "$PROJECT_ROOT/edge/edge_gateway_service.py"
+    --robot-id "$robot_id"
+    --go2-ip "${GO2_IP:-192.168.123.161}"
+    --mqtt-host "${GO2_EDGE_MQTT_HOST:-$public_host}"
+    --mqtt-port "${GO2_MQTT_PORT:-1883}"
+    --media-ws-url "$media_url"
+    --media-ws-token "${GO2_EDGE_MEDIA_TOKEN:-edge-media-dev-token}"
+    --greet-audio-file "$PROJECT_ROOT/assets/audio/Escuela-Técnica-Ort-3.wav"
+  )
+  is_true "${GO2_ENABLE_CAMERA:-1}" && cmd+=(--enable-camera)
+  is_true "${GO2_ENABLE_AUDIO:-1}" && cmd+=(--enable-audio)
+  is_true "${GO2_ENABLE_LIDAR:-1}" && cmd+=(--enable-lidar)
+  is_true "${GO2_DISABLE_TRAFFIC_SAVING:-1}" && cmd+=(--disable-traffic-saving)
+  is_true "${GO2_ENABLE_COLORIZATION:-0}" && cmd+=(--enable-colorization)
+  [[ -n "${GO2_MQTT_USERNAME:-}" ]] && cmd+=(--mqtt-username "$GO2_MQTT_USERNAME")
+  [[ -n "${GO2_MQTT_PASSWORD:-}" ]] && cmd+=(--mqtt-password "$GO2_MQTT_PASSWORD")
+  is_true "${GO2_MQTT_TLS:-0}" && cmd+=(--mqtt-tls)
+  exec "${cmd[@]}" "$@"
+}
+
+run_dashboard() {
+  require_python "$FULL_PYTHON" full
+  local port="${GO2_DASHBOARD_PORT:-8080}"
+  echo "Dashboard: http://localhost:$port/frontend_dashboard.html"
+  exec "$FULL_PYTHON" -m http.server "$port" --bind "${GO2_DASHBOARD_BIND:-0.0.0.0}" --directory "$PROJECT_ROOT/frontend" "$@"
+}
+
+run_lidar_server() {
+  require_python "$LIDAR_SERVER_PYTHON" lidar-server
+  exec "$LIDAR_SERVER_PYTHON" -u "$PROJECT_ROOT/server/lidar_3d_server.py" \
+    --host "${GO2_LIDAR_SERVER_BIND:-0.0.0.0}" \
+    --port "${GO2_LIDAR_SERVER_PORT:-8765}" \
+    --token "${GO2_LIDAR_TOKEN:-}" \
+    "$@"
+}
+
+run_lidar_edge() {
+  require_python "$LIDAR_RASPI_PYTHON" lidar-raspi
+  local host="${GO2_LIDAR_SERVER_HOST:-${GO2_SERVER_PUBLIC_HOST:-127.0.0.1}}"
+  local port="${GO2_LIDAR_SERVER_PORT:-8765}"
+  local robot_id="${GO2_ROBOT_ID:-go2_01}"
+  exec "$LIDAR_RASPI_PYTHON" -u "$PROJECT_ROOT/edge/lidar_only_sender.py" \
+    --robot-id "$robot_id" \
+    --go2-ip "${GO2_IP:-192.168.123.161}" \
+    --server-ws-url "ws://$host:$port/lidar/$robot_id" \
+    --token "${GO2_LIDAR_TOKEN:-}" \
+    "$@"
+}
+
+run_ssh() {
+  require_python "$FULL_PYTHON" full
+  local remote="${1:-${GO2_SSH_REMOTE:-}}"
+  if [[ -z "$remote" ]]; then
+    echo "Indica el destino: ./go2 ssh usuario@raspberry" >&2
+    exit 2
+  fi
+  shift || true
+  local remote_root="${GO2_REMOTE_PROJECT_ROOT:-/home/perrobot/go2_Raspi}"
+  exec "$FULL_PYTHON" -u "$PROJECT_ROOT/tools/ssh/go2_ssh_client.py" \
+    --remote "$remote" \
+    --remote-python "${GO2_REMOTE_PYTHON:-$remote_root/.venv/bin/python}" \
+    --remote-gateway "$remote_root/tools/ssh/go2_ssh_gateway.py" \
+    --go2-ip "${GO2_IP:-192.168.123.161}" \
+    "$@"
+}
+
+run_camera() {
+  require_python "$FULL_PYTHON" full
+  set +e
+  "$FULL_PYTHON" -u "$PROJECT_ROOT/tools/camera/camera_console.py" \
+    | "$FULL_PYTHON" -u "$PROJECT_ROOT/tools/camera/camera_viewer.py" "$@"
+  local status=$?
+  set -e
+  return "$status"
+}
+
+doctor() {
+  local failed=0
+  echo "Proyecto: $PROJECT_ROOT"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    echo "[OK] Configuración: $CONFIG_FILE"
+  else
+    echo "[FALTA] Configuración. Ejecuta: ./go2 init"
+    failed=1
+  fi
+  if [[ -x "$FULL_PYTHON" ]]; then
+    echo "[OK] Python: $FULL_PYTHON"
+    if "$FULL_PYTHON" -c 'import av, cv2, fastapi, numpy, paho.mqtt.client, uvicorn, websockets' >/dev/null 2>&1; then
+      echo "[OK] Dependencias principales"
+    else
+      echo "[FALTA] Dependencias principales. Ejecuta: ./go2 install full"
+      failed=1
+    fi
+    if "$FULL_PYTHON" -c 'import unitree_webrtc_connect' >/dev/null 2>&1; then
+      echo "[OK] Conector Unitree"
+    else
+      echo "[FALTA] unitree-webrtc-connect"
+      failed=1
+    fi
+  else
+    echo "[FALTA] Entorno $FULL_VENV. Ejecuta: ./go2 install full"
+    failed=1
+  fi
+  command -v mosquitto >/dev/null 2>&1 \
+    && echo "[OK] Broker mosquitto disponible" \
+    || echo "[AVISO] No encuentro mosquitto; puede estar en otra máquina."
+  return "$failed"
+}
+
+command="${1:-help}"
+[[ $# -gt 0 ]] && shift
+
+case "$command" in
+  init) init_config ;;
+  install) install_profile "${1:-full}" ;;
+  server) run_server "$@" ;;
+  edge) run_edge "$@" ;;
+  dashboard) run_dashboard "$@" ;;
+  lidar-server) run_lidar_server "$@" ;;
+  lidar-edge) run_lidar_edge "$@" ;;
+  ssh) run_ssh "$@" ;;
+  camera) run_camera "$@" ;;
+  test)
+    require_python "$FULL_PYTHON" dev
+    exec "$FULL_PYTHON" -m pytest "$PROJECT_ROOT/tests" "$@"
+    ;;
+  doctor) doctor ;;
+  service-install) exec "$PROJECT_ROOT/scripts/install-edge-service.sh" "$@" ;;
+  help|-h|--help) usage ;;
+  *)
+    echo "Comando desconocido: $command" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

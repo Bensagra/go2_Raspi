@@ -1250,12 +1250,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--remote-python",
-        default="/home/bensagra/Documents/go2/.venv/bin/python",
+        default="python3",
         help="Python executable on remote PC/Raspberry",
     )
     parser.add_argument(
         "--remote-gateway",
-        default="/home/bensagra/Documents/go2/go2_ssh_gateway.py",
+        default="go2_Raspi/tools/ssh/go2_ssh_gateway.py",
         help="Path to go2_ssh_gateway.py on remote PC/Raspberry",
     )
     parser.add_argument("--go2-ip", default="192.168.123.161", help="Go2 IP in STA mode")

@@ -3,13 +3,31 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Virtual environment
+# Virtual environments
 .venv/
+.venv-*/
+
+# Local configuration and runtime logs
+config/.env
+logs/*
+!logs/.gitignore
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
 
 # Server runtime data (do NOT commit captured faces — biometric/privacy)
 server/faces/
 server/audit/
+server/lidar_models/
 
 # Generated WAV files, except the greeting asset deployed to the edge.
 *.wav
-!Escuela-*-Ort-3.wav
+!assets/audio/*.wav
+
+# Downloaded weights and external repositories
+models/*.pt
+models/*.pth
+!models/.gitignore
+third_party/*
+!third_party/.gitignore

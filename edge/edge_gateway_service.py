@@ -3263,7 +3263,14 @@ def parse_args() -> argparse.Namespace:
                         help="A drive_velocity goal older than this is dropped (robot stops).")
 
     # --- Audio greeting (Go2 speaker via audio hub) --------------------------
-    parser.add_argument("--greet-audio-file", default="Escuela-Técnica-Ort-3.wav",
+    parser.add_argument(
+        "--greet-audio-file",
+        default=str(
+            Path(__file__).resolve().parents[1]
+            / "assets"
+            / "audio"
+            / "Escuela-Técnica-Ort-3.wav"
+        ),
                         help="WAV played through the Go2 speaker (normalized to PCM16 mono 44.1 kHz).")
     parser.add_argument("--greet-audio-uuid", default="",
                         help="Skip upload: play this already-stored audio uuid directly.")

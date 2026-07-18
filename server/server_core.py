@@ -294,7 +294,6 @@ def reconstruct_solid_mesh(
     colored = vox_has > 0
     vox_rgb[colored] /= vox_has[colored][:, None]
 
-    occupied = set(uniq.tolist())
     # Unpack unique voxel coords (in the shifted grid).
     vz = uniq % dz
     tmp = uniq // dz
@@ -2935,7 +2934,9 @@ def parse_args() -> argparse.Namespace:
                         action="store_false")
     parser.add_argument("--perception-device", default="cuda", choices=["cuda", "cpu"],
                         help="Device for YOLO/insightface (GPU server: cuda).")
-    parser.add_argument("--person-model", default="yolov8n.pt",
+    parser.add_argument(
+        "--person-model",
+        default=str(Path(__file__).resolve().parents[1] / "models" / "yolov8n.pt"),
                         help="Ultralytics model for person detection.")
     parser.add_argument("--person-conf", type=float, default=0.45,
                         help="Person detection confidence threshold.")

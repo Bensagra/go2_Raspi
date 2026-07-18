@@ -41,7 +41,13 @@ def resolve_audio_file(value: str) -> str:
     candidates = [requested]
     if not requested.is_absolute():
         repo_root = Path(__file__).resolve().parent.parent
-        candidates.extend((Path.cwd() / requested, repo_root / requested))
+        candidates.extend(
+            (
+                Path.cwd() / requested,
+                repo_root / requested,
+                repo_root / "assets" / "audio" / requested,
+            )
+        )
 
     for candidate in candidates:
         if candidate.is_file():

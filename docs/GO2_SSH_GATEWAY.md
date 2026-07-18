@@ -14,6 +14,9 @@ Ver guia completa:
 
 - `THREE_LAYER_CONNECTION.md`
 
+Para el uso normal no hace falta escribir estas rutas a mano: consulta el
+[`README`](../README.md) y usa `./go2 server`, `./go2 edge` y `./go2 dashboard`.
+
 Gateway NDJSON para manejar todo por una sola sesion SSH:
 
 - Telemetria por topics (`LOW_STATE`, `LF_SPORT_MOD_STATE`, `GAS_SENSOR`, etc.)
@@ -29,19 +32,15 @@ Entrada de comandos: NDJSON por `stdin`.
 
 ## Archivos principales
 
-- `go2_ssh_gateway.py` (lado robot/raspi)
-- `go2_ssh_client.py` (lado servidor operador)
+- `tools/ssh/go2_ssh_gateway.py` (lado robot/raspi)
+- `tools/ssh/go2_ssh_client.py` (lado servidor operador)
 
 ## Arranque recomendado (todo simultaneo)
 
 En el servidor operador, lanza el cliente SSH completo:
 
 ```bash
-python3 /ruta/go2_ssh_client.py \
-  --remote user@raspi-o-pc-cerca-del-go2 \
-  --remote-python /home/bensagra/Documents/go2/.venv/bin/python \
-  --remote-gateway /home/bensagra/Documents/go2/go2_ssh_gateway.py \
-  --go2-ip 192.168.123.161 \
+./go2 ssh user@raspi-o-pc-cerca-del-go2 \
   --enable-camera \
   --enable-lidar \
   --enable-audio \
@@ -64,7 +63,7 @@ Controles en GUI:
 ```bash
 printf '{"id":"1","op":"get_temperatures"}\n' | \
 ssh -T user@pc \
-  "/home/bensagra/Documents/go2/.venv/bin/python -u /home/bensagra/Documents/go2/go2_ssh_gateway.py --ip 192.168.123.161 --subscribe-profile core --exit-on-stdin-eof"
+  "/ruta/go2_Raspi/.venv/bin/python -u /ruta/go2_Raspi/tools/ssh/go2_ssh_gateway.py --ip 192.168.123.161 --subscribe-profile core --exit-on-stdin-eof"
 ```
 
 ## Sesion persistente por SSH con NDJSON crudo
@@ -72,7 +71,7 @@ ssh -T user@pc \
 ```bash
 coproc GO2 {
   ssh -T user@pc \
-    "/home/bensagra/Documents/go2/.venv/bin/python -u /home/bensagra/Documents/go2/go2_ssh_gateway.py --ip 192.168.123.161 --subscribe-profile core --subscribe-profile lidar --subscribe-profile audio --enable-camera --enable-lidar --enable-audio --disable-traffic-saving"
+    "/ruta/go2_Raspi/.venv/bin/python -u /ruta/go2_Raspi/tools/ssh/go2_ssh_gateway.py --ip 192.168.123.161 --subscribe-profile core --subscribe-profile lidar --subscribe-profile audio --enable-camera --enable-lidar --enable-audio --disable-traffic-saving"
 }
 
 # Leer eventos

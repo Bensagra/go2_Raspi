@@ -5,6 +5,7 @@ __pycache__/
 
 # Virtual environment
 .venv/
+.venv-server/
 
 # Server runtime data (do NOT commit captured faces — biometric/privacy)
 server/faces/
@@ -13,3 +14,9 @@ server/audit/
 # Generated WAV files, except the greeting asset deployed to the edge.
 *.wav
 !Escuela-*-Ort-3.wav
+
+# Hosting runtime data and local configuration
+.env
+.env.*
+!.env.example
+data/

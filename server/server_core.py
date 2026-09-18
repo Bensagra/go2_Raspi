@@ -532,6 +532,7 @@ class CoreRuntime:
         self.map_saved_revisions: Dict[str, int] = defaultdict(int)
         self.map_last_save_monotonic: Dict[str, float] = defaultdict(lambda: 0.0)
         self.persisted_robot_ids: Set[str] = set()
+        self.stored_map_keys: Set[Tuple[str, str]] = set()
         self.map_storage_dir = Path(self.args.map_storage_dir).expanduser()
         self.map_storage_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1282,6 +1283,7 @@ class CoreRuntime:
                 metadata_tmp.unlink()
 
         self.persisted_robot_ids.add(robot_id)
+        self.stored_map_keys.add((robot_id, safe_map_id))
         return metadata
 
     def _save_latest_map_sync(self, robot_id: str) -> Optional[Dict[str, Any]]:
@@ -1312,6 +1314,7 @@ class CoreRuntime:
         for metadata_path in snapshots[self.args.map_max_snapshots:]:
             with contextlib.suppress(OSError):
                 metadata_path.unlink()
+                self.stored_map_keys.discard((robot_id, metadata_path.stem))
             with contextlib.suppress(OSError):
                 metadata_path.with_suffix(".npz").unlink()
 
@@ -1425,6 +1428,11 @@ class CoreRuntime:
     def _restore_persisted_maps_sync(self) -> None:
         if not self.map_storage_dir.exists():
             return
+        self.stored_map_keys = {
+            (str(item["robot_id"]), str(item["map_id"]))
+            for item in self._list_maps_sync()
+            if "robot_id" in item
+        }
         for robot_dir in self.map_storage_dir.iterdir():
             if not robot_dir.is_dir() or not SAFE_STORAGE_COMPONENT.fullmatch(robot_dir.name):
                 continue
@@ -2250,7 +2258,7 @@ class CoreRuntime:
                 "known_robots": self._known_robots(),
                 "frontend_clients": len(self.frontend_sockets),
                 "edge_media_clients": len(self.edge_media_sockets),
-                "stored_maps": len(await asyncio.to_thread(self._list_maps_sync)),
+                "stored_maps": len(self.stored_map_keys),
             }
 
         @app.get("/api/robots")
@@ -2757,7 +2765,7 @@ class CoreRuntime:
 
         @app.websocket("/ws/edge-media/{robot_id}")
         async def ws_edge_media(robot_id: str, ws: WebSocket, token: str = Query(default="")) -> None:
-            if token != self.args.edge_media_token:
+            if not token or token != self.args.edge_media_token:
                 await ws.close(code=4403)
                 return
 
@@ -2789,7 +2797,7 @@ class CoreRuntime:
                 self._audit("edge_media_disconnected", {"robot_id": robot_id})
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Go2 Server Core: ingests telemetry/events, validates and dispatches commands, "
@@ -2963,7 +2971,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-greeter-with-autonomy", dest="greeter_with_autonomy",
                         action="store_false")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.port <= 0 or args.port > 65535:
         parser.error("--port must be between 1 and 65535")

@@ -60,11 +60,15 @@ pip install -r requirements_3layer.txt
 
 ### 1) Broker MQTT
 
-Ejemplo con Mosquitto local:
+Ejemplo con Mosquitto para clientes en la misma máquina (loopback):
 
 ```bash
 mosquitto -p 1883
 ```
+
+Para una Raspy en otra máquina hace falta un listener de red explícito.
+En Windows ver [MQTT_WINDOWS.md](MQTT_WINDOWS.md) y
+[mqtt/mosquitto.windows.conf](mqtt/mosquitto.windows.conf).
 
 ### 2) Server Core
 

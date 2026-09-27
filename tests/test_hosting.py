@@ -157,6 +157,29 @@ class HostingEntrypointTests(unittest.TestCase):
             "/api/robots/test_robot/commands", "test-viewer", "POST", {"type": "move"},
         )[0], 403)
 
+    def test_offline_mqtt_is_reported_and_commands_are_not_accepted(self):
+        status, raw = self.request("/health")
+        self.assertFalse(json.loads(raw)["mqtt_connected"])
+        status, raw = self.request("/api/robots/test_robot/commands", "test-operator", "POST", {"type": "move"})
+        self.assertEqual(status, 503)
+        status, raw = self.request("/api/robots/test_robot/state", "test-operator")
+        state = json.loads(raw)
+        self.assertFalse(state["control_link"]["mqtt_connected"])
+        self.assertEqual(state["pending_commands"], [])
+
+        async def scenario():
+            from websockets.asyncio.client import connect
+            async with connect(self.ws_url + "/ws/live?token=test-operator") as viewer:
+                await viewer.send(json.dumps({"op": "drive", "robot_id": "test_robot", "sequence": 1, "payload": {"linear_x": 0.1}}))
+                while True:
+                    packet = await asyncio.wait_for(viewer.recv(), 3)
+                    if isinstance(packet, str):
+                        message = json.loads(packet)
+                        if message.get("type") == "drive_status":
+                            self.assertFalse(message["ok"])
+                            break
+        asyncio.run(scenario())
+
     def test_docs_under_tic_prefix(self):
         status, raw = self.request("/docs", headers={"X-Forwarded-Prefix": "/project/server"})
         self.assertEqual(status, 200)
@@ -220,6 +243,12 @@ class HostingEntrypointTests(unittest.TestCase):
             from websockets.exceptions import InvalidStatus
             from server.server_core import decode_media_frame, encode_cloud_payload, encode_media_frame
 
+            async def next_binary(viewer):
+                while True:
+                    packet = await asyncio.wait_for(viewer.recv(), 3)
+                    if isinstance(packet, bytes):
+                        return packet
+
             with self.assertRaises(InvalidStatus) as rejected:
                 async with connect(self.ws_url + "/ws/edge-media/test_robot"):
                     pass
@@ -230,7 +259,7 @@ class HostingEntrypointTests(unittest.TestCase):
                 self.assertEqual(hello["type"], "hello")
                 async with connect(self.ws_url + "/ws/edge-media/test_robot?token=test-edge") as edge:
                     await edge.send(encode_media_frame({"stream": "video", "image_format": "webp"}, b"test-video"))
-                    header, payload = decode_media_frame(await asyncio.wait_for(viewer.recv(), 3))
+                    header, payload = decode_media_frame(await next_binary(viewer))
                     self.assertEqual(header["robot_id"], "test_robot")
                     self.assertEqual(payload, b"test-video")
                     points = np.array([[0, 0, 0], [1, 1, 0], [2, 1, 1]], dtype=np.float32)
@@ -238,7 +267,7 @@ class HostingEntrypointTests(unittest.TestCase):
                     await edge.send(encode_media_frame({
                         "stream": "lidar", "fmt": fmt, "scale": scale, "offset": offset, "count": count,
                     }, blob))
-                    header, _ = decode_media_frame(await asyncio.wait_for(viewer.recv(), 3))
+                    header, _ = decode_media_frame(await next_binary(viewer))
                     self.assertEqual(header["stream"], "lidar")
                     self.assertEqual(header["count"], 3)
 

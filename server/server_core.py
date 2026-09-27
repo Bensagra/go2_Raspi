@@ -514,6 +514,8 @@ class CoreRuntime:
         self.speed_profile_owners: Dict[str, WebSocket] = {}
 
         self.latest_telemetry: Dict[str, Dict[str, Any]] = {}
+        self.telemetry_received_at: Dict[str, float] = {}
+        self.last_control_link_status: Dict[str, Dict[str, Any]] = {}
         # Latest coalesced binary media frame per (robot, stream): replayed to new
         # clients on connect (e.g. lidar keyframe, MJPEG/WebP video snapshot).
         self.latest_media_frames: Dict[str, Dict[str, bytes]] = defaultdict(dict)
@@ -1557,6 +1559,26 @@ class CoreRuntime:
             allow_headers=["*"],
         )
 
+    def _mqtt_connected(self) -> bool:
+        return self.mqtt_client is not None and self.mqtt_client.is_connected()
+
+    def _control_link_status(self, robot_id: str) -> Dict[str, Any]:
+        mqtt_connected = self._mqtt_connected()
+        received_at = self.telemetry_received_at.get(robot_id)
+        fresh = received_at is not None and time.monotonic() - received_at < 5.0
+        robot_connected = bool(self.latest_telemetry.get(robot_id, {}).get("robot_link", {}).get("connected"))
+        if not mqtt_connected:
+            message = "Control sin MQTT: revisá el broker del servidor"
+        elif not fresh:
+            message = "Sin telemetría de la Raspy: revisá su conexión MQTT"
+        elif not robot_connected:
+            message = "Raspy conectada; falta la conexión con el Go2"
+        else:
+            message = "Canal de control conectado"
+        return {"mqtt_connected": mqtt_connected, "edge_telemetry_fresh": fresh,
+                "robot_connected": robot_connected, "ok": mqtt_connected and fresh and robot_connected,
+                "message": message}
+
     def _setup_mqtt(self) -> None:
         client_id = self.args.mqtt_client_id or f"server-core-{uuid.uuid4().hex[:8]}"
         self.mqtt_client = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
@@ -1615,6 +1637,7 @@ class CoreRuntime:
     async def _process_mqtt_payload(self, robot_id: str, suffix: str, payload: Dict[str, Any]) -> None:
         if suffix == "telemetry":
             self.latest_telemetry[robot_id] = payload
+            self.telemetry_received_at[robot_id] = time.monotonic()
             self.telemetry_history[robot_id].append(payload)
             # Build the path from the LiDAR-frame pose so it overlays the voxel
             # cloud (same frame); fall back to the sport pose for older edges.
@@ -1760,7 +1783,7 @@ class CoreRuntime:
         user_id: str,
         profile: str,
     ) -> Optional[str]:
-        if self.mqtt_client is None or profile not in self._speed_profiles():
+        if not self._mqtt_connected() or profile not in self._speed_profiles():
             return None
 
         command_id = f"profile-{uuid.uuid4().hex[:12]}"
@@ -1799,7 +1822,7 @@ class CoreRuntime:
         payload: Dict[str, Any],
         sequence: int,
     ) -> bool:
-        if self.mqtt_client is None:
+        if not self._mqtt_connected():
             return False
 
         sanitized = self._sanitize_command(
@@ -1830,7 +1853,7 @@ class CoreRuntime:
         return getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS
 
     def _publish_realtime_stop(self, robot_id: str, user_id: str) -> bool:
-        if self.mqtt_client is None:
+        if not self._mqtt_connected():
             return False
 
         wire = {
@@ -1855,7 +1878,7 @@ class CoreRuntime:
     def autonomy_drive(self, robot_id: str, vx: float, vy: float, wz: float) -> bool:
         """Publish a continuous velocity goal to the edge (filtered there by the
         safety guard). Called by the AutonomyController at its control rate."""
-        if self.mqtt_client is None:
+        if not self._mqtt_connected():
             return False
         self.autonomy_drive_seq[robot_id] += 1
         seq = self.autonomy_drive_seq[robot_id]
@@ -1888,7 +1911,7 @@ class CoreRuntime:
     def autonomy_command(self, robot_id: str, cmd_type: str, payload: Dict[str, Any]) -> Optional[str]:
         """Publish a one-shot control command on behalf of the autonomy brain
         (set_autonomy / set_lidar / set_video / stop / e_stop)."""
-        if self.mqtt_client is None:
+        if not self._mqtt_connected():
             return None
         command_id = f"auto-{cmd_type}-{uuid.uuid4().hex[:8]}"
         wire = {
@@ -1908,9 +1931,12 @@ class CoreRuntime:
             "type": cmd_type,
             "ts": time.time(),
         }
-        self.mqtt_client.publish(
+        result = self.mqtt_client.publish(
             self._mqtt_topic(robot_id, "commands/in"), json.dumps(wire), qos=1
         )
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            self.pending_commands.pop(command_id, None)
+            return None
         self._audit("autonomy_command", wire)
         return command_id
 
@@ -2214,7 +2240,12 @@ class CoreRuntime:
 
     async def _heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
-            if self.mqtt_client is not None:
+            for robot_id in self._known_robots():
+                status = self._control_link_status(robot_id)
+                if status != self.last_control_link_status.get(robot_id):
+                    self.last_control_link_status[robot_id] = status
+                    await self._broadcast({"type": "control_status", "robot_id": robot_id, **status})
+            if self._mqtt_connected():
                 now = time.time()
                 for robot_id in self._known_robots():
                     active = now - self.last_control_activity.get(robot_id, 0.0) <= self.args.control_session_timeout_s
@@ -2303,6 +2334,7 @@ class CoreRuntime:
                 "known_robots": self._known_robots(),
                 "frontend_clients": len(self.frontend_sockets),
                 "edge_media_clients": len(self.edge_media_sockets),
+                "mqtt_connected": self._mqtt_connected(),
                 "stored_maps": len(self.stored_map_keys),
             }
 
@@ -2397,6 +2429,7 @@ class CoreRuntime:
                 "robot_id": robot_id,
                 "telemetry": telemetry,
                 "media_streams": sorted(media.keys()),
+                "control_link": self._control_link_status(robot_id),
                 "pending_commands": [x for x in self.pending_commands.values() if x.get("robot_id") == robot_id],
             }
 
@@ -2477,7 +2510,7 @@ class CoreRuntime:
             self._validate_command_by_role(role, command_type)
             self._validate_rate_limit(user_id, robot_id)
 
-            if self.mqtt_client is None:
+            if not self._mqtt_connected():
                 raise HTTPException(status_code=503, detail="MQTT broker is not connected")
 
             cmd_id = command.command_id or f"cmd-{uuid.uuid4().hex[:12]}"
@@ -2506,7 +2539,10 @@ class CoreRuntime:
                 "ts": time.time(),
             }
 
-            self.mqtt_client.publish(self._mqtt_topic(robot_id, "commands/in"), json.dumps(wire), qos=1)
+            result = self.mqtt_client.publish(self._mqtt_topic(robot_id, "commands/in"), json.dumps(wire), qos=1)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                self.pending_commands.pop(cmd_id, None)
+                raise HTTPException(status_code=503, detail="MQTT command publish failed")
             self._audit("command_out", wire)
 
             await self._broadcast({"type": "command_out", "robot_id": robot_id, "data": wire})
@@ -2548,7 +2584,7 @@ class CoreRuntime:
             role = auth["role"]
             # Autonomy implies driving the robot: gate on the same permission.
             self._validate_command_by_role(role, "set_autonomy")
-            if self.mqtt_client is None:
+            if not self._mqtt_connected():
                 raise HTTPException(status_code=503, detail="MQTT broker is not connected")
             action = body.action.strip().lower()
             self.last_control_activity[robot_id] = time.time()
@@ -2682,6 +2718,11 @@ class CoreRuntime:
             driven_robots: Set[str] = set()
             max_profile_robots: Set[str] = set()
             last_drive_publish: Dict[str, float] = {}
+            last_drive_error_at: Dict[str, float] = {}
+
+            for robot_id in self._known_robots():
+                self._enqueue_frontend(ws, {"type": "control_status", "robot_id": robot_id,
+                                            **self._control_link_status(robot_id)})
 
             for robot_id, telemetry in self.latest_telemetry.items():
                 self._enqueue_frontend(
@@ -2780,6 +2821,10 @@ class CoreRuntime:
                                 last_drive_publish[robot_id] = now
                                 driven_robots.add(robot_id)
                                 self.drive_owners[robot_id] = ws
+                            elif now - last_drive_error_at.get(robot_id, float("-inf")) >= 1.0:
+                                last_drive_error_at[robot_id] = now
+                                self._enqueue_frontend(ws, {"type": "drive_status", "robot_id": robot_id,
+                                    "ok": False, "error": "No se envió el movimiento: MQTT desconectado o publicación fallida"})
                             continue
 
                         if self._publish_realtime_stop(robot_id, auth["user_id"]):

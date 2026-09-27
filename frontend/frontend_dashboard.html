@@ -431,6 +431,7 @@
         <input id="robotId" value="go2_01" style="width: 120px">
         <button id="connectBtn">Conectar</button>
         <span id="connStatus" class="status">desconectado</span>
+        <span id="controlLinkStatus" class="status" role="status">Control sin verificar</span>
       </div>
       <p class="hint">
         Canal operativo: WebSocket + API al servidor. Canal pesado: media recibida desde edge (video/audio/lidar) reenviada por el server.
@@ -1013,6 +1014,7 @@
       robotId: document.getElementById("robotId"),
       connectBtn: document.getElementById("connectBtn"),
       connStatus: document.getElementById("connStatus"),
+      controlLinkStatus: document.getElementById("controlLinkStatus"),
       telemetryBox: document.getElementById("telemetryBox"),
       events: document.getElementById("events"),
       thermalFrame: document.getElementById("thermalFrame"),
@@ -1176,7 +1178,7 @@
     async function sendCommand(type, payload = {}, ttl_ms = 1200) {
       const body = { type, payload, ttl_ms };
       try {
-        await fetchOrThrow(api(`/api/robots/${state.robotId}/commands`), {
+        const response = await fetchOrThrow(api(`/api/robots/${state.robotId}/commands`), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1184,6 +1186,7 @@
           },
           body: JSON.stringify(body),
         }, 2500);
+        return await response.json();
       } catch (err) {
         addEvent("http_error", { type, error: normalizeError(err) });
         throw err;
@@ -3697,6 +3700,13 @@
     function handleWsMessage(msg) {
       const type = msg.type;
 
+      if (type === "control_status" || type === "drive_status") {
+        if (msg.robot_id !== state.robotId) return;
+        setBadge(els.controlLinkStatus, msg.message || msg.error || "Control sin verificar", msg.ok ? "ok" : "err");
+        if (type === "drive_status" && !msg.ok) addEvent("drive_error", msg.error);
+        return;
+      }
+
       if (type === "telemetry") {
         if (msg.robot_id !== state.robotId) return;
         const telemetry = msg.data || {};
@@ -4327,6 +4337,7 @@
       releaseMediaFrames();
       state.robotId = els.robotId.value.trim();
       const generation = ++state.connectGeneration;
+      setBadge(els.controlLinkStatus, "Control sin verificar", "warn");
 
       if (!state.token || !state.apiBase || !state.robotId) {
         setStatus("faltan datos", false);
@@ -4405,6 +4416,7 @@
         resetAudioQueue();
         releaseMediaFrames();
         setStatus("desconectado", false);
+        setBadge(els.controlLinkStatus, "Control desconectado", "err");
         stopControlLoop();
         updateMediaStatus();
         addEvent("ws_close", { code: ev.code, reason: ev.reason || "" });

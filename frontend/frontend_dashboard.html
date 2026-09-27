@@ -120,6 +120,12 @@
       cursor: zoom-in;
     }
 
+    .mission-name { flex: 1 1 220px; min-width: 0; max-width: 440px; }
+    .mission-details { overflow-wrap: anywhere; line-height: 1.6; }
+    .mission-actions { margin-top: 12px; }
+    #missionSelect { min-width: 0; width: 100%; flex: 1 1 280px; }
+    .mission-panel button:disabled { opacity: 0.5; cursor: not-allowed; }
+
     .thermal-section { margin-top: 20px; }
     .thermal-heading { justify-content: space-between; margin-bottom: 8px; }
     .thermal-heading .title { margin: 0; }
@@ -667,6 +673,34 @@
       </p>
     </div>
 
+    <section class="panel saved-map-panel mission-panel" aria-labelledby="missionTitle">
+      <h2 id="missionTitle" class="title">Misiones · grabación en el servidor</h2>
+      <div class="row">
+        <label for="missionName">Nombre</label>
+        <input id="missionName" class="mission-name" maxlength="120" placeholder="Ej.: Recorrido del laboratorio">
+        <button id="missionStartBtn" type="button" class="primary">Iniciar misión</button>
+        <button id="missionStopBtn" type="button" disabled>Finalizar y guardar</button>
+        <span id="missionStatus" class="status" role="status">Sin misión activa</span>
+      </div>
+      <p id="missionLiveDetails" class="hint mission-details">La grabación continúa en el servidor aunque cierres este navegador.</p>
+      <p class="hint">Activá las cámaras y el LiDAR antes de iniciar. Se guarda lo que recibe el servidor durante la misión.</p>
+      <div class="row">
+        <label for="missionSelect">Guardadas</label>
+        <select id="missionSelect"><option value="">Todavía no hay misiones guardadas</option></select>
+        <button id="missionRefreshBtn" type="button">Actualizar misiones</button>
+      </div>
+      <p id="missionSummary" class="hint mission-details">Elegí una misión para consultar sus archivos.</p>
+      <div class="row mission-actions">
+        <button type="button" data-mission-file="mission.zip" disabled>Descargar misión completa</button>
+        <button type="button" data-mission-file="camera.mp4" disabled>Cámara · MP4</button>
+        <button type="button" data-mission-file="thermal.mp4" disabled>Térmica y detección · MP4</button>
+        <button type="button" data-mission-file="thermal_detections.jsonl" disabled>Datos de detección</button>
+        <button id="missionMapBtn" type="button" disabled>Abrir mapa LiDAR</button>
+        <button type="button" data-mission-file="lidar_map.ply" disabled>Mapa · PLY</button>
+      </div>
+      <p id="missionFeedback" class="hint mission-details" role="status"></p>
+    </section>
+
     <div class="panel saved-map-panel">
       <h2 class="title">Biblioteca de mapas 3D · guardada en el servidor</h2>
       <div class="row">
@@ -835,6 +869,7 @@
       apiBase: "",
       robotId: "go2_01",
       connected: false,
+      missions: { items: [], busy: false, loading: false, request: 0, context: "", canManage: true },
       speedValue: 50,
       serverLimits: { ...DEFAULT_LIMITS },
       speedProfiles: {
@@ -1009,6 +1044,16 @@
     };
 
     const els = {
+      missionName: document.getElementById("missionName"),
+      missionStartBtn: document.getElementById("missionStartBtn"),
+      missionStopBtn: document.getElementById("missionStopBtn"),
+      missionStatus: document.getElementById("missionStatus"),
+      missionLiveDetails: document.getElementById("missionLiveDetails"),
+      missionSelect: document.getElementById("missionSelect"),
+      missionRefreshBtn: document.getElementById("missionRefreshBtn"),
+      missionSummary: document.getElementById("missionSummary"),
+      missionMapBtn: document.getElementById("missionMapBtn"),
+      missionFeedback: document.getElementById("missionFeedback"),
       apiBase: document.getElementById("apiBase"),
       token: document.getElementById("token"),
       robotId: document.getElementById("robotId"),
@@ -1210,6 +1255,8 @@
           3000
         );
         const json = await res.json();
+        state.missions.canManage = json.role === "operator" || json.role === "admin";
+        renderMissions();
         if (json && typeof json === "object" && json.limits) {
           state.serverLimits = {
             ...DEFAULT_LIMITS,
@@ -2635,6 +2682,140 @@
       return `${formatMapDate(metadata.created_at)} · ${points} puntos`;
     }
 
+    function missionContext() {
+      const base = normalizeApiBase(els.apiBase.value);
+      const robot = els.robotId.value.trim();
+      const token = els.token.value.trim();
+      return { base, robot, token, key: `${base}|${robot}|${token}` };
+    }
+
+    function missionBusy(item) {
+      return item && ["recording", "finalizing"].includes(item.status);
+    }
+
+    function renderMissions() {
+      const current = state.missions;
+      const active = current.items.find(missionBusy);
+      const selected = current.items.find(item => item.mission_id === els.missionSelect.value);
+      const labels = { recording: "Grabando", finalizing: "Guardando", completed: "Guardada", error: "Grabación con error", interrupted: "Interrumpida" };
+      els.missionStartBtn.disabled = current.busy || current.loading || !!active || !current.canManage;
+      els.missionStopBtn.disabled = current.busy || !active || active.status === "finalizing" || !current.canManage;
+      els.missionRefreshBtn.disabled = current.busy || current.loading;
+      els.missionName.disabled = current.busy || !!active;
+      setBadge(els.missionStatus, active ? `${labels[active.status]} · ${Math.floor(active.duration_s || 0)} s` : "Sin misión activa", active ? "warn" : "");
+      const describe = item => {
+        const streams = item.streams || {};
+        return [["camera", "Cámara"], ["thermal", "Térmica"], ["lidar", "LiDAR"]].map(([key, label]) => {
+          const count = streams[key]?.frames || 0;
+          const age = (item.duration_s || 0) - (streams[key]?.last_at_s || 0);
+          return `${label}: ${count ? `${count} cuadros${missionBusy(item) && age > 5 ? " · sin datos recientes" : ""}` : missionBusy(item) ? "esperando datos" : "sin datos"}`;
+        }).join(" · ");
+      };
+      els.missionLiveDetails.textContent = active
+        ? `${active.name} — ${describe(active)}. Sigue grabando aunque cierres el navegador.`
+        : "La grabación continúa en el servidor aunque cierres este navegador.";
+      els.missionSummary.textContent = selected
+        ? `${selected.name} · ${labels[selected.status] || selected.status} · ${new Date(selected.started_at * 1000).toLocaleString()} · ${Math.floor(selected.duration_s || 0)} s. ${describe(selected)}. Mapa: ${selected.lidar_points || 0} puntos.${selected.error ? ` Error: ${selected.error}` : ""}`
+        : "Elegí una misión para consultar sus archivos.";
+      for (const button of document.querySelectorAll("[data-mission-file]")) {
+        const file = button.dataset.missionFile;
+        button.disabled = current.busy || !selected || missionBusy(selected)
+          || (file !== "mission.zip" && !(selected.artifacts || []).includes(file));
+      }
+      els.missionMapBtn.disabled = current.busy || !selected || missionBusy(selected)
+        || !(selected.artifacts || []).includes("lidar_map.npz");
+    }
+
+    async function loadMissions(preferred = "", quiet = false) {
+      const context = missionContext();
+      if (!context.base || !context.robot || !context.token) return;
+      if (quiet && (state.missions.busy || state.missions.loading)) return;
+      const request = ++state.missions.request;
+      if (state.missions.context !== context.key) {
+        state.missions.items = [];
+        els.missionSelect.replaceChildren();
+        state.missions.context = context.key;
+      }
+      state.missions.loading = true;
+      renderMissions();
+      try {
+        const response = await fetchOrThrow(`${context.base}/api/robots/${encodeURIComponent(context.robot)}/missions`,
+          { headers: { Authorization: `Bearer ${context.token}` } }, 10000);
+        const data = await response.json();
+        if (request !== state.missions.request || context.key !== missionContext().key) return;
+        const selected = preferred || els.missionSelect.value;
+        state.missions.items = data.missions || [];
+        els.missionSelect.replaceChildren();
+        if (!state.missions.items.length) {
+          els.missionSelect.add(new Option("Todavía no hay misiones guardadas", ""));
+        }
+        for (const item of state.missions.items) {
+          const when = new Date(item.started_at * 1000).toLocaleString();
+          els.missionSelect.add(new Option(`${when} · ${item.name}`, item.mission_id));
+        }
+        if (state.missions.items.some(item => item.mission_id === selected)) els.missionSelect.value = selected;
+        if (!quiet) els.missionFeedback.textContent = "";
+      } catch (error) {
+        if (request === state.missions.request) els.missionFeedback.textContent = `No se pudo consultar las misiones: ${normalizeError(error)}`;
+      } finally {
+        if (request === state.missions.request) {
+          state.missions.loading = false;
+          renderMissions();
+        }
+      }
+    }
+
+    async function missionAction(action, filename = "") {
+      if (state.missions.busy) return;
+      const context = missionContext();
+      const active = state.missions.items.find(missionBusy);
+      const selected = els.missionSelect.value;
+      if (action !== "start" && !(action === "stop" ? active : selected)) return;
+      state.missions.busy = true;
+      renderMissions();
+      els.missionFeedback.textContent = action === "stop" ? "Finalizando videos y mapa en el servidor…"
+        : action === "download" ? "Preparando descarga…" : action === "map" ? "Abriendo mapa de la misión…" : "Iniciando misión…";
+      try {
+        let path;
+        const options = { method: "POST", headers: { Authorization: `Bearer ${context.token}`, "Content-Type": "application/json" } };
+        if (action === "start") {
+          path = `/api/robots/${encodeURIComponent(context.robot)}/missions`;
+          options.body = JSON.stringify({ name: els.missionName.value.trim() });
+        } else if (action === "stop") path = `/api/missions/${active.mission_id}/stop`;
+        else if (action === "download") path = `/api/missions/${selected}/download/${filename}`;
+        else { path = `/api/missions/${selected}/map`; options.method = "GET"; }
+        const response = await fetchOrThrow(`${context.base}${path}`, options, 120000);
+        const data = await response.json();
+        if (context.key !== missionContext().key) return;
+        if (action === "download") {
+          const link = document.createElement("a");
+          link.href = `${context.base}${data.path}`;
+          link.download = `${selected}_${filename}`;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          els.missionFeedback.textContent = "Descarga solicitada al servidor.";
+        } else if (action === "map") {
+          const points = await decodeFloatPayload(data.points_base64, data.point_format, 3, data.point_count);
+          uploadSavedMap(points, new Float32Array(), data.metadata);
+          setBadge(els.savedMapStatus, "Mapa de misión abierto", "ok");
+          els.savedMapShell.scrollIntoView({ behavior: "smooth", block: "center" });
+          els.missionFeedback.textContent = "Mapa abierto en el visor de mapas guardados.";
+        } else {
+          await loadMissions(data.mission_id);
+          els.missionFeedback.textContent = action === "start" ? "Misión iniciada. El servidor está esperando o grabando las fuentes."
+            : data.status === "completed" ? "Misión guardada. Ya podés descargar sus archivos."
+            : `La misión terminó con un error: ${data.error || data.status}`;
+        }
+      } catch (error) {
+        els.missionFeedback.textContent = normalizeError(error);
+        void loadMissions("", true);
+      } finally {
+        state.missions.busy = false;
+        renderMissions();
+      }
+    }
+
     async function loadSavedMapList(preferredMapId = "") {
       try {
         syncMapApiInputs();
@@ -3700,6 +3881,11 @@
     function handleWsMessage(msg) {
       const type = msg.type;
 
+      if (type === "mission") {
+        if (msg.robot_id === state.robotId) void loadMissions(msg.data?.mission_id);
+        return;
+      }
+
       if (type === "control_status" || type === "drive_status") {
         if (msg.robot_id !== state.robotId) return;
         setBadge(els.controlLinkStatus, msg.message || msg.error || "Control sin verificar", msg.ok ? "ok" : "err");
@@ -4396,6 +4582,7 @@
         if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
         await applyMediaSettings();
         void loadSavedMapList();
+        void loadMissions();
         void loadServerMesh();
         void loadPerceptionCaps();
         void loadFacesGallery();
@@ -4482,6 +4669,18 @@
     els.unlockAudioBtn.addEventListener("click", async () => {
       await ensureAudioContext(true);
     });
+
+    els.missionStartBtn.addEventListener("click", () => void missionAction("start"));
+    els.missionStopBtn.addEventListener("click", () => void missionAction("stop"));
+    els.missionRefreshBtn.addEventListener("click", () => void loadMissions());
+    els.missionSelect.addEventListener("change", renderMissions);
+    els.missionMapBtn.addEventListener("click", () => void missionAction("map"));
+    for (const button of document.querySelectorAll("[data-mission-file]")) {
+      button.addEventListener("click", () => void missionAction("download", button.dataset.missionFile));
+    }
+    setInterval(() => {
+      if (!document.hidden && (state.connected || state.missions.items.some(missionBusy))) void loadMissions("", true);
+    }, 3000);
 
     els.refreshMapsBtn.addEventListener("click", async () => {
       await loadSavedMapList();
@@ -4789,6 +4988,7 @@
     updateMediaStatus();
     updateMotionReadouts();
     void loadSavedMapList();
+    void loadMissions();
   </script>
 </body>
 </html>

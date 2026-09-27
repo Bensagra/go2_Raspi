@@ -18,6 +18,8 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from server.missions import MissionStore
+from server.mission_routes import register_mission_routes
 from server.thermal import ThermalProcessor
 
 import paho.mqtt.client as mqtt
@@ -546,6 +548,10 @@ class CoreRuntime:
         self.stored_map_keys: Set[Tuple[str, str]] = set()
         self.map_storage_dir = Path(self.args.map_storage_dir).expanduser()
         self.map_storage_dir.mkdir(parents=True, exist_ok=True)
+        self.missions = MissionStore(
+            self.args.mission_storage_dir, voxel_size=self.args.lidar_voxel_size,
+            max_voxels=self.args.lidar_map_max_voxels, min_free_mb=self.args.mission_min_free_mb,
+        )
 
         self.telemetry_history: Dict[str, Deque[Dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=self.args.replay_max_items)
@@ -989,6 +995,7 @@ class CoreRuntime:
         points: np.ndarray,
         colors: Optional[np.ndarray] = None,
     ) -> None:
+        self.missions.ingest(robot_id, "lidar", {}, points, colors)
         self.lidar_latest_packets[robot_id] = (points, colors)
         event = self.lidar_events.setdefault(robot_id, asyncio.Event())
         event.set()
@@ -1052,6 +1059,7 @@ class CoreRuntime:
             if time.time() - received_ts > 3.0:
                 continue
             output.update(robot_id=robot_id, server_received_ts=received_ts)
+            self.missions.ingest(robot_id, "thermal", output, jpeg)
             self._broadcast_media_frame(robot_id, "thermal", output, jpeg, coalesce=True)
 
     def _handle_edge_binary_frame(self, robot_id: str, buffer: bytes) -> None:
@@ -1077,6 +1085,7 @@ class CoreRuntime:
             out_header["stream"] = "video"
             out_header["robot_id"] = robot_id
             out_header["server_received_ts"] = time.time()
+            self.missions.ingest(robot_id, "camera", out_header, payload)
             # H.264 deltas can't be decoded out of context, so never coalesce
             # them as a "latest snapshot"; the periodic keyframe resyncs viewers.
             is_h264 = out_header.get("image_format") == "h264"
@@ -2271,11 +2280,13 @@ class CoreRuntime:
 
     def _setup_routes(self) -> None:
         app = self.app
+        register_mission_routes(app, self)
 
         @app.on_event("startup")
         async def _startup() -> None:
             self.loop = asyncio.get_running_loop()
             await asyncio.to_thread(self._restore_persisted_maps_sync)
+            await asyncio.to_thread(self.missions.recover)
             self._setup_mqtt()
             self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             self.map_save_task = asyncio.create_task(self._map_persistence_loop())
@@ -2316,6 +2327,7 @@ class CoreRuntime:
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.mesh_task
 
+            await asyncio.to_thread(self.missions.close)
             await self._save_all_maps()
 
             if self.mqtt_client is not None:
@@ -2868,6 +2880,7 @@ class CoreRuntime:
                 with contextlib.suppress(Exception):
                     await previous_ws.close(code=1012)
             await self._clear_thermal(robot_id)
+            self.missions.ingest(robot_id, "reset", {}, b"")
             self._audit("edge_media_connected", {"robot_id": robot_id})
 
             try:
@@ -3067,7 +3080,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-greeter-with-autonomy", dest="greeter_with_autonomy",
                         action="store_false")
 
+    parser.add_argument("--mission-storage-dir", default="./server/missions",
+                        help="Persistent mission videos, detections and LiDAR maps.")
+    parser.add_argument("--mission-min-free-mb", type=int, default=256,
+                        help="Stop recording when free disk space falls below this reserve.")
+
     args = parser.parse_args(argv)
+    if not args.mission_storage_dir.strip():
+        parser.error("--mission-storage-dir must not be empty")
+    if args.mission_min_free_mb < 0:
+        parser.error("--mission-min-free-mb must be >= 0")
 
     if args.port <= 0 or args.port > 65535:
         parser.error("--port must be between 1 and 65535")

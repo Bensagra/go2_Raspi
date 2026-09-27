@@ -20,3 +20,6 @@ server/audit/
 .env.*
 !.env.example
 data/
+
+# Server mission recordings
+server/missions/

@@ -35,6 +35,7 @@ class HostingConfigTests(unittest.TestCase):
             self.assertEqual(args.robot_id, ["go2_02", "go2_03"])
             self.assertEqual(args.map_storage_dir, str(Path(directory).resolve() / "maps"))
             self.assertEqual(args.faces_dir, str(Path(directory).resolve() / "faces"))
+            self.assertEqual(args.mission_storage_dir, str(Path(directory).resolve() / "missions"))
             self.assertEqual(args.mqtt_port, 8883)
             self.assertTrue(args.mqtt_tls)
             self.assertEqual(args.mqtt_password, "--a-password-with-leading-dashes")
@@ -179,6 +180,79 @@ class HostingEntrypointTests(unittest.TestCase):
                             self.assertFalse(message["ok"])
                             break
         asyncio.run(scenario())
+
+    def test_mission_recording_survives_viewer_disconnect_and_downloads(self):
+        import io
+        import zipfile
+        import av
+        import cv2
+        import numpy as np
+        from server.server_core import encode_media_frame, decode_media_frame, encode_cloud_payload
+        from termica.protocol import encode_csv
+
+        endpoint = "/api/robots/mission_robot/missions"
+        self.assertEqual(self.request(endpoint, "test-viewer", "POST", {"name": "Denied"})[0], 403)
+        status, raw = self.request(endpoint, "test-operator", "POST", {"name": "Laboratorio"})
+        self.assertEqual(status, 201, raw)
+        mission_id = json.loads(raw)["mission_id"]
+        self.assertEqual(self.request(endpoint, "test-operator", "POST", {"name": "Duplicate"})[0], 409)
+        self.assertEqual(self.request(f"/api/missions/{mission_id}/files/mission.zip", "test-operator")[0], 409)
+
+        async def scenario():
+            from websockets.asyncio.client import connect
+            async with connect(self.ws_url + "/ws/edge-media/mission_robot?token=test-edge") as edge:
+                async with connect(self.ws_url + "/ws/live?token=test-viewer") as viewer:
+                    image = np.full((120, 160, 3), 110, np.uint8)
+                    jpeg = cv2.imencode(".jpg", image)[1].tobytes()
+                    for seq in range(1, 4):
+                        await edge.send(encode_media_frame({"stream": "video", "image_format": "jpeg", "ts": time.time()}, jpeg))
+                        frame = np.full((120, 160), 22, np.float32)
+                        frame[30:70, 60:90] = 34
+                        await edge.send(encode_media_frame({"stream": "thermal_csv", "format": "csv_zlib", "unit": "celsius",
+                            "width": 160, "height": 120, "ts": time.time(), "seq": seq, "session_id": "mission"}, encode_csv(frame)))
+                        while True:
+                            packet = await asyncio.wait_for(viewer.recv(), 3)
+                            if isinstance(packet, bytes):
+                                header, _ = decode_media_frame(packet)
+                                if header.get("stream") == "thermal" and header.get("robot_id") == "mission_robot":
+                                    break
+                # No browser remains; recording must continue.
+                await edge.send(encode_media_frame({"stream": "video", "image_format": "jpeg", "ts": time.time()}, jpeg))
+                points = np.array([[1, 2, 3], [4, 5, 6]], np.float32)
+                blob, fmt, scale, offset, count = encode_cloud_payload(points, None, 2)
+                await edge.send(encode_media_frame({"stream": "lidar", "fmt": fmt, "scale": scale, "offset": offset, "count": count}, blob))
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    _, data = self.request(f"/api/missions/{mission_id}", "test-viewer")
+                    current = json.loads(data)
+                    if current["streams"]["camera"]["frames"] == 4 and current["lidar_points"] == 2:
+                        break
+                    await asyncio.sleep(0.05)
+                self.assertEqual(current["status"], "recording")
+                self.assertEqual(current["streams"]["camera"]["frames"], 4)
+        asyncio.run(scenario())
+        self.assertEqual(self.request(f"/api/missions/{mission_id}/stop", "test-viewer", "POST")[0], 403)
+        status, raw = self.request(f"/api/missions/{mission_id}/stop", "test-operator", "POST")
+        result = json.loads(raw)
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(result["status"], "completed", raw)
+        self.assertEqual(result["missing_streams"], [])
+        self.assertTrue((self.data / "missions" / mission_id / "camera.mp4").is_file())
+        status, raw = self.request(f"/api/missions/{mission_id}/map", "test-viewer")
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(json.loads(raw)["point_count"], 2)
+        status, raw = self.request(f"/api/missions/{mission_id}/download/mission.zip", "test-viewer", "POST")
+        self.assertEqual(status, 200, raw)
+        download_path = json.loads(raw)["path"]
+        status, raw = self.request(download_path)
+        self.assertEqual(status, 200)
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            with av.open(io.BytesIO(archive.read("camera.mp4"))) as video:
+                self.assertEqual(len(list(video.decode(video=0))), 4)
+            detections = [json.loads(line) for line in archive.read("thermal_detections.jsonl").splitlines()]
+            self.assertTrue(detections[-1]["detection"]["person_present"])
+        self.assertEqual(self.request(download_path.replace("mission.zip", "camera.mp4"))[0], 401)
+        self.assertEqual(self.request(f"/api/missions/{mission_id}/files/camera.mp4")[0], 401)
 
     def test_docs_under_tic_prefix(self):
         status, raw = self.request("/docs", headers={"X-Forwarded-Prefix": "/project/server"})

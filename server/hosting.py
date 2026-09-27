@@ -85,6 +85,7 @@ def hosting_args(env: Optional[Mapping[str, str]] = None):
     # HosTICer's application files are read-only. Always persist under DATA_DIR,
     # including when SERVER_ARGS contains paths from a previous local launch.
     args.map_storage_dir = str(data_dir / "maps")
+    args.mission_storage_dir = str(data_dir / "missions")
     args.faces_dir = str(data_dir / "faces")
     args.audit_log = str(data_dir / "audit" / "server_audit.jsonl")
     return args

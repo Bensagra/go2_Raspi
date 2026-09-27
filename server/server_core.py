@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import re
+import sys
 import threading
 import time
 import uuid
@@ -13,6 +14,11 @@ import zlib
 from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from server.thermal import ThermalProcessor
 
 import paho.mqtt.client as mqtt
 import numpy as np
@@ -501,6 +507,9 @@ class CoreRuntime:
         self.frontend_ready: Dict[WebSocket, asyncio.Event] = {}
         self.frontend_sender_tasks: Dict[WebSocket, asyncio.Task[None]] = {}
         self.edge_media_sockets: Dict[str, WebSocket] = {}
+        self.thermal_pending: Dict[str, Tuple[Dict[str, Any], bytes, float]] = {}
+        self.thermal_tasks: Dict[str, asyncio.Task] = {}
+        self.thermal_processors: Dict[str, ThermalProcessor] = {}
         self.drive_owners: Dict[str, WebSocket] = {}
         self.speed_profile_owners: Dict[str, WebSocket] = {}
 
@@ -1016,9 +1025,43 @@ class CoreRuntime:
                     robot_id, "lidar", header, payload, coalesce
                 )
 
+    async def _clear_thermal(self, robot_id: str) -> None:
+        task = self.thermal_tasks.pop(robot_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self.thermal_pending.pop(robot_id, None)
+        self.thermal_processors.pop(robot_id, None)
+        self.latest_media_frames.get(robot_id, {}).pop("thermal", None)
+        for latest in self.frontend_latest_media.values():
+            latest.pop(f"{robot_id}:thermal", None)
+
+    async def _thermal_worker(self, robot_id: str) -> None:
+        processor = self.thermal_processors.setdefault(robot_id, ThermalProcessor())
+        while robot_id in self.thermal_pending:
+            header, payload, received_ts = self.thermal_pending.pop(robot_id)
+            try:
+                output, jpeg = await asyncio.to_thread(processor.process, header, payload)
+            except Exception as exc:
+                self._audit("thermal_frame_error", {"robot_id": robot_id, "error": str(exc)})
+                continue
+            # Drop results delayed by an overloaded worker; no stale detection/video.
+            if time.time() - received_ts > 3.0:
+                continue
+            output.update(robot_id=robot_id, server_received_ts=received_ts)
+            self._broadcast_media_frame(robot_id, "thermal", output, jpeg, coalesce=True)
+
     def _handle_edge_binary_frame(self, robot_id: str, buffer: bytes) -> None:
         header, payload = decode_media_frame(buffer)
         stream = str(header.get("stream", "")).strip()
+
+        if stream == "thermal_csv":
+            self.thermal_pending[robot_id] = (header, payload, time.time())
+            task = self.thermal_tasks.get(robot_id)
+            if task is None or task.done():
+                self.thermal_tasks[robot_id] = asyncio.create_task(self._thermal_worker(robot_id))
+            return
 
         if stream == "lidar":
             points, colors = self._decode_lidar_frame(header, payload)
@@ -2217,6 +2260,8 @@ class CoreRuntime:
         @app.on_event("shutdown")
         async def _shutdown() -> None:
             self.stop_event.set()
+            for robot_id in list(self.thermal_tasks):
+                await self._clear_thermal(robot_id)
             for task in list(self.greeter_tasks.values()):
                 task.cancel()
             for controller in list(self.autonomy_controllers.values()):
@@ -2648,6 +2693,8 @@ class CoreRuntime:
             # frame) so a freshly connected viewer has something to show at once.
             for media_robot_id, frames in self.latest_media_frames.items():
                 for stream, frame in frames.items():
+                    if stream == "thermal":
+                        continue  # Wait for a fresh detection, never replay a stale thermal snapshot.
                     self._coalesce_to_socket(ws, f"{media_robot_id}:{stream}", frame)
 
             try:
@@ -2775,12 +2822,15 @@ class CoreRuntime:
             if previous_ws is not None and previous_ws is not ws:
                 with contextlib.suppress(Exception):
                     await previous_ws.close(code=1012)
+            await self._clear_thermal(robot_id)
             self._audit("edge_media_connected", {"robot_id": robot_id})
 
             try:
                 while True:
                     message = await ws.receive()
                     if message.get("type") == "websocket.disconnect":
+                        break
+                    if self.edge_media_sockets.get(robot_id) is not ws:
                         break
                     raw_bytes = message.get("bytes")
                     raw_text = message.get("text")
@@ -2794,6 +2844,7 @@ class CoreRuntime:
             finally:
                 if self.edge_media_sockets.get(robot_id) is ws:
                     self.edge_media_sockets.pop(robot_id, None)
+                    await self._clear_thermal(robot_id)
                 self._audit("edge_media_disconnected", {"robot_id": robot_id})
 
 

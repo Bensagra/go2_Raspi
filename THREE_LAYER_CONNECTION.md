@@ -291,3 +291,9 @@ todo, se detiene.
 
 Este MVP ya separa media en un canal dedicado y permite evolucionar a WebRTC/SFU sin tocar el canal operativo MQTT+control.
 La migracion natural es reemplazar el uplink WebSocket de media por ingest WHIP/WebRTC en `edge/edge_gateway_service.py` y un media server en la capa Server.
+
+## Cámara térmica USB
+
+El gateway ahora lee una SenXor conectada a la Raspy y manda CSV comprimidos al servidor.
+La detección y el video térmico del dashboard usan las conexiones existentes.
+Ver [instalación, opciones y contrato de frontend](THERMAL_STREAMING.md).

@@ -167,6 +167,52 @@ class HostingEntrypointTests(unittest.TestCase):
         self.assertIn("/api/robots/{robot_id}/commands", schema["paths"])
         self.assertIn({"url": "/project/server"}, schema["servers"])
 
+    def test_thermal_csv_returns_jpeg_on_existing_live_socket(self):
+        async def scenario():
+            import cv2
+            import numpy as np
+            from websockets.asyncio.client import connect
+            from server.server_core import decode_media_frame, encode_media_frame
+            from termica.protocol import encode_csv
+
+            async def thermal_frame(viewer):
+                while True:
+                    packet = await asyncio.wait_for(viewer.recv(), 3)
+                    if isinstance(packet, bytes):
+                        header, payload = decode_media_frame(packet)
+                        if header.get("stream") == "thermal":
+                            return header, payload
+
+            async with connect(self.ws_url + "/ws/live?token=test-viewer") as viewer:
+                hello = json.loads(await asyncio.wait_for(viewer.recv(), 3))
+                self.assertEqual(hello["type"], "hello")
+                async with connect(self.ws_url + "/ws/edge-media/test_robot?token=test-edge") as edge:
+                    frame = np.full((120, 160), 22, dtype=np.float32)
+                    frame[30:70, 60:90] = 34
+                    for seq in range(1, 4):
+                        await edge.send(encode_media_frame({
+                            "stream": "thermal_csv", "format": "csv_zlib", "unit": "celsius",
+                            "width": 160, "height": 120, "ts": time.time(),
+                            "session_id": "integration", "seq": seq,
+                            "robot_id": "untrusted-id",
+                        }, encode_csv(frame)))
+                        header, jpeg = await thermal_frame(viewer)
+                        self.assertEqual(header["robot_id"], "test_robot")
+                        self.assertEqual(header["seq"], seq)
+                        self.assertEqual(header["detection"]["person_present"], seq == 3)
+                        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                        self.assertEqual(image.shape, (480, 640, 3))
+                    # Replacing an edge connection must reset temporal detection.
+                    async with connect(self.ws_url + "/ws/edge-media/test_robot?token=test-edge") as replacement:
+                        await replacement.send(encode_media_frame({
+                            "stream": "thermal_csv", "format": "csv_zlib", "unit": "celsius",
+                            "width": 160, "height": 120, "ts": time.time(),
+                            "session_id": "integration", "seq": 4,
+                        }, encode_csv(frame)))
+                        header, _ = await thermal_frame(viewer)
+                        self.assertFalse(header["detection"]["person_present"])
+        asyncio.run(scenario())
+
     def test_binary_media_lidar_and_map_persistence(self):
         async def scenario():
             import numpy as np

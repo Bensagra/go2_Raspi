@@ -7,12 +7,19 @@ import gc
 import json
 import math
 import os
+import sys
 import time
 import uuid
 import zlib
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# Support both python edge/edge_gateway_service.py and package imports.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from edge.thermal_camera import ThermalCamera
 
 import av
 import cv2
@@ -218,6 +225,11 @@ class EdgeGatewayService:
 
         self.subscribed_topics: set[str] = set()
         self.latest_by_topic: Dict[str, Any] = {}
+
+        self.thermal_camera = ThermalCamera(
+            port=args.thermal_port, fps=args.thermal_fps,
+            emissivity=args.thermal_emissivity,
+        ) if args.enable_thermal else None
 
         self.camera_enabled = args.enable_camera
         self.camera_channel_active = False
@@ -2105,6 +2117,8 @@ class EdgeGatewayService:
                 ),
             },
             "media": {
+                "thermal_enabled": self.thermal_camera is not None,
+                "thermal": self.thermal_camera.status() if self.thermal_camera else {},
                 "camera_enabled": self.camera_enabled,
                 "camera_format": self.camera_format,
                 "lidar_enabled": self.lidar_enabled,
@@ -2732,6 +2746,28 @@ class EdgeGatewayService:
             # if this loop dies the deadline lapses and the robot is stopped.
             self.pending_stop_deadline = now + max(2.0 * interval, 0.4)
 
+    async def _thermal_loop(self) -> None:
+        camera = self.thermal_camera
+        if camera is None:
+            return
+        camera.start()
+        last_error = None
+        try:
+            while not self.stop_event.is_set():
+                packet = camera.take_latest()
+                if packet is not None:
+                    await self._enqueue_media(packet)
+                error = camera.status()["error"]
+                if error != last_error:
+                    if error:
+                        self._publish_event("thermal_camera_error", {"error": error})
+                    elif last_error is not None:
+                        self._publish_event("thermal_camera_connected", {})
+                    last_error = error
+                await asyncio.sleep(0.02)
+        finally:
+            await asyncio.to_thread(camera.stop)
+
     async def _media_uplink_loop(self) -> None:
         if not self.args.media_ws_url:
             return
@@ -2803,6 +2839,9 @@ class EdgeGatewayService:
                             self.media_ready.set()
 
                         for payload in batch:
+                            if (payload.get("stream") == "thermal_csv"
+                                    and time.time() - payload["header"]["ts"] > 3.0):
+                                continue
                             header = payload.get("header") if isinstance(payload.get("header"), dict) else None
                             if payload.get("binary") and header is not None:
                                 # Binary media frame (lidar/video): blob rides raw,
@@ -3081,6 +3120,7 @@ class EdgeGatewayService:
             asyncio.create_task(self._autonomy_drive_loop()),
             asyncio.create_task(self._telemetry_loop()),
             asyncio.create_task(self._media_uplink_loop()),
+            asyncio.create_task(self._thermal_loop()),
         ]
 
         try:
@@ -3286,6 +3326,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Separate heavy-data uplink URL. Example: ws://server:8000/ws/edge-media/{robot_id}",
     )
+    parser.add_argument("--enable-thermal", dest="enable_thermal", action="store_true", default=True,
+                        help="Read the USB SenXor continuously (enabled by default).")
+    parser.add_argument("--disable-thermal", dest="enable_thermal", action="store_false")
+    parser.add_argument("--thermal-port", default=None, help="USB serial port, e.g. /dev/ttyACM0")
+    parser.add_argument("--thermal-fps", type=float, default=8.0, help="Maximum thermal CSV uplink FPS")
+    parser.add_argument("--thermal-emissivity", type=float, default=None)
     parser.add_argument("--media-ws-token", default="")
     parser.add_argument("--media-queue-size", type=int, default=64)
     parser.add_argument("--media-audio-batch-size", type=int, default=4)
@@ -3310,6 +3356,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-retry-interval-s", type=float, default=0.5)
 
     args = parser.parse_args()
+
+    if not math.isfinite(args.thermal_fps) or not 1 <= args.thermal_fps <= 30:
+        parser.error("--thermal-fps must be between 1 and 30")
+    if args.thermal_emissivity is not None and not 0.01 <= args.thermal_emissivity <= 1:
+        parser.error("--thermal-emissivity must be between 0.01 and 1")
 
     if args.telemetry_hz <= 0:
         parser.error("--telemetry-hz must be > 0")

@@ -120,6 +120,28 @@
       cursor: zoom-in;
     }
 
+    .thermal-section { margin-top: 20px; }
+    .thermal-heading { justify-content: space-between; margin-bottom: 8px; }
+    .thermal-heading .title { margin: 0; }
+    .thermal-view { position: relative; }
+    .thermal-view .media { aspect-ratio: 4/3; object-fit: contain; }
+    .thermal-empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-content: center;
+      text-align: center;
+      padding: 24px;
+      background: #0b1118;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      pointer-events: none;
+    }
+    .thermal-empty[hidden] { display: none; }
+    #thermalFrame:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    .thermal-readings { margin-top: 8px; font-variant-numeric: tabular-nums; }
+
     .media.map {
       aspect-ratio: 2/1;
     }
@@ -386,9 +408,13 @@
     }
 
     @media (max-width: 1080px) {
-      .wrap { grid-template-columns: 1fr; }
-      .grid2 { grid-template-columns: 1fr; }
+      .wrap { grid-template-columns: minmax(0, 1fr); }
+      .panel, .grid2 > * { min-width: 0; }
+      .grid2 { grid-template-columns: minmax(0, 1fr); }
       .map3d-viewer { height: 400px; }
+    }
+    @media (max-width: 520px) {
+      .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
@@ -416,6 +442,24 @@
           <div class="media-shell">
             <canvas id="videoFrame" class="media" width="960" height="540" aria-label="video"></canvas>
           </div>
+          <section class="thermal-section" aria-labelledby="thermalTitle">
+            <div class="row thermal-heading">
+              <h2 id="thermalTitle" class="title">Cámara térmica</h2>
+              <span id="thermalStatus" class="status" role="status">Sin conexión</span>
+            </div>
+            <div class="thermal-view">
+              <canvas id="thermalFrame" class="media" width="640" height="480"
+                tabindex="0" role="button" aria-label="Ampliar cámara térmica en vivo"
+                aria-haspopup="dialog" aria-describedby="thermalHint"></canvas>
+              <div id="thermalEmpty" class="thermal-empty">Conectate para ver la cámara térmica.</div>
+            </div>
+            <div class="row thermal-readings">
+              <span id="thermalTemperature">Mín. — · Máx. — · Centro —</span>
+              <span id="thermalDetection" class="status">Sin datos de detección</span>
+            </div>
+            <p id="thermalHint" class="hint">Detección orientativa por temperatura y área; no confirma personas.
+              Clic o Enter sobre la imagen para ampliar.</p>
+          </section>
         </div>
         <div>
           <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -801,10 +845,14 @@
       speedProfileCommandId: "",
       lastRequestedMove: { x: 0, y: 0, z: 0 },
       lastMeasuredMove: { x: null, y: null, z: null },
+      lastThermalAt: 0,
+      thermalHeader: null,
+      thermalFrameTimes: [],
       lastVideoAt: 0,
       lastLidarAt: 0,
       lastAudioAt: 0,
       mediaRender: {
+        thermal: { busy: false, pending: null, bitmap: null, generation: 0 },
         video: {
           busy: false,
           pending: null,
@@ -930,8 +978,8 @@
       // Rolling bandwidth / latency metrics for the metrics panel + auto-quality.
       netStats: {
         windowStart: 0,
-        bytes: { video: 0, lidar: 0, audio: 0 },
-        kbps: { video: 0, lidar: 0, audio: 0, total: 0 },
+        bytes: { video: 0, thermal: 0, lidar: 0, audio: 0 },
+        kbps: { video: 0, thermal: 0, lidar: 0, audio: 0, total: 0 },
         lidarLatencyMs: 0,
         lastAdaptAt: 0,
         adaptLevel: 0,        // 0 = none, +N = downgraded N steps
@@ -967,6 +1015,11 @@
       connStatus: document.getElementById("connStatus"),
       telemetryBox: document.getElementById("telemetryBox"),
       events: document.getElementById("events"),
+      thermalFrame: document.getElementById("thermalFrame"),
+      thermalStatus: document.getElementById("thermalStatus"),
+      thermalEmpty: document.getElementById("thermalEmpty"),
+      thermalTemperature: document.getElementById("thermalTemperature"),
+      thermalDetection: document.getElementById("thermalDetection"),
       videoFrame: document.getElementById("videoFrame"),
       mediaModal: document.getElementById("mediaModal"),
       mediaModalTitle: document.getElementById("mediaModalTitle"),
@@ -1334,7 +1387,7 @@
     }
 
     function streamCanvas(stream) {
-      return els.videoFrame;
+      return stream === "thermal" ? els.thermalFrame : els.videoFrame;
     }
 
     async function decodeMediaBlob(blob) {
@@ -1363,18 +1416,24 @@
 
       try {
         while (renderer.pending) {
-          const { bytes, format } = renderer.pending;
+          const { bytes, format, header, receivedAt } = renderer.pending;
           renderer.pending = null;
           const generation = renderer.generation;
 
           const blob = new Blob([bytes], { type: formatImageMime(format) });
           const bitmap = await decodeMediaBlob(blob);
-          if (generation !== renderer.generation) {
+          if (generation !== renderer.generation || (stream === "thermal" && Date.now() - receivedAt >= 3000)) {
             if (typeof bitmap.close === "function") bitmap.close();
             continue;
           }
 
           drawBitmap(streamCanvas(stream), bitmap);
+          if (stream === "thermal") {
+            state.lastThermalAt = receivedAt;
+            state.thermalHeader = header;
+            state.thermalFrameTimes.push(state.lastThermalAt);
+            updateThermalStatus();
+          }
           if (state.expandedStream === stream) {
             drawBitmap(els.expandedMediaCanvas, bitmap);
           }
@@ -1399,10 +1458,10 @@
     }
 
     // Render a compressed image frame (WebP/JPEG) delivered as raw bytes.
-    function renderMediaImageBytes(bytes, format, stream) {
+    function renderMediaImageBytes(bytes, format, stream, header = null) {
       if (!bytes || !state.mediaRender[stream]) return;
       // Conserva sólo el cuadro más nuevo mientras el navegador decodifica.
-      state.mediaRender[stream].pending = { bytes, format };
+      state.mediaRender[stream].pending = { bytes, format, header, receivedAt: Date.now() };
       void processMediaFrames(stream);
     }
 
@@ -1557,6 +1616,11 @@
       if (header.robot_id && header.robot_id !== state.robotId) return;
       const stream = String(header.stream || "");
       recordNetBytes(stream, buffer.byteLength);
+
+      if (stream === "thermal") {
+        renderMediaImageBytes(payload, header.image_format, "thermal", header);
+        return;
+      }
 
       if (stream === "video") {
         const now = Date.now();
@@ -2509,6 +2573,7 @@
     }
 
     function openMediaModal(stream) {
+      if (stream === "thermal" && (!state.connected || !state.lastThermalAt || Date.now() - state.lastThermalAt >= 3000)) return;
       const renderer = state.mediaRender[stream];
       const isH264Video = stream === "video" && state.videoMode === "h264";
       // En H.264 no hay bitmap cacheado: abrimos igual y el próximo cuadro
@@ -2517,7 +2582,7 @@
       state.expandedStream = stream;
       els.mediaModalTitle.textContent = stream === "video"
         ? "Cámara ampliada"
-        : "Mapa LiDAR 3D ampliado";
+        : stream === "thermal" ? "Cámara térmica ampliada" : "Mapa LiDAR 3D ampliado";
       if (renderer && renderer.bitmap) {
         drawBitmap(els.expandedMediaCanvas, renderer.bitmap);
       }
@@ -3157,6 +3222,10 @@
     }
 
     function releaseMediaFrames() {
+      state.lastThermalAt = 0;
+      state.thermalHeader = null;
+      state.thermalFrameTimes.length = 0;
+      updateThermalStatus();
       closeMediaModal();
       resetVideoDecoder();
       for (const renderer of Object.values(state.mediaRender)) {
@@ -3809,7 +3878,36 @@
       return `${((Date.now() - tsMs) / 1000).toFixed(1)}s`;
     }
 
+    function updateThermalStatus() {
+      const now = Date.now();
+      const live = state.connected && state.lastThermalAt > 0 && now - state.lastThermalAt < 3000;
+      while (state.thermalFrameTimes.length && state.thermalFrameTimes[0] < now - 1000) {
+        state.thermalFrameTimes.shift();
+      }
+      els.thermalEmpty.hidden = live;
+      els.thermalFrame.setAttribute("aria-disabled", String(!live));
+      if (!live) {
+        const stale = state.connected && state.lastThermalAt > 0;
+        setBadge(els.thermalStatus, !state.connected ? "Sin conexión" : stale ? "Señal interrumpida" : "Esperando cámara", "warn");
+        els.thermalEmpty.textContent = !state.connected
+          ? "Conectate para ver la cámara térmica."
+          : stale ? "No llegan cuadros nuevos. Revisá la cámara USB y la conexión de la Raspy."
+          : "Esperando la cámara térmica conectada a la Raspy.";
+        els.thermalTemperature.textContent = "Mín. — · Máx. — · Centro —";
+        setBadge(els.thermalDetection, "Sin datos de detección", "");
+        if (state.expandedStream === "thermal") closeMediaModal();
+        return;
+      }
+      setBadge(els.thermalStatus, `En vivo · ${state.thermalFrameTimes.length} fps`, "ok");
+      const t = state.thermalHeader?.temperature || {};
+      const degrees = value => Number.isFinite(value) ? `${value.toFixed(1)} °C` : "—";
+      els.thermalTemperature.textContent = `Mín. ${degrees(t.min_c)} · Máx. ${degrees(t.max_c)} · Centro ${degrees(t.center_c)}`;
+      const detected = state.thermalHeader?.detection?.person_present === true;
+      setBadge(els.thermalDetection, detected ? "Posible presencia humana" : "Sin presencia confirmada", detected ? "warn" : "");
+    }
+
     function updateMediaStatus() {
+      updateThermalStatus();
       if (!state.connected) {
         setBadge(els.mediaStatus, "media offline", "err");
       } else {
@@ -3858,16 +3956,17 @@
       const dt = (now - ns.windowStart) / 1000;
       if (dt < 0.4) return;
       const kv = (ns.bytes.video * 8) / 1000 / dt;
+      const kt = (ns.bytes.thermal * 8) / 1000 / dt;
       const kl = (ns.bytes.lidar * 8) / 1000 / dt;
       const ka = (ns.bytes.audio * 8) / 1000 / dt;
-      ns.kbps = { video: kv, lidar: kl, audio: ka, total: kv + kl + ka };
-      ns.bytes = { video: 0, lidar: 0, audio: 0 };
+      ns.kbps = { video: kv, thermal: kt, lidar: kl, audio: ka, total: kv + kt + kl + ka };
+      ns.bytes = { video: 0, thermal: 0, lidar: 0, audio: 0 };
       ns.windowStart = now;
       if (els.netMetrics) {
         const auto = els.autoQuality.checked ? ` · auto nivel ${ns.adaptLevel}` : "";
         setBadge(
           els.netMetrics,
-          `BW ${ns.kbps.total.toFixed(0)} kbps (vid ${kv.toFixed(0)} · lidar ${kl.toFixed(0)} · audio ${ka.toFixed(0)}) `
+          `BW ${ns.kbps.total.toFixed(0)} kbps (vid ${kv.toFixed(0)} · térmica ${kt.toFixed(0)} · lidar ${kl.toFixed(0)} · audio ${ka.toFixed(0)}) `
           + `· lidar lat ${ns.lidarLatencyMs.toFixed(0)}ms${auto}`,
           ns.adaptLevel > 0 ? "warn" : "ok"
         );
@@ -4225,6 +4324,7 @@
       state.token = els.token.value.trim();
       state.apiBase = normalizeApiBase(els.apiBase.value);
       els.apiBase.value = state.apiBase;
+      releaseMediaFrames();
       state.robotId = els.robotId.value.trim();
       const generation = ++state.connectGeneration;
 
@@ -4416,6 +4516,13 @@
       ev.target.value = "";
     });
 
+    els.thermalFrame.addEventListener("click", () => openMediaModal("thermal"));
+    els.thermalFrame.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openMediaModal("thermal");
+      }
+    });
     els.videoFrame.addEventListener("click", () => {
       openMediaModal("video");
     });

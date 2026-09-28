@@ -71,8 +71,33 @@ def register_mission_routes(app, runtime):
         ticket = runtime.missions.ticket(mission_id, filename)
         return {"path": f"/api/missions/{mission_id}/files/{filename}?ticket={ticket}", "expires_in_s": 600}
 
-    @app.get("/api/missions/{mission_id}/files/{filename}")
+    def playback_payload(mission_id):
+        mission = runtime.missions.get(mission_id)
+        if mission["status"] in {"recording", "finalizing"}:
+            raise MissionConflict("Finalizá la misión antes de reproducirla")
+        videos = {}
+        for stream in ("camera", "thermal"):
+            filename = f"{stream}.mp4"
+            if filename not in mission["artifacts"]:
+                continue
+            runtime.missions.file(mission_id, filename)
+            stats = mission["streams"][stream]
+            ticket = runtime.missions.ticket(mission_id, filename)
+            videos[stream] = {
+                "path": f"/api/missions/{mission_id}/files/{filename}?inline=true&ticket={ticket}",
+                "offset_s": stats["first_at_s"] or 0,
+                "last_at_s": stats["last_at_s"],
+            }
+        return {"mission": mission, "videos": videos, "expires_in_s": 600,
+                "map_path": f"/api/missions/{mission_id}/map" if "lidar_map.npz" in mission["artifacts"] else None}
+
+    @app.post("/api/missions/{mission_id}/playback")
+    async def playback(mission_id: str, auth=Depends(runtime._auth_dependency)):
+        return await mission_call(playback_payload, mission_id)
+
+    @app.api_route("/api/missions/{mission_id}/files/{filename}", methods=["GET", "HEAD"])
     async def download_file(mission_id: str, filename: str, ticket: str = Query(default=""),
+                            inline: bool = Query(default=False),
                             authorization: str = Header(default="")):
         if authorization:
             await runtime._auth_dependency(authorization)
@@ -80,7 +105,9 @@ def register_mission_routes(app, runtime):
             raise HTTPException(status_code=401, detail="Invalid or expired download link")
         path = await mission_call(runtime.missions.file, mission_id, filename)
         media_type = "video/mp4" if filename.endswith(".mp4") else "application/octet-stream"
-        return FileResponse(path, media_type=media_type, filename=f"{mission_id}_{filename}")
+        return FileResponse(path, media_type=media_type, filename=f"{mission_id}_{filename}",
+                            content_disposition_type="inline" if inline and media_type == "video/mp4" else "attachment",
+                            headers={"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer"})
 
     def map_payload(mission_id):
         path = runtime.missions.file(mission_id, "lidar_map.npz")

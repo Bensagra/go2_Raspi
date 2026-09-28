@@ -301,3 +301,10 @@ La migracion natural es reemplazar el uplink WebSocket de media por ingest WHIP/
 El gateway ahora lee una SenXor conectada a la Raspy y manda CSV comprimidos al servidor.
 La detección y el video térmico del dashboard usan las conexiones existentes.
 Ver [instalación, opciones y contrato de frontend](THERMAL_STREAMING.md).
+
+## Misiones y reproducción
+
+El dashboard permite iniciar/finalizar misiones persistidas en el servidor y
+reproducir cámara y térmica con detección sin descargar los MP4 manualmente.
+Cada misión conserva su mapa LiDAR. Ver [MISIONES_FRONTEND.md](MISIONES_FRONTEND.md)
+para configurar la carpeta en Windows, integrar otro frontend y usar la API.

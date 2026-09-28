@@ -1566,6 +1566,7 @@ class CoreRuntime:
             allow_credentials=("*" not in origins),
             allow_methods=["*"],
             allow_headers=["*"],
+            expose_headers=["Accept-Ranges", "Content-Range", "Content-Length"],
         )
 
     def _mqtt_connected(self) -> bool:

@@ -274,7 +274,7 @@ class MissionRecorder:
                         if image is None:
                             raise ValueError("Invalid recorded image")
                         self._record_image(stream, image, header, at)
-                if now - map_at >= 10:
+                if self.voxels and (now - map_at >= 10 or not (self.directory / "lidar_map.npz").exists()):
                     self._save_map()
                     map_at = now
         except Exception as exc:
@@ -293,7 +293,10 @@ class MissionRecorder:
                     self.meta["error"] = self.meta["error"] or str(exc)
             for handle in (self.frames_log, self.detections_log):
                 if handle:
-                    handle.close()
+                    try:
+                        handle.close()
+                    except Exception as exc:
+                        self.meta["error"] = self.meta["error"] or str(exc)
             try:
                 self._save_map()
             except Exception as exc:
@@ -305,9 +308,14 @@ class MissionRecorder:
                 self.meta["artifacts"] = sorted(p.name for p in self.directory.iterdir() if p.name in ARTIFACTS)
             try:
                 self._checkpoint()
-            except OSError:
+            except OSError as exc:
                 # The last checkpoint remains recoverable even when the filesystem fails.
-                pass
+                with self.condition:
+                    self.meta["status"] = "error"
+                    self.meta["error"] = self.meta["error"] or f"Could not save mission manifest: {exc}"
+            self.writers.clear()
+            self.voxels.clear()
+            self.decoder = None
 
 
 class MissionStore:
@@ -400,6 +408,9 @@ class MissionStore:
         if filename not in ARTIFACTS:
             raise ValueError("Archivo de misión inválido")
         directory = self.directory(mission_id)
+        with self.lock:
+            if any(r.directory.name == mission_id and r.thread.is_alive() for r in self.active.values()):
+                raise MissionConflict("La misión todavía se está grabando o guardando")
         if self.get(mission_id)["status"] in BUSY:
             raise MissionConflict("Finalizá la misión antes de descargarla")
         path = directory / filename

@@ -197,6 +197,7 @@ class HostingEntrypointTests(unittest.TestCase):
         mission_id = json.loads(raw)["mission_id"]
         self.assertEqual(self.request(endpoint, "test-operator", "POST", {"name": "Duplicate"})[0], 409)
         self.assertEqual(self.request(f"/api/missions/{mission_id}/files/mission.zip", "test-operator")[0], 409)
+        self.assertEqual(self.request(f"/api/missions/{mission_id}/playback", "test-viewer", "POST")[0], 409)
 
         async def scenario():
             from websockets.asyncio.client import connect
@@ -238,6 +239,27 @@ class HostingEntrypointTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed", raw)
         self.assertEqual(result["missing_streams"], [])
         self.assertTrue((self.data / "missions" / mission_id / "camera.mp4").is_file())
+        self.assertEqual(self.request(f"/api/missions/{mission_id}/playback", method="POST")[0], 401)
+        status, raw = self.request(f"/api/missions/{mission_id}/playback", "test-viewer", "POST")
+        self.assertEqual(status, 200, raw)
+        playback = json.loads(raw)
+        self.assertEqual(set(playback["videos"]), {"camera", "thermal"})
+        self.assertEqual(playback["videos"]["camera"]["offset_s"], result["streams"]["camera"]["first_at_s"])
+        video_path = playback["videos"]["camera"]["path"]
+        video_bytes = (self.data / "missions" / mission_id / "camera.mp4").read_bytes()
+        # Native HTML video players seek with byte ranges, without a JS blob download.
+        req = Request(self.url + video_path, headers={"Range": "bytes=0-127", "Origin": "https://frontend.example"})
+        with urlopen(req) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.headers["Content-Type"], "video/mp4")
+            self.assertTrue(response.headers["Content-Disposition"].startswith("inline"))
+            self.assertEqual(response.headers["Content-Range"], f"bytes 0-127/{len(video_bytes)}")
+            self.assertEqual(response.read(), video_bytes[:128])
+            self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
+        self.assertEqual(self.request(video_path, headers={"Range": "bytes=-64"})[1], video_bytes[-64:])
+        self.assertEqual(self.request(video_path, headers={"Range": f"bytes={len(video_bytes)+1}-"})[0], 416)
+        self.assertEqual(self.request(video_path, method="HEAD"), (200, b""))
+        self.assertEqual(self.request(video_path.replace("camera.mp4", "thermal.mp4"))[0], 401)
         status, raw = self.request(f"/api/missions/{mission_id}/map", "test-viewer")
         self.assertEqual(status, 200, raw)
         self.assertEqual(json.loads(raw)["point_count"], 2)

@@ -125,6 +125,15 @@
     .mission-actions { margin-top: 12px; }
     #missionSelect { min-width: 0; width: 100%; flex: 1 1 280px; }
     .mission-panel button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .mission-player { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 20px; }
+    .mission-player[hidden] { display: none; }
+    .mission-player .grid2 { margin: 16px 0; }
+    .mission-player video { width: 100%; aspect-ratio: 4/3; object-fit: contain; background: #080e14; display: block; }
+    .mission-player figure { margin: 0; min-width: 0; }
+    .mission-player figcaption { margin-bottom: 8px; }
+    .mission-player .range { flex: 1 1 240px; min-width: 0; }
+    .mission-player:fullscreen { background: var(--bg); padding: 24px; overflow: auto; }
+    @media (max-width: 700px) { .mission-player .grid2 { grid-template-columns: 1fr; } }
 
     .thermal-section { margin-top: 20px; }
     .thermal-heading { justify-content: space-between; margin-bottom: 8px; }
@@ -691,6 +700,7 @@
       </div>
       <p id="missionSummary" class="hint mission-details">Elegí una misión para consultar sus archivos.</p>
       <div class="row mission-actions">
+        <button id="missionReplayBtn" type="button" class="primary" disabled>Abrir reproductor</button>
         <button type="button" data-mission-file="mission.zip" disabled>Descargar misión completa</button>
         <button type="button" data-mission-file="camera.mp4" disabled>Cámara · MP4</button>
         <button type="button" data-mission-file="thermal.mp4" disabled>Térmica y detección · MP4</button>
@@ -699,6 +709,30 @@
         <button type="button" data-mission-file="lidar_map.ply" disabled>Mapa · PLY</button>
       </div>
       <p id="missionFeedback" class="hint mission-details" role="status"></p>
+      <section id="missionPlayer" class="mission-player" hidden aria-labelledby="missionPlayerTitle">
+        <div class="row">
+          <h3 id="missionPlayerTitle" class="title">Reproductor de misión</h3>
+          <button id="missionPlayerFullscreen" type="button">Pantalla completa</button>
+          <button id="missionPlayerClose" type="button">Cerrar reproductor</button>
+        </div>
+        <p id="missionPlayerName" class="mission-details"></p>
+        <div class="grid2">
+          <figure><figcaption>Cámara · <span id="missionCameraState" class="hint"></span></figcaption>
+            <video id="missionCameraVideo" muted playsinline preload="metadata" aria-label="Grabación de la cámara"></video></figure>
+          <figure><figcaption>Térmica y detección · <span id="missionThermalState" class="hint"></span></figcaption>
+            <video id="missionThermalVideo" muted playsinline preload="metadata" aria-label="Grabación térmica con detección"></video></figure>
+        </div>
+        <div class="row">
+          <button id="missionPlayerToggle" type="button">Reproducir</button>
+          <input id="missionTimeline" class="range" type="range" min="0" max="1" step="0.1" value="0" aria-label="Tiempo de la misión">
+          <output id="missionPlayerTime" for="missionTimeline">0:00 / 0:00</output>
+          <label for="missionPlayerRate">Velocidad</label>
+          <select id="missionPlayerRate"><option value="0.5">0,5×</option><option value="1" selected>1×</option><option value="2">2×</option></select>
+          <button id="missionPlayerMap" type="button">Ver mapa LiDAR 3D</button>
+        </div>
+        <p id="missionPlayerMessage" class="hint mission-details" role="status"></p>
+        <p class="hint">Videos servidos directamente por el servidor. Tiempos alineados según su recepción. El mapa 3D muestra el recorrido acumulado.</p>
+      </section>
     </section>
 
     <div class="panel saved-map-panel">
@@ -1054,6 +1088,15 @@
       missionSummary: document.getElementById("missionSummary"),
       missionMapBtn: document.getElementById("missionMapBtn"),
       missionFeedback: document.getElementById("missionFeedback"),
+      missionReplayBtn: document.getElementById("missionReplayBtn"),
+      missionPlayer: document.getElementById("missionPlayer"),
+      missionPlayerName: document.getElementById("missionPlayerName"),
+      missionPlayerToggle: document.getElementById("missionPlayerToggle"),
+      missionTimeline: document.getElementById("missionTimeline"),
+      missionPlayerTime: document.getElementById("missionPlayerTime"),
+      missionPlayerRate: document.getElementById("missionPlayerRate"),
+      missionPlayerMap: document.getElementById("missionPlayerMap"),
+      missionPlayerMessage: document.getElementById("missionPlayerMessage"),
       apiBase: document.getElementById("apiBase"),
       token: document.getElementById("token"),
       robotId: document.getElementById("robotId"),
@@ -2682,6 +2725,138 @@
       return `${formatMapDate(metadata.created_at)} · ${points} puntos`;
     }
 
+    const missionPlayback = { id: "", context: null, videos: {}, time: 0, duration: 0,
+      playing: false, loading: false, request: 0, renewedAt: 0, tickAt: performance.now(), failed: false };
+    const missionVideoElements = {
+      camera: { video: document.getElementById("missionCameraVideo"), label: document.getElementById("missionCameraState") },
+      thermal: { video: document.getElementById("missionThermalVideo"), label: document.getElementById("missionThermalState") },
+    };
+
+    function missionTime(value) {
+      const seconds = Math.max(0, Math.floor(value || 0));
+      return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+    }
+
+    function closeMissionPlayer() {
+      const player = missionPlayback;
+      if (document.fullscreenElement === els.missionPlayer) void document.exitFullscreen().catch(() => {});
+      player.request++;
+      player.id = "";
+      player.playing = false;
+      player.loading = false;
+      for (const { video } of Object.values(missionVideoElements)) {
+        video.pause(); video.removeAttribute("src"); video.load();
+      }
+      els.missionPlayer.hidden = true;
+    }
+
+    async function openMissionPlayer(renew = false) {
+      const player = missionPlayback;
+      const context = renew ? player.context : missionContext();
+      if (!context || context.key !== state.missions.context) { await loadMissions(); return; }
+      const id = renew ? player.id : els.missionSelect.value;
+      if (!id) return;
+      const wasPlaying = renew && player.playing;
+      if (!renew) { closeMissionPlayer(); player.time = 0; }
+      const request = ++player.request;
+      player.id = id; player.context = context; player.loading = true; player.failed = false;
+      els.missionPlayer.hidden = false;
+      els.missionPlayerToggle.disabled = true;
+      els.missionPlayerMap.disabled = true;
+      els.missionPlayerName.textContent = renew ? els.missionPlayerName.textContent : "Cargando misión…";
+      els.missionPlayerMessage.textContent = renew ? "Renovando acceso a los videos…" : "Cargando videos desde el servidor…";
+      try {
+        const response = await fetchOrThrow(`${context.base}/api/missions/${id}/playback`,
+          { method: "POST", headers: { Authorization: `Bearer ${context.token}` } }, 15000);
+        const data = await response.json();
+        if (request !== player.request || context.key !== missionContext().key) return;
+        player.videos = data.videos;
+        player.duration = Math.max(0.1, data.mission.duration_s || 0,
+          ...Object.values(data.videos).map(video => video.last_at_s || 0));
+        player.renewedAt = Date.now();
+        player.expiresIn = data.expires_in_s * 1000;
+        player.playing = wasPlaying;
+        els.missionPlayerName.textContent = data.mission.name;
+        els.missionTimeline.max = String(player.duration);
+        els.missionPlayerMap.disabled = !data.map_path;
+        els.missionPlayerToggle.disabled = !Object.keys(data.videos).length;
+        for (const [stream, { video }] of Object.entries(missionVideoElements)) {
+          video.pause();
+          video.preload = "auto";
+          if (data.videos[stream]) video.src = context.base + data.videos[stream].path;
+          else video.removeAttribute("src");
+          video.load();
+        }
+        els.missionPlayerMessage.textContent = data.mission.error
+          ? `Grabación parcial: ${data.mission.error}`
+          : Object.keys(data.videos).length ? "Listo para reproducir. La detección está incluida en el video térmico."
+          : "Esta misión no contiene videos. Podés abrir el mapa si recibió datos LiDAR.";
+      } catch (error) {
+        if (request !== player.request) return;
+        player.failed = true; player.playing = false;
+        Object.values(missionVideoElements).forEach(item => item.video.pause());
+        els.missionPlayerMessage.textContent = `No se pudo abrir: ${normalizeError(error)}. Usá Abrir reproductor para reintentar.`;
+      } finally {
+        if (request === player.request) { player.loading = false; player.tickAt = performance.now(); updateMissionPlayer(); }
+      }
+    }
+
+    function updateMissionPlayer(seek = false) {
+      const player = missionPlayback;
+      if (!player.id || player.loading || player.failed) return;
+      if (player.context.key !== missionContext().key) { closeMissionPlayer(); return; }
+      if (Date.now() - player.renewedAt > player.expiresIn - 60000) { void openMissionPlayer(true); return; }
+      const now = performance.now();
+      const rate = Number(els.missionPlayerRate.value);
+      const buffering = Object.entries(missionVideoElements).some(([stream, { video }]) => {
+        const track = player.videos[stream];
+        return track && player.time >= track.offset_s && player.time <= (track.last_at_s ?? player.duration)
+          && (video.readyState < 3 || video.seeking);
+      });
+      if (player.playing && !seek && !buffering) player.time = Math.min(player.duration, player.time + (now - player.tickAt) / 1000 * rate);
+      player.tickAt = now;
+      if (player.time >= player.duration) player.playing = false;
+      for (const [stream, { video, label }] of Object.entries(missionVideoElements)) {
+        const track = player.videos[stream];
+        if (!track) { label.textContent = "Sin grabación"; continue; }
+        const before = player.time < track.offset_s;
+        const after = player.time > (track.last_at_s ?? player.duration) + 0.1;
+        const target = Math.max(0, Math.min(player.time - track.offset_s, Number.isFinite(video.duration) ? Math.max(0, video.duration - 0.001) : 0));
+        if (video.readyState >= 1 && !video.seeking && (seek || Math.abs(video.currentTime - target) > 0.4)) video.currentTime = target;
+        video.playbackRate = rate;
+        label.textContent = before ? `Comienza en ${missionTime(track.offset_s)}` : after ? "Fin de la grabación" : video.readyState < 3 ? "Cargando…" : "";
+        if (player.playing && !before && !after && !buffering) {
+          if (video.paused) video.play().catch(error => {
+            if (error.name === "AbortError") return;
+            player.playing = false;
+            els.missionPlayerMessage.textContent = "El navegador no pudo reproducir el video. Volvé a abrir el reproductor.";
+          });
+        } else video.pause();
+      }
+      els.missionTimeline.value = String(player.time);
+      els.missionPlayerTime.textContent = `${missionTime(player.time)} / ${missionTime(player.duration)}`;
+      els.missionTimeline.setAttribute("aria-valuetext", els.missionPlayerTime.textContent);
+      els.missionPlayerToggle.textContent = player.playing ? "Pausar" : "Reproducir";
+    }
+
+    async function openPlayerMap() {
+      const { context, id } = missionPlayback;
+      if (!id || context.key !== missionContext().key) return;
+      els.missionPlayerMap.disabled = true;
+      try {
+        const response = await fetchOrThrow(`${context.base}/api/missions/${id}/map`,
+          { headers: { Authorization: `Bearer ${context.token}` } }, 30000);
+        const data = await response.json();
+        if (id !== missionPlayback.id || context.key !== missionContext().key) return;
+        const points = await decodeFloatPayload(data.points_base64, data.point_format, 3, data.point_count);
+        uploadSavedMap(points, new Float32Array(), data.metadata);
+        if (document.fullscreenElement === els.missionPlayer) await document.exitFullscreen();
+        els.savedMapShell.scrollIntoView({ behavior: "smooth", block: "center" });
+        setBadge(els.savedMapStatus, "Mapa de misión abierto", "ok");
+      } catch (error) { els.missionPlayerMessage.textContent = `No se pudo abrir el mapa: ${normalizeError(error)}`; }
+      finally { els.missionPlayerMap.disabled = false; }
+    }
+
     function missionContext() {
       const base = normalizeApiBase(els.apiBase.value);
       const robot = els.robotId.value.trim();
@@ -2724,6 +2899,7 @@
       }
       els.missionMapBtn.disabled = current.busy || !selected || missionBusy(selected)
         || !(selected.artifacts || []).includes("lidar_map.npz");
+      els.missionReplayBtn.disabled = current.busy || !selected || missionBusy(selected);
     }
 
     async function loadMissions(preferred = "", quiet = false) {
@@ -2768,6 +2944,7 @@
     async function missionAction(action, filename = "") {
       if (state.missions.busy) return;
       const context = missionContext();
+      if (context.key !== state.missions.context) { await loadMissions(); return; }
       const active = state.missions.items.find(missionBusy);
       const selected = els.missionSelect.value;
       if (action !== "start" && !(action === "stop" ? active : selected)) return;
@@ -2804,15 +2981,15 @@
         } else {
           await loadMissions(data.mission_id);
           els.missionFeedback.textContent = action === "start" ? "Misión iniciada. El servidor está esperando o grabando las fuentes."
-            : data.status === "completed" ? "Misión guardada. Ya podés descargar sus archivos."
+            : data.status === "completed" ? "Misión guardada. Ya podés abrir el reproductor o descargar sus archivos."
             : `La misión terminó con un error: ${data.error || data.status}`;
         }
       } catch (error) {
         els.missionFeedback.textContent = normalizeError(error);
-        void loadMissions("", true);
       } finally {
         state.missions.busy = false;
         renderMissions();
+        void loadMissions("", true);
       }
     }
 
@@ -4671,6 +4848,33 @@
     });
 
     els.missionStartBtn.addEventListener("click", () => void missionAction("start"));
+    els.missionReplayBtn.addEventListener("click", () => void openMissionPlayer());
+    document.getElementById("missionPlayerClose").addEventListener("click", closeMissionPlayer);
+    document.getElementById("missionPlayerFullscreen").addEventListener("click", () => {
+      if (els.missionPlayer.requestFullscreen) els.missionPlayer.requestFullscreen().catch(() => {
+        els.missionPlayerMessage.textContent = "Este navegador no permite ampliar el reproductor a pantalla completa.";
+      });
+    });
+    els.missionPlayerMap.addEventListener("click", () => void openPlayerMap());
+    els.missionPlayerToggle.addEventListener("click", () => {
+      if (missionPlayback.time >= missionPlayback.duration) missionPlayback.time = 0;
+      missionPlayback.playing = !missionPlayback.playing;
+      missionPlayback.tickAt = performance.now();
+      updateMissionPlayer(true);
+    });
+    els.missionTimeline.addEventListener("input", () => {
+      missionPlayback.time = Number(els.missionTimeline.value); updateMissionPlayer(true);
+    });
+    for (const { video } of Object.values(missionVideoElements)) {
+      video.addEventListener("error", () => {
+        if (!missionPlayback.id || missionPlayback.loading) return;
+        missionPlayback.failed = true; missionPlayback.playing = false;
+        Object.values(missionVideoElements).forEach(item => item.video.pause());
+        els.missionPlayerToggle.disabled = true;
+        els.missionPlayerMessage.textContent = "No se pudo cargar un video. Comprobá la conexión y usá Abrir reproductor para reintentar; una grabación interrumpida puede estar incompleta.";
+      });
+    }
+    setInterval(updateMissionPlayer, 100);
     els.missionStopBtn.addEventListener("click", () => void missionAction("stop"));
     els.missionRefreshBtn.addEventListener("click", () => void loadMissions());
     els.missionSelect.addEventListener("change", renderMissions);
@@ -4800,6 +5004,9 @@
         closeMediaModal();
         return;
       }
+
+      // Mission controls must keep their native keyboard behavior, without driving the robot.
+      if (ev.target instanceof Element && ev.target.closest(".mission-panel")) return;
 
       if (MOVEMENT_KEYS.has(ev.code)) {
         if (isTypingTarget(ev.target)) return;

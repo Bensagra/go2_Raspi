@@ -30,10 +30,14 @@ los nombres, pero no se carga automáticamente. Sin tokens configurados,
 tokens de desarrollo del arranque local.
 
 TIC ya define `DATA_DIR` y `PORT`: no los sobrescribas en el panel. Mapas,
-caras y auditoría se guardan respectivamente en `DATA_DIR/maps`,
-`DATA_DIR/faces` y `DATA_DIR/audit`. Los caches opcionales van a `/tmp`.
+caras, auditoría y misiones se guardan en `DATA_DIR/maps`,
+`DATA_DIR/faces`, `DATA_DIR/audit` y `DATA_DIR/missions`. Los caches opcionales van a `/tmp`.
 `SERVER_ARGS` no puede sacar los datos persistentes de `DATA_DIR` ni reemplazar
 los tokens configurados en sus variables específicas.
+
+Las misiones incluyen videos MP4, detección térmica y mapa LiDAR. El dashboard
+puede reproducirlas directamente por HTTP, con soporte de rangos de bytes.
+Usar un solo worker. Ver [integración del reproductor y API de misiones](MISIONES_FRONTEND.md).
 
 El broker MQTT es externo a esta aplicación: no se instala Mosquitto dentro del
 hosting. El servidor puede arrancar con el broker desconectado y reintentar la

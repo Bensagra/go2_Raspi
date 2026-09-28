@@ -145,3 +145,19 @@ class MissionTests(unittest.TestCase):
         self.store.ingest("robot", "camera", {"image_format": "jpeg"}, jpeg())
         self.store.close()
         self.assertEqual(self.store.get(mission["mission_id"])["status"], "completed")
+
+    def test_final_manifest_write_failure_is_reported_and_recoverable(self):
+        mission = self.store.start("robot", "Disk failure", "operator")
+        recorder = self.store.active["robot"]
+        self.store.ingest("robot", "camera", {"image_format": "jpeg"}, jpeg())
+        with patch.object(recorder, "_checkpoint", side_effect=OSError("disk full")):
+            result = self.store.stop(mission["mission_id"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("disk full", result["error"])
+        self.assertFalse(recorder.thread.is_alive())
+        self.assertFalse(recorder.writers)
+        recovered = MissionStore(self.temp.name, min_free_mb=0)
+        recovered.recover()
+        self.assertEqual(recovered.get(mission["mission_id"])["status"], "interrupted")
+        with av.open(str(recovered.file(mission["mission_id"], "camera.mp4"))) as video:
+            self.assertEqual(len(list(video.decode(video=0))), 1)

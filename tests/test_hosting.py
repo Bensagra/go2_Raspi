@@ -221,7 +221,8 @@ class HostingEntrypointTests(unittest.TestCase):
                 await edge.send(encode_media_frame({"stream": "video", "image_format": "jpeg", "ts": time.time()}, jpeg))
                 points = np.array([[1, 2, 3], [4, 5, 6]], np.float32)
                 blob, fmt, scale, offset, count = encode_cloud_payload(points, None, 2)
-                await edge.send(encode_media_frame({"stream": "lidar", "fmt": fmt, "scale": scale, "offset": offset, "count": count}, blob))
+                await edge.send(encode_media_frame({"stream": "lidar", "fmt": fmt, "scale": scale, "offset": offset,
+                                                    "count": count, "ts": time.time()}, blob))
                 deadline = time.monotonic() + 4
                 while time.monotonic() < deadline:
                     _, data = self.request(f"/api/missions/{mission_id}", "test-viewer")
@@ -320,7 +321,8 @@ class HostingEntrypointTests(unittest.TestCase):
                         self.assertEqual(header["seq"], seq)
                         self.assertEqual(header["detection"]["person_present"], seq == 3)
                         image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-                        self.assertEqual(image.shape, (480, 640, 3))
+                        self.assertEqual(image.shape, (480, 360, 3))
+                        self.assertEqual(header["rotation_deg"], 270)
                     # Replacing an edge connection must reset temporal detection.
                     async with connect(self.ws_url + "/ws/edge-media/test_robot?token=test-edge") as replacement:
                         await replacement.send(encode_media_frame({

@@ -1939,6 +1939,7 @@ class EdgeGatewayService:
         return rgba
 
     async def _maybe_publish_lidar_media(self, payload: Any) -> None:
+        captured_ts = time.time()
         now = time.monotonic()
         if now - self.last_lidar_media_at < (1.0 / max(self.lidar_media_hz, 0.01)):
             return
@@ -1991,7 +1992,7 @@ class EdgeGatewayService:
                     "scale": scale,
                     "offset": offset,
                     "coordinate_frame": "map",
-                    "ts": time.time(),
+                    "ts": captured_ts,
                 },
                 "payload": payload,
             }

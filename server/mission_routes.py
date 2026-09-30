@@ -1,6 +1,7 @@
 """Authenticated mission lifecycle, map viewing and streamed artifact downloads."""
 import asyncio
 import base64
+import contextlib
 import zlib
 
 import numpy as np
@@ -48,7 +49,24 @@ def register_mission_routes(app, runtime):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if runtime.stop_event.is_set():
             raise HTTPException(status_code=503, detail="Server is shutting down")
-        mission = await mission_call(runtime.missions.start, robot_id, body.name, auth["user_id"])
+        async with runtime.mission_start_locks[robot_id]:
+            previous_generation = runtime.lidar_generations[robot_id]
+            runtime.lidar_resetting.add(robot_id)
+            start_task = asyncio.create_task(mission_call(runtime._start_mission_with_fresh_map,
+                                                         robot_id, body.name, auth["user_id"]))
+            try:
+                mission = await asyncio.shield(start_task)
+            except asyncio.CancelledError:
+                # Cancelling to_thread does not stop its worker. Keep the ingest
+                # gate closed until the reset actually finishes.
+                with contextlib.suppress(Exception):
+                    await start_task
+                raise
+            finally:
+                try:
+                    await runtime._finish_mission_map_reset(robot_id, previous_generation)
+                finally:
+                    runtime.lidar_resetting.discard(robot_id)
         runtime._audit("mission_started", {"mission_id": mission["mission_id"], "robot_id": robot_id})
         await runtime._broadcast({"type": "mission", "robot_id": robot_id, "data": mission})
         return mission

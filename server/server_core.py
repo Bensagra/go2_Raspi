@@ -533,10 +533,17 @@ class CoreRuntime:
         self.lidar_voxel_colors: Dict[
             str, Dict[Tuple[int, int, int], Tuple[int, int, int]]
         ] = defaultdict(dict)
-        self.lidar_latest_packets: Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]] = {}
+        self.lidar_latest_packets: Dict[str, Tuple[np.ndarray, Optional[np.ndarray], str]] = {}
         self.lidar_last_keyframe_at: Dict[str, float] = defaultdict(lambda: 0.0)
         self.lidar_events: Dict[str, asyncio.Event] = {}
         self.lidar_tasks: Dict[str, asyncio.Task[None]] = {}
+        self.lidar_generations = defaultdict(lambda: uuid.uuid4().hex)
+        self.lidar_min_source_ts: Dict[str, float] = {}
+        self.lidar_resetting: Set[str] = set()
+        self.mission_start_locks = defaultdict(asyncio.Lock)
+        # Only worker threads take this lock: an old build/save must finish before
+        # a new mission clears derived maps, without blocking the live event loop.
+        self.map_work_locks = defaultdict(threading.RLock)
         # Background solid-mesh reconstruction state.
         self.mesh_task: Optional[asyncio.Task[None]] = None
         self.mesh_built_revisions: Dict[str, int] = defaultdict(lambda: -1)
@@ -934,6 +941,7 @@ class CoreRuntime:
             "type": "media",
             "robot_id": robot_id,
             "stream": "lidar",
+            "map_generation": self.lidar_generations[robot_id],
             "ts": time.time(),
             "fmt": fmt,
             "mode": mode,
@@ -955,7 +963,14 @@ class CoreRuntime:
         robot_id: str,
         points: np.ndarray,
         colors: Optional[np.ndarray] = None,
+        generation: Optional[str] = None,
     ) -> List[Tuple[Dict[str, Any], bytes, bool]]:
+        with self.map_work_locks[robot_id]:
+            if generation is not None and generation != self.lidar_generations[robot_id]:
+                return []
+            return self._process_lidar_packet_locked(robot_id, points, colors)
+
+    def _process_lidar_packet_locked(self, robot_id, points, colors):
         started = time.monotonic()
         new_points, new_colors = self._update_lidar_voxels(robot_id, points, colors)
         self.map_revisions[robot_id] += 1
@@ -998,9 +1013,17 @@ class CoreRuntime:
         robot_id: str,
         points: np.ndarray,
         colors: Optional[np.ndarray] = None,
+        source_ts: Optional[float] = None,
     ) -> None:
+        if robot_id in self.lidar_resetting:
+            return
+        cutoff = self.lidar_min_source_ts.get(robot_id)
+        if cutoff is not None and (
+            type(source_ts) not in (int, float) or not math.isfinite(source_ts) or source_ts < cutoff
+        ):
+            return
         self.missions.ingest(robot_id, "lidar", {}, points, colors)
-        self.lidar_latest_packets[robot_id] = (points, colors)
+        self.lidar_latest_packets[robot_id] = (points, colors, self.lidar_generations[robot_id])
         event = self.lidar_events.setdefault(robot_id, asyncio.Event())
         event.set()
         task = self.lidar_tasks.get(robot_id)
@@ -1008,6 +1031,66 @@ class CoreRuntime:
             self.lidar_tasks[robot_id] = asyncio.create_task(
                 self._lidar_worker(robot_id)
             )
+
+    def _start_mission_with_fresh_map(self, robot_id, name, user_id):
+        """Serialize against in-flight LiDAR, autosaves and mesh builds on workers."""
+        with self.map_work_locks[robot_id]:
+            # A rejected start must leave the current mission/map untouched.
+            mission = self.missions.start(robot_id, name, user_id)
+            self.lidar_generations[robot_id] = mission["mission_id"]
+            self.lidar_min_source_ts[robot_id] = mission["started_at"]
+            with self.map_data_locks[robot_id]:
+                self.lidar_voxels[robot_id].clear()
+                self.lidar_voxel_colors[robot_id].clear()
+                self.robot_paths[robot_id].clear()
+                self.map_revisions[robot_id] += 1
+            self.lidar_last_keyframe_at[robot_id] = 0.0
+            self.mesh_built_revisions[robot_id] = -1
+            try:
+                # Persist an empty latest map too: a restart before the first new
+                # scan must not restore the previous room. Named snapshots stay.
+                self._write_map_files(robot_id, "latest", np.empty((0, 3), dtype="<f4"),
+                                      np.empty((0, 2), dtype="<f4"), is_latest=True,
+                                      created_at=mission["started_at"])
+                for filename in ("latest.bin", "latest.json"):
+                    (self._mesh_dir(robot_id) / filename).unlink(missing_ok=True)
+            except Exception as exc:
+                recorder = self.missions.active[robot_id]
+                with recorder.condition:
+                    recorder.meta["error"] = f"Could not reset mission map: {exc}"
+                self.missions.stop(mission["mission_id"])
+                raise
+            return mission
+
+    async def _finish_mission_map_reset(self, robot_id, previous_generation):
+        generation = self.lidar_generations[robot_id]
+        if generation == previous_generation:
+            return
+        self.lidar_latest_packets.pop(robot_id, None)
+        self.latest_media_frames[robot_id].pop("lidar", None)
+        for ws, queue in list(self.frontend_queues.items()):
+            self.frontend_latest_media.get(ws, {}).pop(f"{robot_id}:lidar", None)
+            keep = []
+            while not queue.empty():
+                message = queue.get_nowait()
+                old_lidar = False
+                if isinstance(message, bytes):
+                    with contextlib.suppress(ValueError, TypeError, KeyError):
+                        header, _ = decode_media_frame(message)
+                        old_lidar = header.get("robot_id") == robot_id and header.get("stream") == "lidar"
+                if not old_lidar:
+                    keep.append(message)
+            for message in keep:
+                queue.put_nowait(message)
+        # An empty, valid keyframe also resets older frontends that only know
+        # the existing binary cloud protocol, including newly connected viewers.
+        header = {"type": "media", "robot_id": robot_id, "stream": "lidar",
+                  "map_generation": generation, "mode": "keyframe", "fmt": "f32_xyz_zlib",
+                  "count": 0, "map_points": 0, "source_points": 0, "path": [],
+                  "pose": {"x": 0, "y": 0, "yaw": 0}, "ts": time.time()}
+        self._broadcast_media_frame(robot_id, "lidar", header, zlib.compress(b""), coalesce=True)
+        await self._broadcast({"type": "map_reset", "robot_id": robot_id,
+                               "map_generation": generation})
 
     async def _lidar_worker(self, robot_id: str) -> None:
         event = self.lidar_events[robot_id]
@@ -1017,7 +1100,7 @@ class CoreRuntime:
             packet = self.lidar_latest_packets.pop(robot_id, None)
             if packet is None:
                 continue
-            points, colors = packet
+            points, colors, generation = packet
 
             try:
                 messages = await asyncio.to_thread(
@@ -1025,6 +1108,7 @@ class CoreRuntime:
                     robot_id,
                     points,
                     colors,
+                    generation,
                 )
             except Exception as exc:
                 self._audit(
@@ -1033,6 +1117,8 @@ class CoreRuntime:
                 )
                 continue
 
+            if robot_id in self.lidar_resetting or generation != self.lidar_generations[robot_id]:
+                continue
             for header, payload, coalesce in messages:
                 self._broadcast_media_frame(
                     robot_id, "lidar", header, payload, coalesce
@@ -1082,7 +1168,7 @@ class CoreRuntime:
         if stream == "lidar":
             points, colors = self._decode_lidar_frame(header, payload)
             if points.size:
-                self._schedule_lidar_packet(robot_id, points, colors)
+                self._schedule_lidar_packet(robot_id, points, colors, source_ts=header.get("ts"))
             return
 
         if stream == "video":
@@ -1114,9 +1200,10 @@ class CoreRuntime:
 
         # Legacy edges send lidar as base64 JSON; still feed the point-cloud pipeline.
         if stream == "lidar_points" and isinstance(data, dict):
+            generation = self.lidar_generations[robot_id]
             points = await asyncio.to_thread(self._decode_lidar_points, data)
-            if points.size:
-                self._schedule_lidar_packet(robot_id, points)
+            if points.size and generation == self.lidar_generations[robot_id]:
+                self._schedule_lidar_packet(robot_id, points, source_ts=payload.get("ts", data.get("ts")))
             return
 
         # Audio stays JSON end-to-end (small packets, separate playback path).
@@ -1189,6 +1276,10 @@ class CoreRuntime:
         return path
 
     def _build_and_save_mesh_sync(self, robot_id: str) -> Optional[Dict[str, Any]]:
+        with self.map_work_locks[robot_id]:
+            return self._build_and_save_mesh_locked(robot_id)
+
+    def _build_and_save_mesh_locked(self, robot_id):
         points, colors = self._snapshot_cloud_for_mesh(robot_id)
         if points.shape[0] < self.args.mesh_min_voxels:
             return None
@@ -1211,6 +1302,7 @@ class CoreRuntime:
         tmp_blob.replace(blob_path)
         metadata = {
             "robot_id": robot_id,
+            "map_generation": self.lidar_generations[robot_id],
             "vertex_count": int(mesh["vertices"].shape[0]),
             "face_count": int(mesh["faces"].shape[0]),
             "voxel_count": int(mesh["voxel_count"]),
@@ -1233,7 +1325,7 @@ class CoreRuntime:
         try:
             revision = self.map_revisions.get(robot_id, 0)
             metadata = await asyncio.to_thread(self._build_and_save_mesh_sync, robot_id)
-            if metadata is not None:
+            if metadata is not None and metadata.get("map_generation") == self.lidar_generations[robot_id]:
                 self.mesh_built_revisions[robot_id] = revision
                 self._audit("mesh_built", metadata)
                 await self._broadcast(
@@ -1304,6 +1396,8 @@ class CoreRuntime:
         bounds_min, bounds_max = self._map_bounds(points)
         metadata = {
             "map_id": safe_map_id,
+            "map_generation": self.lidar_generations[robot_id],
+            "source_start_ts": self.lidar_min_source_ts.get(robot_id),
             "robot_id": robot_id,
             "title": (
                 "Mapa actual (guardado automático)"
@@ -1347,6 +1441,10 @@ class CoreRuntime:
         return metadata
 
     def _save_latest_map_sync(self, robot_id: str) -> Optional[Dict[str, Any]]:
+        with self.map_work_locks[robot_id]:
+            return self._save_latest_map_locked(robot_id)
+
+    def _save_latest_map_locked(self, robot_id):
         points, path = self._copy_map_arrays(robot_id)
         if points.size == 0:
             return None
@@ -1497,9 +1595,15 @@ class CoreRuntime:
             if not robot_dir.is_dir() or not SAFE_STORAGE_COMPONENT.fullmatch(robot_dir.name):
                 continue
             try:
-                _, points, path = self._load_map_files(robot_dir.name, "latest")
+                metadata, points, path = self._load_map_files(robot_dir.name, "latest")
             except (FileNotFoundError, KeyError, OSError, ValueError):
                 continue
+
+            if isinstance(metadata.get("map_generation"), str):
+                self.lidar_generations[robot_dir.name] = metadata["map_generation"]
+            cutoff = metadata.get("source_start_ts")
+            if type(cutoff) in (int, float) and math.isfinite(cutoff):
+                self.lidar_min_source_ts[robot_dir.name] = cutoff
 
             if points.shape[0] > self.args.lidar_map_max_voxels:
                 points = points[-self.args.lidar_map_max_voxels:]

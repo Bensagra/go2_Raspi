@@ -36,6 +36,10 @@ a la izquierda. En hosting con `uvicorn main:app`, agregalo a `SERVER_ARGS`:
 SERVER_ARGS=["--thermal-rotation-deg","270"]
 ```
 
+Después del giro, la imagen se **espeja horizontalmente por defecto** para
+corregir que se veía invertida izquierda/derecha. Para desactivarlo, agregá
+`--no-thermal-mirror` (o `"--no-thermal-mirror"` en `SERVER_ARGS`).
+
 Conservá los demás argumentos que ya tengas en ese array. El ángulo se aplica
 a todos los robots atendidos por ese Core. Si tenías `--thermal-rotation-deg 90`
 explícito, cambialo a `270` o retiralo para usar el nuevo valor predeterminado.

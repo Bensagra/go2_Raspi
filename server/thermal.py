@@ -18,10 +18,11 @@ TEMP_PIEL_MAX = 42.0  # C
 
 
 class ThermalProcessor:
-    def __init__(self, rotation_deg=270):
+    def __init__(self, rotation_deg=270, mirror=False):
         if type(rotation_deg) is not int or rotation_deg not in (0, 90, 180, 270):
             raise ValueError("La rotacion termica debe ser 0, 90, 180 o 270 grados")
         self.rotation_deg = rotation_deg
+        self.mirror = bool(mirror)
         self.history = deque(maxlen=3)
         self.present = False
         self.with_blob = self.without_blob = 0
@@ -33,7 +34,10 @@ class ThermalProcessor:
         frame = decode_csv(header, payload)
         # Rotate temperatures before detection/rendering so regions and labels
         # share the displayed orientation, including recordings and other UIs.
-        frame = np.ascontiguousarray(np.rot90(frame, k=-(self.rotation_deg // 90)))
+        frame = np.rot90(frame, k=-(self.rotation_deg // 90))
+        if self.mirror:
+            frame = np.fliplr(frame)  # espejo horizontal sobre la imagen ya girada
+        frame = np.ascontiguousarray(frame)
         now = time.monotonic()
         seq = header.get("seq")
         session = header.get("session_id")
@@ -89,7 +93,7 @@ class ThermalProcessor:
             "type": "media", "stream": "thermal", "image_format": "jpeg",
             "width": out_width, "height": out_height,
             "source_width": width, "source_height": height,
-            "rotation_deg": self.rotation_deg,
+            "rotation_deg": self.rotation_deg, "mirror": self.mirror,
             "ts": ts, "seq": seq, "session_id": session,
             "temperature": {"min_c": low, "max_c": high,
                             "center_c": float(celsius[height // 2, width // 2])},

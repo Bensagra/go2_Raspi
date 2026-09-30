@@ -89,6 +89,16 @@ class ThermalProtocolTests(unittest.TestCase):
         self.assertEqual(parse_args([]).thermal_rotation_deg, 270)
         self.assertEqual(parse_args(["--thermal-rotation-deg", "90"]).thermal_rotation_deg, 90)
 
+    def test_mirror_flips_after_rotation(self):
+        self.assertTrue(parse_args([]).thermal_mirror)
+        self.assertFalse(parse_args(["--no-thermal-mirror"]).thermal_mirror)
+        detector = ThermalProcessor(rotation_deg=270, mirror=True)
+        header, _ = detector.process(*fixture())
+        raw_header, raw_payload = fixture()
+        expected = np.fliplr(np.rot90(decode_csv(raw_header, raw_payload), -3))
+        np.testing.assert_array_equal(detector.history[-1], expected)
+        self.assertTrue(header["mirror"])
+
     def test_duplicate_rejected_and_new_session_resets_confirmation(self):
         detector = ThermalProcessor()
         for seq in range(1, 4):

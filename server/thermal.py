@@ -14,7 +14,7 @@ from termica.protocol import decode_csv
 
 
 class ThermalProcessor:
-    def __init__(self, rotation_deg=90):
+    def __init__(self, rotation_deg=270):
         if type(rotation_deg) is not int or rotation_deg not in (0, 90, 180, 270):
             raise ValueError("La rotacion termica debe ser 0, 90, 180 o 270 grados")
         self.rotation_deg = rotation_deg

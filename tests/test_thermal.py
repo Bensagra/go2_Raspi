@@ -54,7 +54,7 @@ class ThermalProtocolTests(unittest.TestCase):
         image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual(image.shape, (480, 360, 3))
         self.assertEqual((header["source_width"], header["source_height"]), (120, 160))
-        self.assertEqual(header["rotation_deg"], 90)
+        self.assertEqual(header["rotation_deg"], 270)
         self.assertEqual(header["temperature"]["max_c"], 34)
         self.assertGreater(len(header["detection"]["regions"]), 0)
         for seq in range(4, 15):
@@ -86,8 +86,8 @@ class ThermalProtocolTests(unittest.TestCase):
                 self.assertEqual(header["temperature"]["max_c"], original["temperature"]["max_c"])
 
     def test_server_rotation_default_and_override(self):
-        self.assertEqual(parse_args([]).thermal_rotation_deg, 90)
-        self.assertEqual(parse_args(["--thermal-rotation-deg", "270"]).thermal_rotation_deg, 270)
+        self.assertEqual(parse_args([]).thermal_rotation_deg, 270)
+        self.assertEqual(parse_args(["--thermal-rotation-deg", "90"]).thermal_rotation_deg, 90)
 
     def test_duplicate_rejected_and_new_session_resets_confirmation(self):
         detector = ThermalProcessor()
@@ -202,7 +202,7 @@ class ThermalPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(a["detection"]["person_present"])
         self.assertFalse(b["detection"]["person_present"])
         self.assertEqual(a["robot_id"], "a")
-        self.assertEqual(a["rotation_deg"], 90)
+        self.assertEqual(a["rotation_deg"], 270)
         self.assertTrue(jpeg.startswith(b"\xff\xd8"))
         await runtime._clear_thermal("a")
         self.assertNotIn("a", runtime.thermal_processors)

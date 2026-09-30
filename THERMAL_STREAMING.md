@@ -13,8 +13,9 @@ video H.264 del Go2. No requiere otro puerto, otra conexión ni WebCodecs.
 
 ## Orientación de la cámara
 
-La térmica se gira **90° a la derecha por defecto** en el servidor para corregir
-el montaje de costado. La matriz de temperaturas se gira antes de detectar y
+La térmica se gira **270° en sentido horario (90° a la izquierda) por defecto**
+en el servidor. Esto agrega 180° al giro anterior de 90° para corregir la imagen
+que quedaba patas arriba. La matriz de temperaturas se gira antes de detectar y
 dibujar: imagen, recuadros y coordenadas quedan alineados, y los textos se leen
 derechos. Se aplica a la vista normal, ampliada, otros frontends y las nuevas
 grabaciones de misiones. No modifica grabaciones anteriores ni el CSV crudo de
@@ -27,8 +28,8 @@ Si el montaje necesita otro ángulo, configurá el **Server Core**:
 python server/server_core.py --thermal-rotation-deg 270
 ```
 
-Agregá ese argumento al resto de los que ya usás. Los valores son `0`, `90`
-(predeterminado), `180` o `270`, siempre en sentido horario; `270` equivale a 90°
+Agregá ese argumento al resto de los que ya usás. Los valores son `0`, `90`,
+`180` o `270` (predeterminado), siempre en sentido horario; `270` equivale a 90°
 a la izquierda. En hosting con `uvicorn main:app`, agregalo a `SERVER_ARGS`:
 
 ```text
@@ -36,7 +37,8 @@ SERVER_ARGS=["--thermal-rotation-deg","270"]
 ```
 
 Conservá los demás argumentos que ya tengas en ese array. El ángulo se aplica
-a todos los robots atendidos por ese Core.
+a todos los robots atendidos por ese Core. Si tenías `--thermal-rotation-deg 90`
+explícito, cambialo a `270` o retiralo para usar el nuevo valor predeterminado.
 
 ## Puesta en marcha
 
@@ -102,7 +104,7 @@ El header incluye:
   "height": 480,
   "source_width": 120,
   "source_height": 160,
-  "rotation_deg": 90,
+  "rotation_deg": 270,
   "ts": 1790000000.0,
   "server_received_ts": 1790000000.1,
   "session_id": "identificador-de-captura",
@@ -114,12 +116,12 @@ El header incluye:
     "temp_min_c": 29.0,
     "temp_max_c": 39.0,
     "area_min_pixels": 55,
-    "regions": [{"x": 55, "y": 60, "width": 35, "height": 25, "area": 871, "max_c": 34.0}]
+    "regions": [{"x": 30, "y": 75, "width": 35, "height": 25, "area": 871, "max_c": 34.0}]
   }
 }
 ```
 
-Ejemplo ilustrativo para un sensor de 160×120 girado 90°. `source_width` y
+Ejemplo ilustrativo para un sensor de 160×120 girado 270°. `source_width` y
 `source_height`, y las coordenadas de los recuadros, corresponden a la matriz
 **ya girada**, no al CSV crudo ni al JPEG ampliado. `rotation_deg` informa el giro
 ya aplicado: el frontend no debe volver a rotar. Las temperaturas mostradas corresponden a la matriz suavizada usada por

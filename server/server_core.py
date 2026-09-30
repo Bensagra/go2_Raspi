@@ -2936,7 +2936,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--thermal-rotation-deg", type=int, choices=(0, 90, 180, 270),
-                        default=90, help="Clockwise thermal image rotation (default: 90).")
+                        default=270, help="Clockwise thermal image rotation (default: 270).")
     parser.add_argument(
         "--cors-origin",
         action="append",

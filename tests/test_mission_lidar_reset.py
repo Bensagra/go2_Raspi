@@ -86,10 +86,8 @@ class MissionLidarResetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('unrelated-message', queued)
         self.assertEqual(self.rt._load_map_files('dog', 'latest')[1].shape, (0, 3))
         self.assertEqual(len(self.rt._load_map_files('dog', snapshot['map_id'])[1]), 2)
-        # Delayed scan from the previous mission must not contaminate its successor.
-        await self.scan(old, ts=first['started_at'])
-        self.assertNotIn('dog', self.rt.lidar_latest_packets)
-        await self.scan(new)
+        # A Raspi clock that lags the Core must not silently drop the new mission's scans.
+        await self.scan(new, ts=second['started_at'] - 60)
         await self.wait_for(lambda: len(self.rt.lidar_voxels['dog']) == 2)
         np.testing.assert_allclose(self.rt._copy_map_arrays('dog')[0], new)
         await asyncio.to_thread(self.rt.missions.stop, second['mission_id'])
@@ -105,7 +103,6 @@ class MissionLidarResetTests(unittest.IsolatedAsyncioTestCase):
         restarted._restore_persisted_maps_sync()
         self.assertFalse(restarted.lidar_voxels['dog'])
         self.assertEqual(restarted.lidar_generations['dog'], mission['mission_id'])
-        self.assertEqual(restarted.lidar_min_source_ts['dog'], mission['started_at'])
 
     async def test_conflicting_start_does_not_clear_running_mission(self):
         first = await self.start('dog', MissionStart(), self.auth)

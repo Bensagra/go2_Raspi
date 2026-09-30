@@ -78,11 +78,8 @@ el mapa que está en uso.
 
 Cada mapa nuevo lleva `map_generation`, cuyo valor es el `mission_id`. Los trabajos
 de LiDAR, guardado y reconstrucción que estaban en curso no pueden volver a
-insertar/publicar el mapa anterior después del cambio. Los paquetes entrantes
-necesitan `ts` Unix en segundos y se descartan si preceden a `started_at`: mantené
-sincronizados los relojes del Core y la Raspi. El gateway incluido envía ese
-timestamp antes de comprimir la nube. Un gateway personalizado sin `ts` debe
-agregarlo para que sus cuadros se acepten después de iniciar una misión.
+insertar/publicar el mapa anterior después del cambio. El corte **no depende del
+reloj de la Raspi**: un reloj atrasado respecto del Core no descarta escaneos.
 
 El dashboard limpia la vista y espera puntos nuevos; no reaparece el LiDAR viejo
 por una descompresión atrasada. Se detiene el replay/grabador local 3D si estaba

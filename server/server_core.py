@@ -538,7 +538,6 @@ class CoreRuntime:
         self.lidar_events: Dict[str, asyncio.Event] = {}
         self.lidar_tasks: Dict[str, asyncio.Task[None]] = {}
         self.lidar_generations = defaultdict(lambda: uuid.uuid4().hex)
-        self.lidar_min_source_ts: Dict[str, float] = {}
         self.lidar_resetting: Set[str] = set()
         self.mission_start_locks = defaultdict(asyncio.Lock)
         # Only worker threads take this lock: an old build/save must finish before
@@ -1013,14 +1012,10 @@ class CoreRuntime:
         robot_id: str,
         points: np.ndarray,
         colors: Optional[np.ndarray] = None,
-        source_ts: Optional[float] = None,
     ) -> None:
+        # No clock-based cutoff: the Raspi clock may lag the Core and would drop
+        # every scan silently. Old data is fenced by the generation tag instead.
         if robot_id in self.lidar_resetting:
-            return
-        cutoff = self.lidar_min_source_ts.get(robot_id)
-        if cutoff is not None and (
-            type(source_ts) not in (int, float) or not math.isfinite(source_ts) or source_ts < cutoff
-        ):
             return
         self.missions.ingest(robot_id, "lidar", {}, points, colors)
         self.lidar_latest_packets[robot_id] = (points, colors, self.lidar_generations[robot_id])
@@ -1038,7 +1033,6 @@ class CoreRuntime:
             # A rejected start must leave the current mission/map untouched.
             mission = self.missions.start(robot_id, name, user_id)
             self.lidar_generations[robot_id] = mission["mission_id"]
-            self.lidar_min_source_ts[robot_id] = mission["started_at"]
             with self.map_data_locks[robot_id]:
                 self.lidar_voxels[robot_id].clear()
                 self.lidar_voxel_colors[robot_id].clear()
@@ -1168,7 +1162,7 @@ class CoreRuntime:
         if stream == "lidar":
             points, colors = self._decode_lidar_frame(header, payload)
             if points.size:
-                self._schedule_lidar_packet(robot_id, points, colors, source_ts=header.get("ts"))
+                self._schedule_lidar_packet(robot_id, points, colors)
             return
 
         if stream == "video":
@@ -1203,7 +1197,7 @@ class CoreRuntime:
             generation = self.lidar_generations[robot_id]
             points = await asyncio.to_thread(self._decode_lidar_points, data)
             if points.size and generation == self.lidar_generations[robot_id]:
-                self._schedule_lidar_packet(robot_id, points, source_ts=payload.get("ts", data.get("ts")))
+                self._schedule_lidar_packet(robot_id, points)
             return
 
         # Audio stays JSON end-to-end (small packets, separate playback path).
@@ -1397,7 +1391,6 @@ class CoreRuntime:
         metadata = {
             "map_id": safe_map_id,
             "map_generation": self.lidar_generations[robot_id],
-            "source_start_ts": self.lidar_min_source_ts.get(robot_id),
             "robot_id": robot_id,
             "title": (
                 "Mapa actual (guardado automático)"
@@ -1601,9 +1594,6 @@ class CoreRuntime:
 
             if isinstance(metadata.get("map_generation"), str):
                 self.lidar_generations[robot_dir.name] = metadata["map_generation"]
-            cutoff = metadata.get("source_start_ts")
-            if type(cutoff) in (int, float) and math.isfinite(cutoff):
-                self.lidar_min_source_ts[robot_dir.name] = cutoff
 
             if points.shape[0] > self.args.lidar_map_max_voxels:
                 points = points[-self.args.lidar_map_max_voxels:]

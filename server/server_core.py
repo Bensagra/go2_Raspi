@@ -1051,7 +1051,8 @@ class CoreRuntime:
             latest.pop(f"{robot_id}:thermal", None)
 
     async def _thermal_worker(self, robot_id: str) -> None:
-        processor = self.thermal_processors.setdefault(robot_id, ThermalProcessor())
+        processor = self.thermal_processors.setdefault(
+            robot_id, ThermalProcessor(rotation_deg=self.args.thermal_rotation_deg))
         while robot_id in self.thermal_pending:
             header, payload, received_ts = self.thermal_pending.pop(robot_id)
             try:
@@ -2934,6 +2935,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--thermal-rotation-deg", type=int, choices=(0, 90, 180, 270),
+                        default=90, help="Clockwise thermal image rotation (default: 90).")
     parser.add_argument(
         "--cors-origin",
         action="append",

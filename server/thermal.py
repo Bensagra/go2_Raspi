@@ -8,9 +8,13 @@ import numpy as np
 
 from termica.detector_csv import (
     AREA_MIN_PERSONA, FRAMES_PARA_CONFIRMAR, FRAMES_PARA_DESCARTAR,
-    TEMP_PIEL_MAX, TEMP_PIEL_MIN, detectar_personas,
+    detectar_personas,
 )
 from termica.protocol import decode_csv
+
+# Rango de detección del servidor (el script local termica/ conserva 29–39 °C).
+TEMP_PIEL_MIN = 27.0  # C
+TEMP_PIEL_MAX = 42.0  # C
 
 
 class ThermalProcessor:

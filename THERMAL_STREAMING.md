@@ -113,8 +113,8 @@ El header incluye:
   "detection": {
     "person_present": true,
     "method": "temperature_area_heuristic",
-    "temp_min_c": 29.0,
-    "temp_max_c": 39.0,
+    "temp_min_c": 27.0,
+    "temp_max_c": 42.0,
     "area_min_pixels": 55,
     "regions": [{"x": 30, "y": 75, "width": 35, "height": 25, "area": 871, "max_c": 34.0}]
   }
@@ -163,7 +163,7 @@ reproduce capturas térmicas antiguas a un frontend recién conectado.
   `thermal_camera_connected` para diagnóstico.
 - El procesamiento CSV y JPEG corre fuera del bucle asíncrono del servidor. La
   memoria pendiente está limitada a un cuadro por robot y un cuadro por visor.
-- Detección: promedio de 3 cuadros, filtro mediana, umbral 29–39 °C, área mínima
+- Detección: promedio de 3 cuadros, filtro mediana, umbral 27–42 °C, área mínima
   55 píxeles; confirma tras 3 cuadros procesados con zona válida y descarta tras
   8 sin zona. Un cambio de sesión, tamaño o una pausa de más de 3 s reinicia la
   confirmación. Parámetros reutilizados de `termica/detector_csv.py`.

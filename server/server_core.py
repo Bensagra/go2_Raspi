@@ -21,6 +21,8 @@ if __package__ in (None, ""):
 from server.missions import MissionStore
 from server.mission_routes import register_mission_routes
 from server.thermal import ThermalProcessor
+from server.talk import TalkRelay
+from robot_media_protocol import flashlight_payload
 
 import paho.mqtt.client as mqtt
 import numpy as np
@@ -49,6 +51,7 @@ ROLE_ALLOWED_COMMANDS = {
         "set_autonomy",
         "set_safety",
         "play_audio",
+        "set_flashlight",
         "set_video",
         "set_camera_stream",
         "set_audio",
@@ -69,6 +72,7 @@ ROLE_ALLOWED_COMMANDS = {
         "set_autonomy",
         "set_safety",
         "play_audio",
+        "set_flashlight",
         "set_video",
         "set_camera_stream",
         "set_audio",
@@ -1645,6 +1649,11 @@ class CoreRuntime:
         self.loop.call_soon_threadsafe(asyncio.create_task, self._process_mqtt_payload(robot_id, suffix, payload))
 
     async def _process_mqtt_payload(self, robot_id: str, suffix: str, payload: Dict[str, Any]) -> None:
+        if suffix == "talk/status":
+            self.talk.on_status(robot_id, payload)
+            return
+        if suffix == "talk/in":
+            return  # PCM is transient: never broadcast/audit microphone packets.
         if suffix == "telemetry":
             self.latest_telemetry[robot_id] = payload
             self.telemetry_received_at[robot_id] = time.monotonic()
@@ -2073,6 +2082,12 @@ class CoreRuntime:
     ) -> Dict[str, Any]:
         output = dict(payload)
 
+        if command_type == "set_flashlight":
+            try:
+                return flashlight_payload(payload)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         if command_type == "move":
             limits = self._speed_profiles().get(
                 speed_profile,
@@ -2282,6 +2297,8 @@ class CoreRuntime:
     def _setup_routes(self) -> None:
         app = self.app
         register_mission_routes(app, self)
+        self.talk = TalkRelay(self)
+        self.talk.register(app)
 
         @app.on_event("startup")
         async def _startup() -> None:

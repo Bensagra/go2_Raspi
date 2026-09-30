@@ -20,6 +20,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from edge.thermal_camera import ThermalCamera
+from edge.talk import EdgeTalk
+from robot_media_protocol import flashlight_payload, require_robot_success
 
 import av
 import cv2
@@ -201,6 +203,8 @@ class EdgeGatewayService:
         self.stop_event = asyncio.Event()
 
         self.conn: Optional[UnitreeWebRTCConnection] = None
+        self.talk = EdgeTalk(self)
+        self.flashlight_brightness = None
         self.video_task: Optional[asyncio.Task[None]] = None
         self.video_encode_task: Optional[asyncio.Task[None]] = None
         self.latest_camera_frame = None
@@ -460,6 +464,7 @@ class EdgeGatewayService:
             return
 
         client.subscribe(self._mqtt_topic("commands/in"), qos=1)
+        client.subscribe(self._mqtt_topic("talk/in"), qos=1)
         client.subscribe(self._mqtt_topic("control/heartbeat"), qos=0)
         self._publish_event(
             "mqtt_connected",
@@ -493,6 +498,10 @@ class EdgeGatewayService:
                     self.last_heartbeat_monotonic = time.monotonic()
                 else:
                     self.last_heartbeat_monotonic = 0.0
+            return
+
+        if topic.endswith("/talk/in"):
+            self.loop.call_soon_threadsafe(self.talk.enqueue, payload)
             return
 
         if topic.endswith("/commands/in"):
@@ -802,7 +811,7 @@ class EdgeGatewayService:
         level = int(max(0, min(10, level)))
         try:
             await asyncio.wait_for(
-                self._robot_request(TOPIC_ALIAS_TO_VALUE["VUI"], 1005, {"volume": level}),
+                self._robot_request(TOPIC_ALIAS_TO_VALUE["VUI"], 1003, {"volume": level}),
                 timeout=2.0,
             )
             return True
@@ -815,6 +824,8 @@ class EdgeGatewayService:
         audio_name: Optional[Any] = None,
         audio_file: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        if self.talk.session is not None:
+            return {"played": False, "skipped": "talk_active"}
         now = time.monotonic()
         if not force and now - self.last_greet_at < self.greet_min_interval_s:
             return {"played": False, "skipped": "rate_limited"}
@@ -2170,6 +2181,8 @@ class EdgeGatewayService:
                 "has_target": self.drive_target is not None,
             },
             "audio_buttons": self._audio_button_status(),
+            "flashlight": {"brightness": self.flashlight_brightness},
+            "talk": {"active": self.talk.session is not None, "max_seconds": 20},
             "alerts": alerts,
         }
 
@@ -2196,6 +2209,7 @@ class EdgeGatewayService:
             "e_stop",
             "set_safety",
             "play_audio",
+            "set_flashlight",
             "set_video",
             "set_camera_stream",
             "set_audio",
@@ -2230,6 +2244,12 @@ class EdgeGatewayService:
     async def _execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         cmd_type = str(command.get("type", ""))
         payload = command.get("payload", {}) if isinstance(command.get("payload"), dict) else {}
+
+        if cmd_type == "set_flashlight":
+            params = flashlight_payload(payload)
+            require_robot_success(await self._robot_request(RTC_TOPIC["VUI"], 1005, params))
+            self.flashlight_brightness = params["brightness"]
+            return {"executed": "set_flashlight", **params, "enabled": params["brightness"] > 0}
 
         if cmd_type == "stop":
             self._sport_send_nowait(int(SPORT_CMD["StopMove"]))
@@ -2900,6 +2920,11 @@ class EdgeGatewayService:
 
         self.conn.video.add_track_callback(self._on_video_track)
         self.conn.audio.add_track_callback(self._on_audio_frame)
+        try:
+            self.talk.attach(self.conn)
+        except Exception as exc:
+            self._publish_event("talk_unavailable", {"error": str(exc)})
+        self.flashlight_brightness = None
 
         try:
             await self._set_speed_profile("normal", stop_first=True)
@@ -2971,6 +2996,11 @@ class EdgeGatewayService:
         )
 
     async def _disconnect_robot(self) -> None:
+        await self.talk.stop("robot_disconnected")
+        if self.talk.track is not None:
+            self.talk.track.stop()
+            self.talk.track = None
+        self.flashlight_brightness = None
         if self.greet_prewarm_task and not self.greet_prewarm_task.done():
             self.greet_prewarm_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -3116,6 +3146,7 @@ class EdgeGatewayService:
         tasks: List[asyncio.Task[Any]] = [
             asyncio.create_task(self._robot_supervisor_loop()),
             asyncio.create_task(self._command_loop()),
+            asyncio.create_task(self.talk.run()),
             asyncio.create_task(self._watchdog_loop()),
             asyncio.create_task(self._autonomy_drive_loop()),
             asyncio.create_task(self._telemetry_loop()),
@@ -3248,11 +3279,11 @@ def parse_args() -> argparse.Namespace:
 
     # --- Reactive safety guard + autonomy ------------------------------------
     parser.add_argument("--enable-safety-guard", dest="enable_safety_guard",
-                        action="store_true", default=True,
-                        help="Reactive LiDAR collision/cliff guard (default on).")
+                        action="store_true", default=False,
+                        help="Enable reactive LiDAR collision/cliff guard (default off).")
     parser.add_argument("--disable-safety-guard", dest="enable_safety_guard",
                         action="store_false",
-                        help="Disable the local safety guard (NOT recommended).")
+                        help="Start with the local safety guard disabled (default).")
     parser.add_argument("--safety-points-frame", choices=["world", "body"], default="world",
                         help="Frame of LiDAR points fed to the guard.")
     parser.add_argument("--safety-update-hz", type=float, default=10.0,

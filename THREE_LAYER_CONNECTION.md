@@ -166,11 +166,13 @@ y, mientras pasea, **busque personas y capture/reconozca su cara**. Toda la
 inteligencia pesada (planeamiento, detección, reconocimiento) vive en el server;
 el anti-choque vive en el edge para que sea una garantía dura.
 
-### Capa de seguridad (edge) — "nunca choca / nunca se cae"
+### Capa de seguridad (edge) — antichoque opcional
 
 `edge/safety_guard.py` es un guard reactivo que corre en la Raspi sobre el LiDAR
-**crudo**, antes de cualquier compresión/uplink, así la garantía sobrevive a la
-latencia o a una caída de red. Filtra **todo** movimiento (manual *y* autónomo):
+**crudo**, antes de cualquier compresión/uplink. **Arranca apagado por defecto**;
+se activa explícitamente desde el dashboard con `set_safety` o al iniciar el edge
+con `--enable-safety-guard`. Cuando está activo y armado filtra el movimiento
+manual y autónomo; depende de la cobertura del sensor y de la calibración:
 
 - Sectoriza la nube en body frame y, según la dirección del movimiento pedido,
   **veta** (clearance < `stop_distance`) o **ralentiza** (entre `stop` y `slow`)
@@ -188,14 +190,17 @@ latencia o a una caída de red. Filtra **todo** movimiento (manual *y* autónomo
 Flags del edge (todos calibrables en vivo con el comando `set_safety`):
 `--safety-stop-distance-m`, `--safety-slow-distance-m`, `--safety-robot-half-width-m`,
 `--safety-ground-z-m` (piso), `--safety-cliff-drop-m`, `--safety-max-radius-m`,
-`--disable-safety-guard`, `--safety-cliff-disabled`.
+`--enable-safety-guard`, `--disable-safety-guard`, `--safety-cliff-disabled`.
+
+Micrófono tipo handy, linterna y captura de cámara: ver [MEDIA_FRONTEND.md](MEDIA_FRONTEND.md)
+para despliegue, protocolo y un cliente JavaScript reutilizable en otro frontend.
 
 ### Capa de navegación (server) — exploración por fronteras
 
 `server/exploration.py` arma una grilla de ocupación 2D desde el voxel-map
 acumulado + el camino recorrido, busca **fronteras** (libre lindando con
 desconocido), elige la más cercana alcanzable por BFS y produce una velocidad
-hacia ella (el anti-choque del edge se encarga de no chocar). **Termina cuando no
+hacia ella (el guard del edge filtra obstáculos si se activa explícitamente). **Termina cuando no
 quedan fronteras** ("mapear todo y parar").
 
 `server/autonomy.py` es la **máquina de estados** (una por robot):

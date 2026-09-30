@@ -75,6 +75,12 @@
     }
 
     button:hover { filter: brightness(1.15); }
+    .media-actions { margin: 12px 0; }
+    .media-actions button { min-height: 44px; }
+    .media-actions button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .media-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    #talkHoldBtn { touch-action: none; user-select: none; }
+    #talkHoldBtn[aria-pressed="true"] { background: #713030; border-color: var(--err); }
 
     .status {
       font-size: 12px;
@@ -605,6 +611,21 @@
       <div class="row" style="margin-top: 4px;">
         <span id="netMetrics" class="status">red --</span>
       </div>
+      <div class="media-actions" aria-label="Micrófono, linterna y captura">
+        <div class="row">
+          <button id="talkHoldBtn" type="button" aria-pressed="false" aria-describedby="talkHint">Mantener para hablar</button>
+          <button id="talkToggleBtn" type="button" aria-pressed="false">Abrir micrófono (20 s)</button>
+          <span id="talkStatus" class="status" role="status">Micrófono cerrado</span>
+        </div>
+        <p id="talkHint" class="hint">Tu voz sale por el parlante del perro. Soltá para cortar o usá Abrir micrófono y luego Cerrar. Máximo 20 segundos por turno.</p>
+        <div class="row">
+          <button id="flashlightOnBtn" type="button">Encender linterna</button>
+          <button id="flashlightOffBtn" type="button">Apagar linterna</button>
+          <span id="flashlightStatus" class="status" role="status">Linterna: sin confirmar</span>
+          <button id="snapshotBtn" type="button">Capturar imagen</button>
+          <span id="snapshotStatus" class="status" role="status">Captura PNG de la cámara</span>
+        </div>
+      </div>
       <p class="hint">
         El perfil <strong>Débil</strong> limita cámara y LiDAR para priorizar el control. El audio queda apagado
         por defecto porque, aun sin video, puede consumir una porción importante del enlace.
@@ -665,8 +686,8 @@
         <span id="safLast" class="status">última intervención: --</span>
       </div>
       <p class="hint">
-        El anti-choque corre en el robot (edge) sobre el LiDAR crudo y filtra todo movimiento — manual y autónomo —
-        así nunca choca ni se cae aunque se corte la red. Calibrá el piso con <span class="kbd">--safety-ground-z-m</span>.
+        El anti-choque arranca apagado. Podés activarlo con el botón; cuando está activo y tiene LiDAR,
+        filtra el movimiento manual y autónomo. Calibrá el piso con <span class="kbd">--safety-ground-z-m</span>.
       </p>
 
       <h2 class="title" style="margin-top:12px;">👤 Caras capturadas</h2>
@@ -794,6 +815,7 @@
     </div>
   </div>
 
+  <script src="go2-media-controls.js"></script>
   <script>
     const DEFAULT_LIMITS = Object.freeze({
       max_forward_speed: 3.8,
@@ -1208,7 +1230,7 @@
     function wsUrlFromApi(apiBase, token) {
       const u = new URL(apiBase);
       u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-      u.pathname = "/ws/live";
+      u.pathname = u.pathname.replace(/\/$/, "") + "/ws/live";
       u.search = "token=" + encodeURIComponent(token);
       return u.toString();
     }
@@ -1279,6 +1301,93 @@
         addEvent("http_error", { type, error: normalizeError(err) });
         throw err;
       }
+    }
+
+    const mediaOptions = () => ({ apiBase: state.apiBase, token: state.token, robotId: state.robotId });
+    let lastSnapshotFrameAt = 0;
+    const videoSnapshotTimes = new Map();
+    const snapshotTimestamp = header => Number(header?.encoded_ts || header?.ts || 0) * 1000;
+    const talkClient = new Go2Media.TalkClient(message => {
+      const talking = message.status === "talking";
+      const active = talking || message.status === "opening";
+      document.getElementById("talkHoldBtn").setAttribute("aria-pressed", String(active));
+      const toggle = document.getElementById("talkToggleBtn");
+      toggle.setAttribute("aria-pressed", String(active));
+      toggle.textContent = active ? "Cerrar micrófono" : "Abrir micrófono (20 s)";
+      setBadge(document.getElementById("talkStatus"), talking ? `Transmitiendo · ${message.remaining} s` :
+        message.status === "opening" ? "Abriendo micrófono…" : message.error || "Micrófono cerrado",
+        talking ? "warn" : message.error ? "err" : "");
+      if (active) resetAudioQueue();
+    });
+
+    async function startTalk() {
+      try {
+        if (!state.connected) throw new Error("Conectá el dashboard antes de hablar");
+        await talkClient.start(mediaOptions());
+      } catch (error) {
+        setBadge(document.getElementById("talkStatus"), normalizeError(error), "err");
+      }
+    }
+
+    const holdTalk = document.getElementById("talkHoldBtn");
+    holdTalk.addEventListener("pointerdown", event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      holdTalk.setPointerCapture(event.pointerId);
+      void startTalk();
+    });
+    for (const name of ["pointerup", "pointercancel", "lostpointercapture"]) {
+      holdTalk.addEventListener(name, () => talkClient.stop());
+    }
+    holdTalk.addEventListener("blur", () => talkClient.stop());
+    holdTalk.addEventListener("keydown", event => {
+      if (["Space", "Enter"].includes(event.code)) {
+        event.preventDefault(); event.stopPropagation();
+        if (!event.repeat) void startTalk();
+      }
+    });
+    holdTalk.addEventListener("keyup", event => {
+      if (["Space", "Enter"].includes(event.code)) {
+        event.preventDefault(); event.stopPropagation(); talkClient.stop();
+      }
+    });
+    document.getElementById("talkToggleBtn").addEventListener("click", () => {
+      if (talkClient.active) talkClient.stop(); else void startTalk();
+    });
+    for (const [id, brightness] of [["flashlightOnBtn", 10], ["flashlightOffBtn", 0]]) {
+      document.getElementById(id).addEventListener("click", async () => {
+        const badge = document.getElementById("flashlightStatus");
+        const buttons = ["flashlightOnBtn", "flashlightOffBtn"].map(x => document.getElementById(x));
+        const options = mediaOptions();
+        buttons.forEach(b => b.disabled = true);
+        setBadge(badge, "Esperando confirmación de la linterna…", "warn");
+        try {
+          const result = await Go2Media.confirmedCommand(options, "set_flashlight", { brightness });
+          if (options.robotId === state.robotId) setBadge(badge, result.enabled ? "Linterna encendida" : "Linterna apagada", "ok");
+        } catch (error) {
+          setBadge(badge, normalizeError(error), "err");
+        } finally { buttons.forEach(b => b.disabled = false); }
+      });
+    }
+    document.getElementById("snapshotBtn").addEventListener("click", async () => {
+      const badge = document.getElementById("snapshotStatus");
+      try {
+        const shot = await Go2Media.captureCanvas(els.videoFrame, {
+          robotId: state.robotId, lastFrameAt: lastSnapshotFrameAt,
+        });
+        const url = URL.createObjectURL(shot.blob);
+        const link = document.createElement("a");
+        link.href = url; link.download = shot.filename;
+        document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        setBadge(badge, `Captura lista · ${shot.width} × ${shot.height}`, "ok");
+      } catch (error) { setBadge(badge, normalizeError(error), "err"); }
+    });
+    for (const input of [els.apiBase, els.token, els.robotId]) {
+      input.addEventListener("input", () => {
+        talkClient.stop(); lastSnapshotFrameAt = 0;
+        setBadge(document.getElementById("flashlightStatus"), "Linterna: sin confirmar");
+      });
     }
 
     async function activateControl() {
@@ -1521,6 +1630,7 @@
           }
 
           drawBitmap(streamCanvas(stream), bitmap);
+          if (stream === "video") lastSnapshotFrameAt = snapshotTimestamp(header);
           if (stream === "thermal") {
             state.lastThermalAt = receivedAt;
             state.thermalHeader = header;
@@ -1582,6 +1692,10 @@
     function handleDecodedVideoFrame(frame) {
       try {
         drawVideoFrame(els.videoFrame, frame);
+        lastSnapshotFrameAt = videoSnapshotTimes.get(frame.timestamp) || 0;
+        for (const timestamp of videoSnapshotTimes.keys()) {
+          if (timestamp <= frame.timestamp) videoSnapshotTimes.delete(timestamp);
+        }
         if (state.expandedStream === "video") {
           drawVideoFrame(els.expandedMediaCanvas, frame);
         }
@@ -1593,6 +1707,7 @@
     }
 
     function resetVideoDecoder() {
+      videoSnapshotTimes.clear();
       const vd = state.videoDecoder;
       if (vd.decoder) {
         try { vd.decoder.close(); } catch (e) { /* ignore */ }
@@ -1610,6 +1725,7 @@
       if (vd.decoder) {
         try { vd.decoder.close(); } catch (e) { /* ignore */ }
       }
+      videoSnapshotTimes.clear();
       vd.decoder = new VideoDecoder({
         output: handleDecodedVideoFrame,
         error: (err) => {
@@ -1662,6 +1778,8 @@
 
       const fps = Math.max(1, parseNum(header.target_fps, 30));
       const timestamp = Math.round((vd.frameCount++ * 1e6) / fps);
+      videoSnapshotTimes.set(timestamp, snapshotTimestamp(header));
+      if (videoSnapshotTimes.size > 120) videoSnapshotTimes.delete(videoSnapshotTimes.keys().next().value);
       try {
         vd.decoder.decode(new EncodedVideoChunk({
           type: isKey ? "key" : "delta",
@@ -3583,6 +3701,8 @@
     }
 
     function releaseMediaFrames() {
+      talkClient.stop();
+      lastSnapshotFrameAt = 0;
       state.lastThermalAt = 0;
       state.thermalHeader = null;
       state.thermalFrameTimes.length = 0;
@@ -3891,9 +4011,9 @@
       const turnOn = !state.safetyOn;
       const sEl = autoEl("safetyToggleStatus");
       try {
-        const res = await sendCommand("set_safety", { enabled: turnOn }, 3000);
-        // Trust the edge ack when present; otherwise assume the requested state.
-        const applied = (res && res.safety_enabled !== undefined) ? !!res.safety_enabled : turnOn;
+        if (sEl) setBadge(sEl, "Esperando confirmación…", "warn");
+        const res = await Go2Media.confirmedCommand(mediaOptions(), "set_safety", { enabled: turnOn });
+        const applied = !!res.safety_enabled;
         state.safetyOn = applied;
         updateSafetyButton(applied);
         if (sEl) setBadge(sEl, applied ? "activado" : "DESACTIVADO", applied ? "ok" : "err");
@@ -4077,6 +4197,10 @@
         updateMeasuredMotion(telemetry);
         updateSafetyReadout(telemetry);
         updateAudioButtonsFromTelemetry(telemetry);
+        const brightness = telemetry.flashlight?.brightness;
+        if (Number.isInteger(brightness)) {
+          setBadge(document.getElementById("flashlightStatus"), brightness > 0 ? `Linterna encendida · ${brightness}/10` : "Linterna apagada", "ok");
+        }
         return;
       }
 
@@ -4115,6 +4239,7 @@
         if (msg.robot_id !== state.robotId) return;
         const stream = String(msg.stream || "");
         if (stream === "audio") {
+          if (talkClient.active) return; // Half-duplex: avoid feeding the speaker back to the mic.
           recordNetBytes("audio", JSON.stringify(msg.data || {}).length);
           queueAudioPacket(msg.data || {});
           return;
@@ -5006,7 +5131,7 @@
       }
 
       // Mission controls must keep their native keyboard behavior, without driving the robot.
-      if (ev.target instanceof Element && ev.target.closest(".mission-panel")) return;
+      if (ev.target instanceof Element && ev.target.closest(".mission-panel, .media-actions")) return;
 
       if (MOVEMENT_KEYS.has(ev.code)) {
         if (isTypingTarget(ev.target)) return;

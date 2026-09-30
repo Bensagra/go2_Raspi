@@ -66,60 +66,6 @@ Se crean videos y mapa solamente si llegaron datos. Los JSONL pueden quedar vac�
 
 El mapa empieza vacío en cada misión; usa el sistema de coordenadas del LiDAR recibido y la resolución/límite de voxeles del servidor. Por defecto conserva hasta 120.000 voxeles; al llegar al límite se descartan los menos recientes. Es un mapa acumulado, **no una secuencia temporal de nubes ni una grabación de trayectoria**. El visor existente colorea por altura; PLY y NPZ conservan los colores recibidos.
 
-### LiDAR nuevo al iniciar cada misión
-
-`POST /api/robots/{robot}/missions` también reinicia el **mapa en vivo del Core**:
-vacía puntos, colores, trayectoria y caché de keyframes; invalida el modelo 3D
-automático anterior. Persiste `latest` vacío para no recuperar el lugar anterior
-si el servidor se reinicia antes del primer escaneo. Los archivos de misiones
-anteriores y las instantáneas con nombre se conservan. El reinicio sólo afecta
-al robot de esa misión; un inicio rechazado por misión activa (`409`) no borra
-el mapa que está en uso.
-
-Cada mapa nuevo lleva `map_generation`, cuyo valor es el `mission_id`. Los trabajos
-de LiDAR, guardado y reconstrucción que estaban en curso no pueden volver a
-insertar/publicar el mapa anterior después del cambio. Los paquetes entrantes
-necesitan `ts` Unix en segundos y se descartan si preceden a `started_at`: mantené
-sincronizados los relojes del Core y la Raspi. El gateway incluido envía ese
-timestamp antes de comprimir la nube. Un gateway personalizado sin `ts` debe
-agregarlo para que sus cuadros se acepten después de iniciar una misión.
-
-El dashboard limpia la vista y espera puntos nuevos; no reaparece el LiDAR viejo
-por una descompresión atrasada. Se detiene el replay/grabador local 3D si estaba
-activo al cambiar de mapa, conservando sus cuadros para exportación. **Iniciar
-misión no enciende el sensor**: habilitá LiDAR si está apagado. Tampoco reinicia
-la odometría/SLAM del firmware; la nube nueva conserva las coordenadas que entrega
-el robot.
-
-Para desplegar, actualizá Core (`server_core.py` y `mission_routes.py`), el gateway
-y el HTML del dashboard, y reiniciá los procesos Python. Los mapas descargados de
-misiones antiguas seguirán mostrando sus recorridos originales.
-
-#### Contrato para un frontend propio
-
-Por `/ws/live`, después del cambio se emite:
-
-```json
-{"type":"map_reset","robot_id":"go2_01","map_generation":"id-de-la-nueva-mision"}
-```
-
-También se emite/cachea un **keyframe vacío válido** del protocolo binario de nube
-(`stream:"lidar"`, `mode:"keyframe"`, `fmt:"f32_xyz_zlib"`, `count:0`, `path:[]` y
-`map_generation`), cuyo payload es zlib de bytes vacíos. Los keyframes/deltas
-siguientes incluyen la misma generación. El keyframe vacío permite limpiar
-visores que sólo implementan el protocolo binario existente.
-
-Al cambiar `map_generation`, vaciá puntos, trayectoria, pose y modelo derivado;
-invalidá las descompresiones/descargas que empezaron con la generación anterior.
-No vuelvas a limpiar si recibís `map_reset` de la generación que ya estás mostrando:
-el keyframe puede llegar primero. Recordá las generaciones retiradas para ignorar
-paquetes viejos que todavía estuvieran pendientes. Al cambiar robot/conexión,
-invalidá también el trabajo de decodificación y el estado local de generación.
-Ver `useLidarGeneration()` y `handleLidarFrame()` del dashboard como referencia.
-
-La ruta de inicio, su respuesta `201` y las rutas de mapas de misiones no cambian;
-no hace falta enviar un segundo comando de limpieza desde el frontend.
-
 Cerrar o recargar el navegador no detiene la grabación. Se finaliza desde la API/dashboard o al apagar normalmente el servidor. Si se corta la luz o se mata el proceso, al reiniciar aparece como `interrupted`: los fragmentos de video y mapas ya escritos pueden recuperarse, pero no se garantiza el último tramo ni que un MP4 incompleto sea reproducible. No se reanuda automáticamente.
 
 La cola de grabación es limitada y corre en un hilo separado. Si el codificador/disco no alcanza, termina con `error` en vez de acumular memoria indefinidamente. Por defecto exige 256 MB libres (`--mission-min-free-mb`); se comprueba al iniciar y periódicamente. Las misiones **no se borran automáticamente**: hay que disponer de espacio y respaldar/gestionar la carpeta.

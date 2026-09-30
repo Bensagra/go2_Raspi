@@ -998,9 +998,6 @@
       },
       // Live LiDAR point cloud: accumulated voxel map rendered in WebGL.
       liveLidar: {
-        generation: "",
-        retiredGenerations: new Set(),
-        decodeGeneration: 0,
         voxels: new Map(),          // "ix,iy,iz" -> [x, y, z]
         maxPoints: 130000,          // LOD budget for the browser
         voxelSize: 0.08,            // dedup grid (m)
@@ -1910,15 +1907,6 @@
     }
 
     async function handleLidarFrame(header, payload) {
-      const live = state.liveLidar;
-      const generation = String(header.map_generation || "");
-      if (generation && !useLidarGeneration(generation)) return;
-      if (header.mode === "keyframe" && header.count === 0) {
-        applyLiveLidar(header, new Float32Array(), null);
-        return;
-      }
-      const decodeGeneration = live.decodeGeneration;
-      const robotId = state.robotId;
       let decoded;
       try {
         decoded = await decodeLidarCloud(header, payload);
@@ -1926,7 +1914,6 @@
         addEvent("lidar_decode_error", normalizeError(err));
         return;
       }
-      if (decodeGeneration !== live.decodeGeneration || robotId !== state.robotId) return;
       state.lastLidarAt = Date.now();
       state.lidarStats.mapPoints = Math.round(parseNum(header.map_points, 0));
       state.lidarStats.sourcePoints = Math.round(parseNum(header.source_points, 0));
@@ -2241,39 +2228,10 @@
     }
 
     function clearLiveLidar() {
-      state.liveLidar.decodeGeneration += 1;
       state.liveLidar.voxels.clear();
       state.liveLidar.path = [];
-      state.liveLidar.bounds = null;
       state.liveLidar.dirty = true;
       requestLiveRender();
-    }
-
-    function useLidarGeneration(generation) {
-      const live = state.liveLidar;
-      if (generation === live.generation) return true;
-      if (live.retiredGenerations.has(generation)) return false;
-      if (live.generation) live.retiredGenerations.add(live.generation);
-      live.generation = generation;
-      stopReplay();
-      // Keep exported/local recordings available, but end an in-progress local
-      // recording so it cannot silently join two missions.
-      state.lidarRec.recording = false;
-      updateRecorderUi();
-      live.pose = { x: 0, y: 0, yaw: 0 };
-      live.viewer.target = [0, 0, 0];
-      live.viewer.radius = 8;
-      clearLiveLidar();
-      resetLiveView();
-      state.lastLidarAt = 0;
-      state.lidarStats.mapPoints = 0;
-      state.lidarStats.sourcePoints = 0;
-      state.mesh.indexCount = 0;
-      state.mesh.metadata = null;
-      if (state.mesh.gl) requestMeshRender();
-      setBadge(els.liveLidarStats, "Mapa nuevo · esperando LiDAR", "warn");
-      setBadge(els.meshStatus, "Misión nueva · esperando reconstrucción", "warn");
-      return true;
     }
 
     function toggleLiveFollow() {
@@ -2628,8 +2586,6 @@
         return;
       }
       m.loading = true;
-      const generation = state.liveLidar.decodeGeneration;
-      const robotId = state.robotId;
       try {
         setBadge(els.meshStatus, "descargando modelo…", "warn");
         const res = await fetchOrThrow(
@@ -2638,7 +2594,6 @@
           120000
         );
         const raw = await inflateZlib(new Uint8Array(await res.arrayBuffer()));
-        if (generation !== state.liveLidar.decodeGeneration || robotId !== state.robotId) return;
         if (raw.byteLength < 12 || raw[0] !== 77 || raw[1] !== 83 || raw[2] !== 72 || raw[3] !== 49) {
           throw new Error("modelo con formato inválido");
         }
@@ -2658,7 +2613,6 @@
           "ok"
         );
       } catch (err) {
-        if (generation !== state.liveLidar.decodeGeneration || robotId !== state.robotId) return;
         const msg = String(err);
         if (msg.includes("404") || /not found/i.test(msg)) {
           setBadge(els.meshStatus, "todavía no hay modelo (esperá la reconstrucción)", "warn");
@@ -3144,7 +3098,7 @@
           els.missionFeedback.textContent = "Mapa abierto en el visor de mapas guardados.";
         } else {
           await loadMissions(data.mission_id);
-          els.missionFeedback.textContent = action === "start" ? "Misión iniciada con mapa LiDAR nuevo. Esperando o grabando las fuentes."
+          els.missionFeedback.textContent = action === "start" ? "Misión iniciada. El servidor está esperando o grabando las fuentes."
             : data.status === "completed" ? "Misión guardada. Ya podés abrir el reproductor o descargar sus archivos."
             : `La misión terminó con un error: ${data.error || data.status}`;
         }
@@ -3747,9 +3701,6 @@
     }
 
     function releaseMediaFrames() {
-      clearLiveLidar();
-      state.liveLidar.generation = "";
-      state.liveLidar.retiredGenerations.clear();
       talkClient.stop();
       lastSnapshotFrameAt = 0;
       state.lastThermalAt = 0;
@@ -4227,11 +4178,6 @@
     function handleWsMessage(msg) {
       const type = msg.type;
 
-      if (type === "map_reset") {
-        if (msg.robot_id === state.robotId && msg.map_generation) useLidarGeneration(String(msg.map_generation));
-        return;
-      }
-
       if (type === "mission") {
         if (msg.robot_id === state.robotId) void loadMissions(msg.data?.mission_id);
         return;
@@ -4304,7 +4250,6 @@
       if (type === "mesh_ready") {
         if (msg.robot_id !== state.robotId) return;
         const meta = msg.data || {};
-        if (meta.map_generation && state.liveLidar.generation && meta.map_generation !== state.liveLidar.generation) return;
         const verts = Number(meta.vertex_count || 0).toLocaleString();
         setBadge(els.meshStatus, `modelo nuevo disponible · ${verts} vértices`, "warn");
         if (els.meshAutoLoad.checked) void loadServerMesh();

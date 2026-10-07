@@ -31,6 +31,7 @@ class MissionTests(unittest.TestCase):
         mission = self.store.start("robot", "Recorrido", "operator")
         for i in range(3):
             self.store.ingest("robot", "camera", {"image_format": "jpeg", "ts": 123 + i}, jpeg())
+            self.store.ingest("robot", "arducam", {"image_format": "jpeg", "ts": 123 + i}, jpeg(120))
             self.store.ingest("robot", "thermal", {"image_format": "jpeg", "ts": 123 + i,
                 "detection": {"person_present": i == 2, "regions": []},
                 "temperature": {"max_c": 34}, "source_width": 160, "source_height": 120}, jpeg())
@@ -42,7 +43,7 @@ class MissionTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed", result["error"])
         self.assertEqual(result["missing_streams"], [])
         decoded = {}
-        for stream in ("camera", "thermal"):
+        for stream in ("camera", "arducam", "thermal"):
             with av.open(str(self.store.file(mission["mission_id"], stream + ".mp4"))) as video:
                 frames = list(video.decode(video=0))
                 self.assertEqual(len(frames), 3)
@@ -103,7 +104,7 @@ class MissionTests(unittest.TestCase):
         second = self.store.start("robot", "Second", "operator")
         result = self.store.stop(second["mission_id"])
         self.assertEqual(result["lidar_points"], 0)
-        self.assertEqual(set(result["missing_streams"]), {"camera", "thermal", "lidar"})
+        self.assertEqual(set(result["missing_streams"]), {"camera", "arducam", "thermal", "lidar"})
         with self.assertRaises(FileNotFoundError):
             self.store.file(second["mission_id"], "camera.mp4")
         self.assertEqual(self.store.stop(second["mission_id"])["status"], "completed")

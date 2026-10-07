@@ -21,6 +21,7 @@ if __package__ in (None, ""):
 from server.missions import MissionStore
 from server.mission_routes import register_mission_routes
 from server.thermal import ThermalProcessor
+from server.arducam import ArducamProcessor
 from server.talk import TalkRelay
 from robot_media_protocol import flashlight_payload
 
@@ -513,6 +514,9 @@ class CoreRuntime:
         self.frontend_ready: Dict[WebSocket, asyncio.Event] = {}
         self.frontend_sender_tasks: Dict[WebSocket, asyncio.Task[None]] = {}
         self.edge_media_sockets: Dict[str, WebSocket] = {}
+        self.arducam_pending = {}
+        self.arducam_tasks = {}
+        self.arducam_processors = {}
         self.thermal_pending: Dict[str, Tuple[Dict[str, Any], bytes, float]] = {}
         self.thermal_tasks: Dict[str, asyncio.Task] = {}
         self.thermal_processors: Dict[str, ThermalProcessor] = {}
@@ -1118,6 +1122,33 @@ class CoreRuntime:
                     robot_id, "lidar", header, payload, coalesce
                 )
 
+    async def _clear_arducam(self, robot_id: str) -> None:
+        task = self.arducam_tasks.pop(robot_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self.arducam_pending.pop(robot_id, None)
+        self.arducam_processors.pop(robot_id, None)
+        self.latest_media_frames.get(robot_id, {}).pop("arducam", None)
+        for latest in self.frontend_latest_media.values():
+            latest.pop(f"{robot_id}:arducam", None)
+
+    async def _arducam_worker(self, robot_id: str) -> None:
+        processor = self.arducam_processors.setdefault(robot_id, ArducamProcessor())
+        while robot_id in self.arducam_pending:
+            header, payload, received_ts = self.arducam_pending.pop(robot_id)
+            try:
+                output = await asyncio.to_thread(processor.process, header, payload)
+            except Exception as exc:
+                self._audit("arducam_frame_error", {"robot_id": robot_id, "error": str(exc)})
+                continue
+            if time.time() - received_ts > 3:
+                continue
+            output.update(robot_id=robot_id, server_received_ts=received_ts)
+            self.missions.ingest(robot_id, "arducam", output, payload)
+            self._broadcast_media_frame(robot_id, "arducam", output, payload, coalesce=True)
+
     async def _clear_thermal(self, robot_id: str) -> None:
         task = self.thermal_tasks.pop(robot_id, None)
         if task is not None:
@@ -1151,6 +1182,13 @@ class CoreRuntime:
     def _handle_edge_binary_frame(self, robot_id: str, buffer: bytes) -> None:
         header, payload = decode_media_frame(buffer)
         stream = str(header.get("stream", "")).strip()
+
+        if stream == "arducam":
+            self.arducam_pending[robot_id] = (header, payload, time.time())
+            task = self.arducam_tasks.get(robot_id)
+            if task is None or task.done():
+                self.arducam_tasks[robot_id] = asyncio.create_task(self._arducam_worker(robot_id))
+            return
 
         if stream == "thermal_csv":
             self.thermal_pending[robot_id] = (header, payload, time.time())
@@ -2416,6 +2454,8 @@ class CoreRuntime:
         @app.on_event("shutdown")
         async def _shutdown() -> None:
             self.stop_event.set()
+            for robot_id in list(self.arducam_tasks):
+                await self._clear_arducam(robot_id)
             for robot_id in list(self.thermal_tasks):
                 await self._clear_thermal(robot_id)
             for task in list(self.greeter_tasks.values()):
@@ -2860,7 +2900,7 @@ class CoreRuntime:
             # frame) so a freshly connected viewer has something to show at once.
             for media_robot_id, frames in self.latest_media_frames.items():
                 for stream, frame in frames.items():
-                    if stream == "thermal":
+                    if stream in {"thermal", "arducam"}:
                         continue  # Wait for a fresh detection, never replay a stale thermal snapshot.
                     self._coalesce_to_socket(ws, f"{media_robot_id}:{stream}", frame)
 
@@ -2994,6 +3034,7 @@ class CoreRuntime:
                 with contextlib.suppress(Exception):
                     await previous_ws.close(code=1012)
             await self._clear_thermal(robot_id)
+            await self._clear_arducam(robot_id)
             self.missions.ingest(robot_id, "reset", {}, b"")
             self._audit("edge_media_connected", {"robot_id": robot_id})
 
@@ -3017,6 +3058,7 @@ class CoreRuntime:
                 if self.edge_media_sockets.get(robot_id) is ws:
                     self.edge_media_sockets.pop(robot_id, None)
                     await self._clear_thermal(robot_id)
+                    await self._clear_arducam(robot_id)
                 self._audit("edge_media_disconnected", {"robot_id": robot_id})
 
 

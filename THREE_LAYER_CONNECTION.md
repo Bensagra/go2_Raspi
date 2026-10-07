@@ -313,3 +313,7 @@ El dashboard permite iniciar/finalizar misiones persistidas en el servidor y
 reproducir cámara y térmica con detección sin descargar los MP4 manualmente.
 Cada misión conserva su mapa LiDAR. Ver [MISIONES_FRONTEND.md](MISIONES_FRONTEND.md)
 para configurar la carpeta en Windows, integrar otro frontend y usar la API.
+
+## Arducam B0541 adicional
+
+La cámara CSI de la Raspberry se integra como `stream: "arducam"`, separado del video Go2 y de la térmica. Se graba durante las misiones y se muestra/reproduce en el dashboard. Ver [ARDUCAM_STREAMING.md](ARDUCAM_STREAMING.md) para instalación, configuración y contrato completo.

@@ -20,6 +20,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from edge.thermal_camera import ThermalCamera
+from edge.arducam_camera import ArducamCamera
 from edge.talk import EdgeTalk
 from robot_media_protocol import flashlight_payload, require_robot_success
 
@@ -234,6 +235,11 @@ class EdgeGatewayService:
             port=args.thermal_port, fps=args.thermal_fps,
             emissivity=args.thermal_emissivity,
         ) if args.enable_thermal else None
+
+        self.arducam_camera = ArducamCamera(
+            media=args.arducam_media, fps=args.arducam_fps,
+            max_width=args.arducam_max_width, quality=args.arducam_quality,
+        ) if args.enable_arducam else None
 
         self.camera_enabled = args.enable_camera
         self.camera_channel_active = False
@@ -2129,6 +2135,8 @@ class EdgeGatewayService:
                 ),
             },
             "media": {
+                "arducam_enabled": self.arducam_camera is not None,
+                "arducam": self.arducam_camera.status() if self.arducam_camera else {},
                 "thermal_enabled": self.thermal_camera is not None,
                 "thermal": self.thermal_camera.status() if self.thermal_camera else {},
                 "camera_enabled": self.camera_enabled,
@@ -2768,7 +2776,12 @@ class EdgeGatewayService:
             self.pending_stop_deadline = now + max(2.0 * interval, 0.4)
 
     async def _thermal_loop(self) -> None:
-        camera = self.thermal_camera
+        await self._local_camera_loop(self.thermal_camera, "thermal")
+
+    async def _arducam_loop(self) -> None:
+        await self._local_camera_loop(self.arducam_camera, "arducam")
+
+    async def _local_camera_loop(self, camera, name: str) -> None:
         if camera is None:
             return
         camera.start()
@@ -2781,9 +2794,9 @@ class EdgeGatewayService:
                 error = camera.status()["error"]
                 if error != last_error:
                     if error:
-                        self._publish_event("thermal_camera_error", {"error": error})
+                        self._publish_event(f"{name}_camera_error", {"error": error})
                     elif last_error is not None:
-                        self._publish_event("thermal_camera_connected", {})
+                        self._publish_event(f"{name}_camera_connected", {})
                     last_error = error
                 await asyncio.sleep(0.02)
         finally:
@@ -2860,7 +2873,7 @@ class EdgeGatewayService:
                             self.media_ready.set()
 
                         for payload in batch:
-                            if (payload.get("stream") == "thermal_csv"
+                            if (payload.get("stream") in {"thermal_csv", "arducam"}
                                     and time.time() - payload["header"]["ts"] > 3.0):
                                 continue
                             header = payload.get("header") if isinstance(payload.get("header"), dict) else None
@@ -3153,6 +3166,7 @@ class EdgeGatewayService:
             asyncio.create_task(self._telemetry_loop()),
             asyncio.create_task(self._media_uplink_loop()),
             asyncio.create_task(self._thermal_loop()),
+            asyncio.create_task(self._arducam_loop()),
         ]
 
         try:
@@ -3358,6 +3372,13 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Separate heavy-data uplink URL. Example: ws://server:8000/ws/edge-media/{robot_id}",
     )
+    parser.add_argument("--enable-arducam", dest="enable_arducam", action="store_true", default=True,
+                        help="Read the CSI Arducam B0541 independently of the Go2 camera (default: on).")
+    parser.add_argument("--disable-arducam", dest="enable_arducam", action="store_false")
+    parser.add_argument("--arducam-media", default=None, help="Optional /dev/mediaN when several cameras exist")
+    parser.add_argument("--arducam-fps", type=float, default=5.0, help="Maximum JPEG uplink FPS (CSI stays 4K)")
+    parser.add_argument("--arducam-max-width", type=int, default=1280, help="JPEG width, 320..3840")
+    parser.add_argument("--arducam-quality", type=int, default=75, help="JPEG quality, 25..95")
     parser.add_argument("--enable-thermal", dest="enable_thermal", action="store_true", default=True,
                         help="Read the USB SenXor continuously (enabled by default).")
     parser.add_argument("--disable-thermal", dest="enable_thermal", action="store_false")
@@ -3388,6 +3409,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-retry-interval-s", type=float, default=0.5)
 
     args = parser.parse_args()
+
+    if not math.isfinite(args.arducam_fps) or not 1 <= args.arducam_fps <= 30:
+        parser.error("--arducam-fps must be between 1 and 30")
+    if not 320 <= args.arducam_max_width <= 3840:
+        parser.error("--arducam-max-width must be between 320 and 3840")
+    if not 25 <= args.arducam_quality <= 95:
+        parser.error("--arducam-quality must be between 25 and 95")
 
     if not math.isfinite(args.thermal_fps) or not 1 <= args.thermal_fps <= 30:
         parser.error("--thermal-fps must be between 1 and 30")

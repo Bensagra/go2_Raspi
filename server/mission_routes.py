@@ -94,7 +94,7 @@ def register_mission_routes(app, runtime):
         if mission["status"] in {"recording", "finalizing"}:
             raise MissionConflict("Finalizá la misión antes de reproducirla")
         videos = {}
-        for stream in ("camera", "thermal"):
+        for stream in ("camera", "arducam", "thermal"):
             filename = f"{stream}.mp4"
             if filename not in mission["artifacts"]:
                 continue

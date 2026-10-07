@@ -160,7 +160,7 @@
       pointer-events: none;
     }
     .thermal-empty[hidden] { display: none; }
-    #thermalFrame:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    #arducamFrame:focus-visible, #thermalFrame:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     .thermal-readings { margin-top: 8px; font-variant-numeric: tabular-nums; }
 
     .media.map {
@@ -464,6 +464,20 @@
           <div class="media-shell">
             <canvas id="videoFrame" class="media" width="960" height="540" aria-label="video"></canvas>
           </div>
+          <section class="thermal-section" aria-labelledby="arducamTitle">
+            <div class="row thermal-heading">
+              <h2 id="arducamTitle" class="title">Arducam · Raspberry</h2>
+              <span id="arducamStatus" class="status" role="status">Sin conexión</span>
+            </div>
+            <div class="thermal-view">
+              <canvas id="arducamFrame" class="media" width="1280" height="720" style="aspect-ratio: 16/9"
+                tabindex="0" role="button" aria-label="Ampliar Arducam en vivo"
+                aria-haspopup="dialog" aria-describedby="arducamHint"></canvas>
+              <div id="arducamEmpty" class="thermal-empty">Conectate para ver la Arducam.</div>
+            </div>
+            <p id="arducamHint" class="hint">Se guarda en el servidor durante las misiones.
+              Clic o Enter sobre la imagen para ampliar.</p>
+          </section>
           <section class="thermal-section" aria-labelledby="thermalTitle">
             <div class="row thermal-heading">
               <h2 id="thermalTitle" class="title">Cámara térmica</h2>
@@ -724,6 +738,7 @@
         <button id="missionReplayBtn" type="button" class="primary" disabled>Abrir reproductor</button>
         <button type="button" data-mission-file="mission.zip" disabled>Descargar misión completa</button>
         <button type="button" data-mission-file="camera.mp4" disabled>Cámara · MP4</button>
+        <button type="button" data-mission-file="arducam.mp4" disabled>Arducam · MP4</button>
         <button type="button" data-mission-file="thermal.mp4" disabled>Térmica y detección · MP4</button>
         <button type="button" data-mission-file="thermal_detections.jsonl" disabled>Datos de detección</button>
         <button id="missionMapBtn" type="button" disabled>Abrir mapa LiDAR</button>
@@ -740,6 +755,8 @@
         <div class="grid2">
           <figure><figcaption>Cámara · <span id="missionCameraState" class="hint"></span></figcaption>
             <video id="missionCameraVideo" muted playsinline preload="metadata" aria-label="Grabación de la cámara"></video></figure>
+          <figure><figcaption>Arducam · <span id="missionArducamState" class="hint"></span></figcaption>
+            <video id="missionArducamVideo" muted playsinline preload="metadata" aria-label="Grabación de la Arducam"></video></figure>
           <figure><figcaption>Térmica y detección · <span id="missionThermalState" class="hint"></span></figcaption>
             <video id="missionThermalVideo" muted playsinline preload="metadata" aria-label="Grabación térmica con detección"></video></figure>
         </div>
@@ -937,6 +954,8 @@
       speedProfileCommandId: "",
       lastRequestedMove: { x: 0, y: 0, z: 0 },
       lastMeasuredMove: { x: null, y: null, z: null },
+      lastArducamAt: 0,
+      arducamFrameTimes: [],
       lastThermalAt: 0,
       thermalHeader: null,
       thermalFrameTimes: [],
@@ -944,6 +963,7 @@
       lastLidarAt: 0,
       lastAudioAt: 0,
       mediaRender: {
+        arducam: { busy: false, pending: null, bitmap: null, generation: 0 },
         thermal: { busy: false, pending: null, bitmap: null, generation: 0 },
         video: {
           busy: false,
@@ -1073,8 +1093,8 @@
       // Rolling bandwidth / latency metrics for the metrics panel + auto-quality.
       netStats: {
         windowStart: 0,
-        bytes: { video: 0, thermal: 0, lidar: 0, audio: 0 },
-        kbps: { video: 0, thermal: 0, lidar: 0, audio: 0, total: 0 },
+        bytes: { video: 0, arducam: 0, thermal: 0, lidar: 0, audio: 0 },
+        kbps: { video: 0, arducam: 0, thermal: 0, lidar: 0, audio: 0, total: 0 },
         lidarLatencyMs: 0,
         lastAdaptAt: 0,
         adaptLevel: 0,        // 0 = none, +N = downgraded N steps
@@ -1130,6 +1150,9 @@
       controlLinkStatus: document.getElementById("controlLinkStatus"),
       telemetryBox: document.getElementById("telemetryBox"),
       events: document.getElementById("events"),
+      arducamFrame: document.getElementById("arducamFrame"),
+      arducamStatus: document.getElementById("arducamStatus"),
+      arducamEmpty: document.getElementById("arducamEmpty"),
       thermalFrame: document.getElementById("thermalFrame"),
       thermalStatus: document.getElementById("thermalStatus"),
       thermalEmpty: document.getElementById("thermalEmpty"),
@@ -1592,7 +1615,7 @@
     }
 
     function streamCanvas(stream) {
-      return stream === "thermal" ? els.thermalFrame : els.videoFrame;
+      return stream === "arducam" ? els.arducamFrame : stream === "thermal" ? els.thermalFrame : els.videoFrame;
     }
 
     async function decodeMediaBlob(blob) {
@@ -1627,13 +1650,18 @@
 
           const blob = new Blob([bytes], { type: formatImageMime(format) });
           const bitmap = await decodeMediaBlob(blob);
-          if (generation !== renderer.generation || (stream === "thermal" && Date.now() - receivedAt >= 3000)) {
+          if (generation !== renderer.generation || (["thermal", "arducam"].includes(stream) && Date.now() - receivedAt >= 3000)) {
             if (typeof bitmap.close === "function") bitmap.close();
             continue;
           }
 
           drawBitmap(streamCanvas(stream), bitmap);
           if (stream === "video") lastSnapshotFrameAt = snapshotTimestamp(header);
+          if (stream === "arducam") {
+            state.lastArducamAt = receivedAt;
+            state.arducamFrameTimes.push(receivedAt);
+            updateArducamStatus();
+          }
           if (stream === "thermal") {
             state.lastThermalAt = receivedAt;
             state.thermalHeader = header;
@@ -1831,8 +1859,8 @@
       const stream = String(header.stream || "");
       recordNetBytes(stream, buffer.byteLength);
 
-      if (stream === "thermal") {
-        renderMediaImageBytes(payload, header.image_format, "thermal", header);
+      if (["thermal", "arducam"].includes(stream)) {
+        renderMediaImageBytes(payload, header.image_format, stream, header);
         return;
       }
 
@@ -2830,6 +2858,7 @@
     }
 
     function openMediaModal(stream) {
+      if (stream === "arducam" && (!state.connected || !state.lastArducamAt || Date.now() - state.lastArducamAt >= 3000)) return;
       if (stream === "thermal" && (!state.connected || !state.lastThermalAt || Date.now() - state.lastThermalAt >= 3000)) return;
       const renderer = state.mediaRender[stream];
       const isH264Video = stream === "video" && state.videoMode === "h264";
@@ -2839,7 +2868,7 @@
       state.expandedStream = stream;
       els.mediaModalTitle.textContent = stream === "video"
         ? "Cámara ampliada"
-        : stream === "thermal" ? "Cámara térmica ampliada" : "Mapa LiDAR 3D ampliado";
+        : stream === "arducam" ? "Arducam ampliada" : stream === "thermal" ? "Cámara térmica ampliada" : "Mapa LiDAR 3D ampliado";
       if (renderer && renderer.bitmap) {
         drawBitmap(els.expandedMediaCanvas, renderer.bitmap);
       }
@@ -2893,6 +2922,7 @@
       playing: false, loading: false, request: 0, renewedAt: 0, tickAt: performance.now(), failed: false };
     const missionVideoElements = {
       camera: { video: document.getElementById("missionCameraVideo"), label: document.getElementById("missionCameraState") },
+      arducam: { video: document.getElementById("missionArducamVideo"), label: document.getElementById("missionArducamState") },
       thermal: { video: document.getElementById("missionThermalVideo"), label: document.getElementById("missionThermalState") },
     };
 
@@ -3044,7 +3074,7 @@
       setBadge(els.missionStatus, active ? `${labels[active.status]} · ${Math.floor(active.duration_s || 0)} s` : "Sin misión activa", active ? "warn" : "");
       const describe = item => {
         const streams = item.streams || {};
-        return [["camera", "Cámara"], ["thermal", "Térmica"], ["lidar", "LiDAR"]].map(([key, label]) => {
+        return [["camera", "Cámara"], ["arducam", "Arducam"], ["thermal", "Térmica"], ["lidar", "LiDAR"]].map(([key, label]) => {
           const count = streams[key]?.frames || 0;
           const age = (item.duration_s || 0) - (streams[key]?.last_at_s || 0);
           return `${label}: ${count ? `${count} cuadros${missionBusy(item) && age > 5 ? " · sin datos recientes" : ""}` : missionBusy(item) ? "esperando datos" : "sin datos"}`;
@@ -3752,6 +3782,9 @@
       state.liveLidar.retiredGenerations.clear();
       talkClient.stop();
       lastSnapshotFrameAt = 0;
+      state.lastArducamAt = 0;
+      state.arducamFrameTimes.length = 0;
+      updateArducamStatus();
       state.lastThermalAt = 0;
       state.thermalHeader = null;
       state.thermalFrameTimes.length = 0;
@@ -4431,6 +4464,24 @@
       return `${((Date.now() - tsMs) / 1000).toFixed(1)}s`;
     }
 
+    function updateArducamStatus() {
+      const now = Date.now();
+      const live = state.connected && state.lastArducamAt > 0 && now - state.lastArducamAt < 3000;
+      while (state.arducamFrameTimes.length && state.arducamFrameTimes[0] < now - 1000) state.arducamFrameTimes.shift();
+      els.arducamEmpty.hidden = live;
+      els.arducamFrame.setAttribute("aria-disabled", String(!live));
+      if (live) {
+        setBadge(els.arducamStatus, `En vivo · ${state.arducamFrameTimes.length} fps`, "ok");
+      } else {
+        const stale = state.connected && state.lastArducamAt > 0;
+        setBadge(els.arducamStatus, !state.connected ? "Sin conexión" : stale ? "Señal interrumpida" : "Esperando cámara", "warn");
+        els.arducamEmpty.textContent = !state.connected ? "Conectate para ver la Arducam."
+          : stale ? "No llegan cuadros nuevos. Revisá la Arducam y la conexión de la Raspy."
+          : "Esperando la Arducam conectada a la Raspy.";
+        if (state.expandedStream === "arducam") closeMediaModal();
+      }
+    }
+
     function updateThermalStatus() {
       const now = Date.now();
       const live = state.connected && state.lastThermalAt > 0 && now - state.lastThermalAt < 3000;
@@ -4460,6 +4511,7 @@
     }
 
     function updateMediaStatus() {
+      updateArducamStatus();
       updateThermalStatus();
       if (!state.connected) {
         setBadge(els.mediaStatus, "media offline", "err");
@@ -4509,17 +4561,18 @@
       const dt = (now - ns.windowStart) / 1000;
       if (dt < 0.4) return;
       const kv = (ns.bytes.video * 8) / 1000 / dt;
+      const kc = (ns.bytes.arducam * 8) / 1000 / dt;
       const kt = (ns.bytes.thermal * 8) / 1000 / dt;
       const kl = (ns.bytes.lidar * 8) / 1000 / dt;
       const ka = (ns.bytes.audio * 8) / 1000 / dt;
-      ns.kbps = { video: kv, thermal: kt, lidar: kl, audio: ka, total: kv + kt + kl + ka };
-      ns.bytes = { video: 0, thermal: 0, lidar: 0, audio: 0 };
+      ns.kbps = { video: kv, arducam: kc, thermal: kt, lidar: kl, audio: ka, total: kv + kc + kt + kl + ka };
+      ns.bytes = { video: 0, arducam: 0, thermal: 0, lidar: 0, audio: 0 };
       ns.windowStart = now;
       if (els.netMetrics) {
         const auto = els.autoQuality.checked ? ` · auto nivel ${ns.adaptLevel}` : "";
         setBadge(
           els.netMetrics,
-          `BW ${ns.kbps.total.toFixed(0)} kbps (vid ${kv.toFixed(0)} · térmica ${kt.toFixed(0)} · lidar ${kl.toFixed(0)} · audio ${ka.toFixed(0)}) `
+          `BW ${ns.kbps.total.toFixed(0)} kbps (vid ${kv.toFixed(0)} · Arducam ${kc.toFixed(0)} · térmica ${kt.toFixed(0)} · lidar ${kl.toFixed(0)} · audio ${ka.toFixed(0)}) `
           + `· lidar lat ${ns.lidarLatencyMs.toFixed(0)}ms${auto}`,
           ns.adaptLevel > 0 ? "warn" : "ok"
         );
@@ -5111,6 +5164,13 @@
       ev.target.value = "";
     });
 
+    els.arducamFrame.addEventListener("click", () => openMediaModal("arducam"));
+    els.arducamFrame.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openMediaModal("arducam");
+      }
+    });
     els.thermalFrame.addEventListener("click", () => openMediaModal("thermal"));
     els.thermalFrame.addEventListener("keydown", event => {
       if (event.key === "Enter" || event.key === " ") {

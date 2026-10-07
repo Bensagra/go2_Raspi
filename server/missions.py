@@ -18,7 +18,7 @@ import av
 import cv2
 import numpy as np
 
-ARTIFACTS = {"mission.json", "camera.mp4", "thermal.mp4", "frames.jsonl",
+ARTIFACTS = {"mission.json", "camera.mp4", "arducam.mp4", "thermal.mp4", "frames.jsonl",
              "thermal_detections.jsonl", "lidar_map.npz", "lidar_map.ply", "mission.zip"}
 BUSY = {"recording", "finalizing"}
 
@@ -88,7 +88,7 @@ class MissionRecorder:
             "started_by": user_id, "started_at": time.time(), "ended_at": None,
             "status": "recording", "error": "", "duration_s": 0,
             "streams": {s: {"frames": 0, "first_at_s": None, "last_at_s": None}
-                        for s in ("camera", "thermal", "lidar")},
+                        for s in ("camera", "arducam", "thermal", "lidar")},
             "lidar_points": 0, "voxel_size_m": voxel_size,
             "skipped_camera_packets": 0, "artifacts": [], "missing_streams": [],
         }
@@ -191,7 +191,8 @@ class MissionRecorder:
             frame_number = stats["frames"]
         record = {"stream": stream, "frame": frame_number, "mission_time_s": round(at, 3),
                   "video_time_s": video_time, "source_ts": header.get("ts"),
-                  "source_frame_index": header.get("frame_index", header.get("seq"))}
+                  "source_frame_index": header.get("frame_index", header.get("seq")),
+                  "source_session_id": header.get("session_id")}
         self.frames_log.write(json.dumps(record, allow_nan=False) + "\n")
         if stream == "thermal":
             record.update(temperature=header.get("temperature", {}), detection=header.get("detection", {}),

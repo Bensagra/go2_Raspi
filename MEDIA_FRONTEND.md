@@ -614,3 +614,7 @@ También se verificó sintaxis JavaScript y compilación de los módulos Python.
 
 El detector de UI señaló una advertencia tipográfica preexistente en el dashboard
 (tamaños muy próximos). No se rediseñó la interfaz fuera del alcance de estos controles.
+
+## Arducam B0541 adicional
+
+La cámara CSI de la Raspberry se integra como `stream: "arducam"`, separado del video Go2 y de la térmica. Se graba durante las misiones y se muestra/reproduce en el dashboard. Ver [ARDUCAM_STREAMING.md](ARDUCAM_STREAMING.md) para instalación, configuración y contrato completo.

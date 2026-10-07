@@ -207,17 +207,24 @@ class HostingEntrypointTests(unittest.TestCase):
                     jpeg = cv2.imencode(".jpg", image)[1].tobytes()
                     for seq in range(1, 4):
                         await edge.send(encode_media_frame({"stream": "video", "image_format": "jpeg", "ts": time.time()}, jpeg))
+                        await edge.send(encode_media_frame({"stream": "arducam", "image_format": "jpg",
+                            "width": 160, "height": 120, "ts": time.time(), "seq": seq, "session_id": "csi"}, jpeg))
                         frame = np.full((120, 160), 22, np.float32)
                         frame[30:70, 60:90] = 34
                         await edge.send(encode_media_frame({"stream": "thermal_csv", "format": "csv_zlib", "unit": "celsius",
                             "width": 160, "height": 120, "ts": time.time(), "seq": seq, "session_id": "mission"}, encode_csv(frame)))
+                        seen = set()
                         while True:
                             packet = await asyncio.wait_for(viewer.recv(), 3)
                             if isinstance(packet, bytes):
                                 header, _ = decode_media_frame(packet)
-                                if header.get("stream") == "thermal" and header.get("robot_id") == "mission_robot":
+                                if header.get("robot_id") == "mission_robot":
+                                    seen.add(header.get("stream"))
+                                if {"thermal", "arducam"} <= seen:
                                     break
-                # No browser remains; recording must continue.
+                # No browser remains; recording must continue for both cameras.
+                await edge.send(encode_media_frame({"stream": "arducam", "image_format": "jpg",
+                    "width": 160, "height": 120, "ts": time.time(), "seq": 4, "session_id": "csi"}, jpeg))
                 await edge.send(encode_media_frame({"stream": "video", "image_format": "jpeg", "ts": time.time()}, jpeg))
                 points = np.array([[1, 2, 3], [4, 5, 6]], np.float32)
                 blob, fmt, scale, offset, count = encode_cloud_payload(points, None, 2)
@@ -227,7 +234,8 @@ class HostingEntrypointTests(unittest.TestCase):
                 while time.monotonic() < deadline:
                     _, data = self.request(f"/api/missions/{mission_id}", "test-viewer")
                     current = json.loads(data)
-                    if current["streams"]["camera"]["frames"] == 4 and current["lidar_points"] == 2:
+                    if (current["streams"]["camera"]["frames"] == 4 and current["lidar_points"] == 2
+                            and current["streams"]["arducam"]["frames"] == 4):
                         break
                     await asyncio.sleep(0.05)
                 self.assertEqual(current["status"], "recording")
@@ -244,7 +252,7 @@ class HostingEntrypointTests(unittest.TestCase):
         status, raw = self.request(f"/api/missions/{mission_id}/playback", "test-viewer", "POST")
         self.assertEqual(status, 200, raw)
         playback = json.loads(raw)
-        self.assertEqual(set(playback["videos"]), {"camera", "thermal"})
+        self.assertEqual(set(playback["videos"]), {"camera", "arducam", "thermal"})
         self.assertEqual(playback["videos"]["camera"]["offset_s"], result["streams"]["camera"]["first_at_s"])
         video_path = playback["videos"]["camera"]["path"]
         video_bytes = (self.data / "missions" / mission_id / "camera.mp4").read_bytes()
@@ -271,6 +279,8 @@ class HostingEntrypointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             with av.open(io.BytesIO(archive.read("camera.mp4"))) as video:
+                self.assertEqual(len(list(video.decode(video=0))), 4)
+            with av.open(io.BytesIO(archive.read("arducam.mp4"))) as video:
                 self.assertEqual(len(list(video.decode(video=0))), 4)
             detections = [json.loads(line) for line in archive.read("thermal_detections.jsonl").splitlines()]
             self.assertTrue(detections[-1]["detection"]["person_present"])

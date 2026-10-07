@@ -1,6 +1,6 @@
 # Misiones: instalación, API e integración con otro frontend
 
-El servidor guarda cada misión con video de cámara, video térmico con detección y un mapa LiDAR propio. El dashboard permite **Iniciar misión → Finalizar y guardar → Abrir reproductor**, sin descargar archivos manualmente. Cámara y térmica comparten una línea de tiempo; el mapa se abre en el visor 3D.
+El servidor guarda cada misión con video del Go2, video Arducam, video térmico con detección y un mapa LiDAR propio. El dashboard permite **Iniciar misión → Finalizar y guardar → Abrir reproductor**, sin descargar archivos manualmente. Go2, Arducam y térmica comparten una línea de tiempo; el mapa se abre en el visor 3D.
 
 ## 1. Conectar las tres partes
 
@@ -178,7 +178,7 @@ const completed = await api(`/api/missions/${id}/stop`, { method: "POST" });
 const library = await api(`/api/robots/${encodeURIComponent(ROBOT)}/missions`);
 ```
 
-Campos útiles del manifiesto: `mission_id`, `name`, `robot_id`, `status`, `started_at`/`ended_at` (Unix, segundos), `duration_s`, `error`, `artifacts`, `missing_streams`, `lidar_points`, `skipped_camera_packets` y `streams.camera|thermal|lidar.{frames,first_at_s,last_at_s}`. Los tiempos de cada stream son segundos desde el comienzo de la misión. Si el contador no avanza o `duration_s - last_at_s` crece, la fuente no está enviando cuadros recientes.
+Campos útiles del manifiesto: `mission_id`, `name`, `robot_id`, `status`, `started_at`/`ended_at` (Unix, segundos), `duration_s`, `error`, `artifacts`, `missing_streams`, `lidar_points`, `skipped_camera_packets` y `streams.camera|arducam|thermal|lidar.{frames,first_at_s,last_at_s}`. Los tiempos de cada stream son segundos desde el comienzo de la misión. Si el contador no avanza o `duration_s - last_at_s` crece, la fuente no está enviando cuadros recientes.
 
 ## 5. Reproducir directamente en otro frontend
 
@@ -358,3 +358,7 @@ python -m unittest discover -s tests
 ```
 
 Cubren MP4 decodificables, detección persistida, aislamiento entre misiones, grabación sin visor, recuperación, roles, tickets y reproducción HTTP con Range/HEAD. Los cambios del repositorio no actualizan automáticamente el servidor Windows: hay que copiar/sincronizar el código y reiniciarlo allí.
+
+## Cámara CSI adicional
+
+Ver [ARDUCAM_STREAMING.md](ARDUCAM_STREAMING.md) para captura, arranque y contrato del stream `arducam`. Las nuevas misiones incluyen `streams.arducam` y, si recibieron cuadros, `arducam.mp4`; playback agrega `videos.arducam`. Los ejemplos anteriores que solo contienen Go2/térmica siguen siendo válidos para misiones sin la cámara adicional.

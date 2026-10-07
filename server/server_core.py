@@ -22,6 +22,7 @@ from server.missions import MissionStore
 from server.mission_routes import register_mission_routes
 from server.thermal import ThermalProcessor
 from server.arducam import ArducamProcessor
+from server.people import PeopleIdentifier
 from server.talk import TalkRelay
 from robot_media_protocol import flashlight_payload
 
@@ -488,6 +489,10 @@ class FaceLabelIn(BaseModel):
     known: bool = False
 
 
+class PersonLabelIn(BaseModel):
+    label: str = ""
+
+
 SAFE_STORAGE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -604,6 +609,18 @@ class CoreRuntime:
                 enable_person=self.args.enable_person_detection,
                 enable_face=self.args.enable_face_recognition,
                 min_face_quality=self.args.min_face_capture_quality,
+            )
+        # Arducam people identification (OpenCV DNN, CPU/OpenCL; models auto-download).
+        self.people: Optional[PeopleIdentifier] = None
+        if self.args.enable_perception and self.args.enable_people_id:
+            self.people = PeopleIdentifier(
+                models_dir=Path(self.args.people_models_dir).expanduser(),
+                people_dir=Path(self.args.people_dir).expanduser(),
+                target=self.args.people_target,
+                match_threshold=self.args.people_match_threshold,
+                max_fps=self.args.people_max_fps,
+                on_result=self._on_people_result,
+                on_new_person=self._on_new_person,
             )
         self.autonomy_controllers: Dict[str, AutonomyController] = {}
         self.autonomy_drive_seq: Dict[str, int] = defaultdict(int)
@@ -1130,6 +1147,8 @@ class CoreRuntime:
                 await task
         self.arducam_pending.pop(robot_id, None)
         self.arducam_processors.pop(robot_id, None)
+        if self.people is not None:
+            self.people.reset(robot_id)
         self.latest_media_frames.get(robot_id, {}).pop("arducam", None)
         for latest in self.frontend_latest_media.values():
             latest.pop(f"{robot_id}:arducam", None)
@@ -1148,6 +1167,23 @@ class CoreRuntime:
             output.update(robot_id=robot_id, server_received_ts=received_ts)
             self.missions.ingest(robot_id, "arducam", output, payload)
             self._broadcast_media_frame(robot_id, "arducam", output, payload, coalesce=True)
+            if self.people is not None:
+                self.people.submit(robot_id, output, payload)
+
+    # Called from the people-id worker thread: hop onto the event loop. Wait for
+    # the broadcast so a failure (e.g. non-JSON value) surfaces in the worker
+    # status instead of vanishing inside an unobserved future.
+    def _on_people_result(self, robot_id: str, message: Dict[str, Any]) -> None:
+        if self.loop is not None:
+            asyncio.run_coroutine_threadsafe(self._broadcast(message), self.loop).result(timeout=5)
+
+    def _on_new_person(self, robot_id: str, person: Dict[str, Any]) -> None:
+        if self.loop is None:
+            return
+        event = {"robot_id": robot_id, "ts": time.time(), "event": "person_new", "data": person}
+        self.loop.call_soon_threadsafe(self._audit, "person_new", {"robot_id": robot_id, **person})
+        asyncio.run_coroutine_threadsafe(
+            self._broadcast({"type": "event", "robot_id": robot_id, "data": event}), self.loop)
 
     async def _clear_thermal(self, robot_id: str) -> None:
         task = self.thermal_tasks.pop(robot_id, None)
@@ -2454,6 +2490,8 @@ class CoreRuntime:
         @app.on_event("shutdown")
         async def _shutdown() -> None:
             self.stop_event.set()
+            if self.people is not None:
+                await asyncio.to_thread(self.people.stop)
             for robot_id in list(self.arducam_tasks):
                 await self._clear_arducam(robot_id)
             for robot_id in list(self.thermal_tasks):
@@ -2843,6 +2881,63 @@ class CoreRuntime:
             if self.perception is None:
                 return {"ok": True, "removed": 0}
             removed = self.perception.gallery.purge(robot_id, person_id)
+            return {"ok": True, "removed": removed}
+
+        # ------------------------------------------- people identified (Arducam)
+        @app.get("/api/people/status")
+        async def people_status(auth: Dict[str, str] = Depends(self._auth_dependency)) -> Dict[str, Any]:
+            if self.people is None:
+                return {"enabled": False}
+            return {"enabled": True, **self.people.status()}
+
+        @app.get("/api/robots/{robot_id}/people")
+        async def people_list(
+            robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)
+        ) -> Dict[str, Any]:
+            if self.people is None:
+                return {"people": []}
+            return {"people": await asyncio.to_thread(self.people.gallery.list, robot_id)}
+
+        @app.get("/api/robots/{robot_id}/people/{person_id}/image")
+        async def people_image(
+            robot_id: str, person_id: str,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Any:
+            path = self.people.gallery.crop_path(robot_id, person_id) if self.people else None
+            if path is None:
+                raise HTTPException(status_code=404, detail="no image for this person")
+            return FileResponse(str(path), media_type="image/jpeg")
+
+        @app.post("/api/robots/{robot_id}/people/{person_id}")
+        async def people_rename(
+            robot_id: str, person_id: str, body: PersonLabelIn,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            if auth["role"] not in {"operator", "admin"}:
+                raise HTTPException(status_code=403, detail="not allowed")
+            if self.people is None or not self.people.gallery.rename(robot_id, person_id, body.label):
+                raise HTTPException(status_code=404, detail="person not found")
+            return {"ok": True}
+
+        @app.delete("/api/robots/{robot_id}/people")
+        async def people_purge_all(
+            robot_id: str, auth: Dict[str, str] = Depends(self._auth_dependency)
+        ) -> Dict[str, Any]:
+            if auth["role"] not in {"operator", "admin"}:
+                raise HTTPException(status_code=403, detail="not allowed")
+            removed = self.people.gallery.delete(robot_id) if self.people else 0
+            self._audit("people_purged", {"robot_id": robot_id, "removed": removed, "by": auth["user_id"]})
+            return {"ok": True, "removed": removed}
+
+        @app.delete("/api/robots/{robot_id}/people/{person_id}")
+        async def people_delete(
+            robot_id: str, person_id: str,
+            auth: Dict[str, str] = Depends(self._auth_dependency),
+        ) -> Dict[str, Any]:
+            if auth["role"] not in {"operator", "admin"}:
+                raise HTTPException(status_code=403, detail="not allowed")
+            removed = self.people.gallery.delete(robot_id, person_id) if self.people else 0
+            self._audit("person_deleted", {"robot_id": robot_id, "person_id": person_id, "by": auth["user_id"]})
             return {"ok": True, "removed": removed}
 
         @app.websocket("/ws/live")
@@ -3239,6 +3334,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Also greet while autonomous exploration runs (default on).")
     parser.add_argument("--no-greeter-with-autonomy", dest="greeter_with_autonomy",
                         action="store_false")
+
+    # --- People identification on the Arducam (OpenCV DNN) -------------------
+    parser.add_argument("--enable-people-id", dest="enable_people_id", action="store_true", default=True,
+                        help="Detect, number and recognise people on the Arducam (default on).")
+    parser.add_argument("--disable-people-id", dest="enable_people_id", action="store_false")
+    parser.add_argument("--people-dir", default="./server/people",
+                        help="Numbered people: face embeddings + best crop (biometric data).")
+    parser.add_argument("--people-models-dir", default="./server/models",
+                        help="ONNX models (YOLOX, YuNet, SFace); downloaded on first use.")
+    parser.add_argument("--people-target", choices=["cpu", "opencl"], default="cpu",
+                        help="OpenCV DNN target; opencl uses the GPU (e.g. AMD) when available.")
+    parser.add_argument("--people-match-threshold", type=float, default=0.40,
+                        help="SFace cosine similarity to recognise a known person (0.363..0.5).")
+    parser.add_argument("--people-max-fps", type=float, default=5.0,
+                        help="Max Arducam frames analysed per second per robot.")
 
     parser.add_argument("--mission-storage-dir", default="./server/missions",
                         help="Persistent mission videos, detections and LiDAR maps.")

@@ -9,6 +9,8 @@ __pycache__/
 
 # Server runtime data (do NOT commit captured faces — biometric/privacy)
 server/faces/
+server/people/
+server/models/
 server/audit/
 
 # Generated WAV files, except the greeting asset deployed to the edge.

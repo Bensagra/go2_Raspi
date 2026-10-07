@@ -30,6 +30,8 @@ def hosting_args(env: Optional[Mapping[str, str]] = None):
     argv = [
         "--map-storage-dir", str(data_dir / "maps"),
         "--faces-dir", str(data_dir / "faces"),
+        "--people-dir", str(data_dir / "people"),
+        "--people-models-dir", str(data_dir / "models"),
         "--audit-log", str(data_dir / "audit" / "server_audit.jsonl"),
         "--perception-device", env.get("PERCEPTION_DEVICE", "cpu"),
     ]
@@ -87,6 +89,8 @@ def hosting_args(env: Optional[Mapping[str, str]] = None):
     args.map_storage_dir = str(data_dir / "maps")
     args.mission_storage_dir = str(data_dir / "missions")
     args.faces_dir = str(data_dir / "faces")
+    args.people_dir = str(data_dir / "people")
+    args.people_models_dir = str(data_dir / "models")
     args.audit_log = str(data_dir / "audit" / "server_audit.jsonl")
     return args
 

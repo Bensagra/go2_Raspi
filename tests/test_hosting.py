@@ -91,7 +91,7 @@ class HostingEntrypointTests(unittest.TestCase):
             "API_TOKENS": '["test-operator:operator:test","test-viewer:viewer:test-viewer"]',
             "EDGE_MEDIA_TOKEN": "test-edge",
             "ROBOT_IDS": "test_robot",
-            "SERVER_ARGS": '["--mesh-interval-s","0"]',
+            "SERVER_ARGS": '["--mesh-interval-s","0","--disable-people-id"]',
         }
         cls.process = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(cls.port)],

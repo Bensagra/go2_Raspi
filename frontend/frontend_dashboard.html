@@ -477,6 +477,7 @@
             </div>
             <p id="arducamHint" class="hint">Se guarda en el servidor durante las misiones.
               Clic o Enter sobre la imagen para ampliar.</p>
+            <p id="arducamPeople" class="hint" aria-live="polite"></p>
           </section>
           <section class="thermal-section" aria-labelledby="thermalTitle">
             <div class="row thermal-heading">
@@ -704,6 +705,19 @@
         filtra el movimiento manual y autónomo. Calibrá el piso con <span class="kbd">--safety-ground-z-m</span>.
       </p>
 
+      <h2 class="title" style="margin-top:12px;">🧑 Personas identificadas (Arducam)</h2>
+      <div class="row">
+        <button id="peopleRefreshBtn" type="button">Actualizar</button>
+        <button id="peoplePurgeBtn" type="button" style="background:#a11;color:#fff;">Borrar todas (privacidad)</button>
+        <span id="peopleStatus" class="status">identificación: --</span>
+      </div>
+      <div id="peopleGallery" class="row" style="flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
+      <p class="hint">
+        El servidor numera a cada persona por su cara y la reconoce aunque vuelva otro día; el recuadro
+        mantiene el número aunque se dé vuelta. Clic en una persona para ponerle nombre.
+        Guarda biometría (caras): borrá cuando corresponda.
+      </p>
+
       <h2 class="title" style="margin-top:12px;">👤 Caras capturadas</h2>
       <div class="row">
         <button id="facesRefreshBtn" type="button">Actualizar</button>
@@ -913,6 +927,10 @@
         uplinkMaxKbps: 12000,
       }),
     });
+
+    // Personas identificadas en la Arducam (ver handlePeopleMessage).
+    const PEOPLE_OVERLAY_MAX_AGE_MS = 1500;
+    const peopleState = { overlay: null, imageUrls: new Map() };
 
     const state = {
       ws: null,
@@ -1656,6 +1674,7 @@
           }
 
           drawBitmap(streamCanvas(stream), bitmap);
+          if (stream === "arducam") drawPeopleOverlay(streamCanvas(stream));
           if (stream === "video") lastSnapshotFrameAt = snapshotTimestamp(header);
           if (stream === "arducam") {
             state.lastArducamAt = receivedAt;
@@ -1670,6 +1689,7 @@
           }
           if (state.expandedStream === stream) {
             drawBitmap(els.expandedMediaCanvas, bitmap);
+            if (stream === "arducam") drawPeopleOverlay(els.expandedMediaCanvas);
           }
 
           const previous = renderer.bitmap;
@@ -2871,6 +2891,7 @@
         : stream === "arducam" ? "Arducam ampliada" : stream === "thermal" ? "Cámara térmica ampliada" : "Mapa LiDAR 3D ampliado";
       if (renderer && renderer.bitmap) {
         drawBitmap(els.expandedMediaCanvas, renderer.bitmap);
+        if (stream === "arducam") drawPeopleOverlay(els.expandedMediaCanvas);
       }
       els.mediaModal.hidden = false;
       document.body.style.overflow = "hidden";
@@ -3784,6 +3805,8 @@
       lastSnapshotFrameAt = 0;
       state.lastArducamAt = 0;
       state.arducamFrameTimes.length = 0;
+      peopleState.overlay = null;
+      document.getElementById("arducamPeople").textContent = "";
       updateArducamStatus();
       state.lastThermalAt = 0;
       state.thermalHeader = null;
@@ -4174,6 +4197,189 @@
       }
     }
 
+
+    // ------------------------------------------------- personas (Arducam)
+    // El servidor manda {type:"people"} con recuadros normalizados (0..1) y el
+    // número estable de cada persona; se dibujan encima del último cuadro.
+
+    function personColor(number) {
+      return number ? `hsl(${Math.round((number * 137.5) % 360)} 85% 58%)` : "#9aa4b2";
+    }
+
+    function drawPeopleOverlay(canvas) {
+      const ov = peopleState.overlay;
+      if (!canvas || !ov || ov.robot_id !== state.robotId || Date.now() - ov.receivedAt > PEOPLE_OVERLAY_MAX_AGE_MS) return;
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width, h = canvas.height;
+      const line = Math.max(2, Math.round(w / 400));
+      const fontPx = Math.max(12, Math.round(w / 55));
+      ctx.save();
+      ctx.font = `600 ${fontPx}px system-ui, sans-serif`;
+      ctx.textBaseline = "top";
+      for (const p of ov.people || []) {
+        const [x1, y1, x2, y2] = p.box;
+        const color = personColor(p.number);
+        ctx.lineWidth = line;
+        ctx.strokeStyle = color;
+        ctx.setLineDash([]);
+        ctx.strokeRect(x1 * w, y1 * h, (x2 - x1) * w, (y2 - y1) * h);
+        if (p.face_box) {
+          const [fx1, fy1, fx2, fy2] = p.face_box;
+          ctx.setLineDash([line * 2, line * 2]);
+          ctx.lineWidth = Math.max(1, line / 2);
+          ctx.strokeRect(fx1 * w, fy1 * h, (fx2 - fx1) * w, (fy2 - fy1) * h);
+        }
+        const label = p.name || "Sin identificar";
+        const tw = ctx.measureText(label).width + line * 4;
+        const th = fontPx + line * 3;
+        const ty = y1 * h - th >= 0 ? y1 * h - th : y1 * h;
+        ctx.fillStyle = color;
+        ctx.fillRect(x1 * w, ty, tw, th);
+        ctx.fillStyle = "#000";
+        ctx.fillText(label, x1 * w + line * 2, ty + line * 1.5);
+      }
+      ctx.restore();
+    }
+
+    function redrawArducamWithPeople() {
+      const renderer = state.mediaRender.arducam;
+      if (!renderer || !renderer.bitmap) return;
+      drawBitmap(els.arducamFrame, renderer.bitmap);
+      drawPeopleOverlay(els.arducamFrame);
+      if (state.expandedStream === "arducam") {
+        drawBitmap(els.expandedMediaCanvas, renderer.bitmap);
+        drawPeopleOverlay(els.expandedMediaCanvas);
+      }
+    }
+
+    function handlePeopleMessage(msg) {
+      if (msg.robot_id !== state.robotId) return;
+      peopleState.overlay = { ...msg, receivedAt: Date.now() };
+      redrawArducamWithPeople();
+      const people = msg.people || [];
+      document.getElementById("arducamPeople").textContent = people.length
+        ? `👤 ${people.length} en vista: ${people.map(p => p.name || "sin identificar").join(", ")}`
+        : "👤 Nadie en vista";
+    }
+
+    async function peopleFetch(path, options = {}) {
+      const res = await fetch(api(path), {
+        ...options,
+        headers: { "Authorization": "Bearer " + state.token, ...(options.headers || {}) },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    }
+
+    async function loadPeopleStatus() {
+      const el = document.getElementById("peopleStatus");
+      if (!el || !state.token) return;
+      try {
+        const d = await (await peopleFetch("/api/people/status")).json();
+        if (!d.enabled) setBadge(el, "identificación desactivada en el servidor", "warn");
+        else if (d.status === "error") setBadge(el, d.error || "error", "err");
+        else if (d.status === "loading") setBadge(el, "descargando/cargando modelos…", "warn");
+        else if (d.status === "ready") setBadge(el, `activa · ${d.fps} fps · ${d.ms} ms por cuadro (${d.target})`, "ok");
+        else setBadge(el, "esperando imágenes de la Arducam", "warn");
+      } catch (e) {
+        setBadge(el, "servidor sin identificación de personas", "warn");
+      }
+    }
+
+    async function loadPeopleGallery() {
+      const gallery = document.getElementById("peopleGallery");
+      if (!gallery || !state.token || !state.robotId) return;
+      const robot = state.robotId;
+      let people;
+      try {
+        people = (await (await peopleFetch(`/api/robots/${encodeURIComponent(robot)}/people`)).json()).people || [];
+      } catch (e) {
+        return;
+      }
+      if (robot !== state.robotId) return;
+      for (const url of peopleState.imageUrls.values()) URL.revokeObjectURL(url);
+      peopleState.imageUrls.clear();
+      gallery.replaceChildren();
+      if (!people.length) {
+        const empty = document.createElement("span");
+        empty.className = "status";
+        empty.textContent = "todavía no identificó a nadie";
+        gallery.appendChild(empty);
+        return;
+      }
+      for (const p of people) {
+        const card = document.createElement("div");
+        card.style.cssText = "width:112px;text-align:center;font-size:11px;position:relative;cursor:pointer;";
+        card.title = "Clic para ponerle nombre";
+        const img = document.createElement("img");
+        img.alt = p.name;
+        img.style.cssText = `width:104px;height:104px;object-fit:cover;border-radius:6px;border:3px solid ${personColor(p.number)};background:#111;`;
+        peopleFetch(`/api/robots/${encodeURIComponent(robot)}/people/${encodeURIComponent(p.person_id)}/image`)
+          .then(res => res.blob())
+          .then(blob => {
+            const url = URL.createObjectURL(blob);
+            peopleState.imageUrls.set(p.person_id, url);
+            img.src = url;
+          })
+          .catch(() => { img.style.visibility = "hidden"; });
+        const name = document.createElement("div");
+        name.style.fontWeight = "600";
+        name.textContent = p.name;
+        const meta = document.createElement("div");
+        meta.className = "hint";
+        meta.textContent = `#${p.number} · visto ${new Date(p.last_seen * 1000).toLocaleTimeString()}`;
+        const del = document.createElement("button");
+        del.type = "button";
+        del.textContent = "×";
+        del.title = "Borrar esta persona";
+        del.setAttribute("aria-label", `Borrar ${p.name}`);
+        del.style.cssText = "position:absolute;top:2px;right:6px;padding:0 6px;line-height:18px;";
+        del.onclick = event => { event.stopPropagation(); void deletePerson(p); };
+        card.append(img, name, meta, del);
+        card.onclick = () => void renamePerson(p);
+        gallery.appendChild(card);
+      }
+    }
+
+    async function renamePerson(p) {
+      const label = prompt(`Nombre para ${p.name} (vacío = volver a "Persona ${p.number}"):`, p.label || "");
+      if (label === null) return;
+      try {
+        await peopleFetch(`/api/robots/${encodeURIComponent(state.robotId)}/people/${encodeURIComponent(p.person_id)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ label }),
+        });
+      } catch (e) {
+        addEvent("people", `No se pudo renombrar: ${normalizeError(e)}`);
+      }
+      void loadPeopleGallery();
+    }
+
+    async function deletePerson(p) {
+      if (!confirm(`¿Borrar a ${p.name}? Si vuelve a aparecer se registra con un número nuevo.`)) return;
+      try {
+        await peopleFetch(`/api/robots/${encodeURIComponent(state.robotId)}/people/${encodeURIComponent(p.person_id)}`, { method: "DELETE" });
+      } catch (e) {
+        addEvent("people", `No se pudo borrar: ${normalizeError(e)}`);
+      }
+      void loadPeopleGallery();
+    }
+
+    async function purgePeople() {
+      if (!confirm("¿Borrar TODAS las personas identificadas de este robot? La numeración vuelve a empezar (irreversible).")) return;
+      try {
+        await peopleFetch(`/api/robots/${encodeURIComponent(state.robotId)}/people`, { method: "DELETE" });
+      } catch (e) {
+        addEvent("people", `No se pudo borrar: ${normalizeError(e)}`);
+      }
+      void loadPeopleGallery();
+    }
+
+    setInterval(() => {
+      if (!state.connected) return;
+      void loadPeopleStatus();
+      void loadPeopleGallery();
+    }, 15000);
+
     async function loadFacesGallery() {
       const gallery = autoEl("facesGallery");
       if (!gallery || !state.token || !state.robotId) return;
@@ -4248,6 +4454,8 @@
       bind("autoEstopBtn", () => autonomyAction("estop"));
       bind("facesRefreshBtn", () => { loadFacesGallery(); loadPerceptionCaps(); });
       bind("facesPurgeBtn", purgeFaces);
+      bind("peopleRefreshBtn", () => { loadPeopleGallery(); loadPeopleStatus(); });
+      bind("peoplePurgeBtn", purgePeople);
       bind("greeterToggleBtn", greeterToggle);
       bind("greetLoopBtn", greetLoopToggle);
       bind("greetTestBtn", greetTest);
@@ -4259,6 +4467,11 @@
 
     function handleWsMessage(msg) {
       const type = msg.type;
+
+      if (type === "people") {
+        handlePeopleMessage(msg);
+        return;
+      }
 
       if (type === "map_reset") {
         if (msg.robot_id === state.robotId && msg.map_generation) useLidarGeneration(String(msg.map_generation));
@@ -4345,6 +4558,12 @@
       }
 
       if (type === "command_ack" && handleSpeedProfileAck(msg.data || {})) {
+        return;
+      }
+
+      if (type === "event" && msg.robot_id === state.robotId && msg.data?.event === "person_new") {
+        addEvent("person_new", `Nueva persona identificada: ${msg.data.data?.name || ""}`);
+        void loadPeopleGallery();
         return;
       }
 
@@ -4470,6 +4689,9 @@
       while (state.arducamFrameTimes.length && state.arducamFrameTimes[0] < now - 1000) state.arducamFrameTimes.shift();
       els.arducamEmpty.hidden = live;
       els.arducamFrame.setAttribute("aria-disabled", String(!live));
+      if (!peopleState.overlay || now - peopleState.overlay.receivedAt > 3000) {
+        document.getElementById("arducamPeople").textContent = "";
+      }
       if (live) {
         setBadge(els.arducamStatus, `En vivo · ${state.arducamFrameTimes.length} fps`, "ok");
       } else {
@@ -4996,6 +5218,8 @@
         void loadServerMesh();
         void loadPerceptionCaps();
         void loadFacesGallery();
+        void loadPeopleStatus();
+        void loadPeopleGallery();
       };
 
       ws.onclose = (ev) => {

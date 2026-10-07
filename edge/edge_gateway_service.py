@@ -243,6 +243,7 @@ class EdgeGatewayService:
         self.arducam_camera = ArducamCamera(
             media=args.arducam_media, fps=args.arducam_fps,
             max_width=args.arducam_max_width, quality=args.arducam_quality,
+            min_width=args.arducam_min_width,
         ) if args.enable_arducam else None
 
         self.camera_enabled = args.enable_camera
@@ -3413,6 +3414,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arducam-fps", type=float, default=5.0, help="Maximum JPEG uplink FPS (CSI stays 4K)")
     parser.add_argument("--arducam-max-width", type=int, default=1280, help="JPEG width, 320..3840")
     parser.add_argument("--arducam-quality", type=int, default=75, help="JPEG quality, 25..95")
+    parser.add_argument("--arducam-min-width", type=int, default=480,
+                        help="Smallest width the bandwidth adaptation may use; "
+                             "set it equal to --arducam-max-width to lock the resolution")
     parser.add_argument("--enable-thermal", dest="enable_thermal", action="store_true", default=True,
                         help="Read the USB SenXor continuously (enabled by default).")
     parser.add_argument("--disable-thermal", dest="enable_thermal", action="store_false")
@@ -3450,6 +3454,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--arducam-max-width must be between 320 and 3840")
     if not 25 <= args.arducam_quality <= 95:
         parser.error("--arducam-quality must be between 25 and 95")
+    if not 320 <= args.arducam_min_width <= 3840:
+        parser.error("--arducam-min-width must be between 320 and 3840")
 
     if not math.isfinite(args.thermal_fps) or not 1 <= args.thermal_fps <= 30:
         parser.error("--thermal-fps must be between 1 and 30")

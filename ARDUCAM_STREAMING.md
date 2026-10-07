@@ -64,6 +64,7 @@ El servidor utiliza su `--mission-storage-dir` habitual (en TIC, `DATA_DIR/missi
 | `--arducam-fps` | 5 | Máximo de imágenes enviadas por segundo, 1–30 |
 | `--arducam-max-width` | 1280 | Ancho del JPEG, 320–3840; conserva proporción |
 | `--arducam-quality` | 75 | Calidad JPEG, 25–95 |
+| `--arducam-min-width` | 480 | Ancho mínimo al que puede bajar el ajuste automático. Igual a `--arducam-max-width` fija la resolución (ej. 1920 → 1080p) y, si falta ancho de banda, baja calidad/FPS en vez de tamaño |
 
 La captura del sensor sigue siendo 4K UYVY. El perfil inicial transmite **1280×720**, y esa resolución se guarda en el MP4. Para guardar 4K hay que transmitir con `--arducam-max-width 3840` y ajustar FPS/ancho de banda; el rendimiento 4K no está validado. El FPS configurado es un máximo, no una garantía del sensor o la red.
 

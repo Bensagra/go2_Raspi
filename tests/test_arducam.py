@@ -93,6 +93,10 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(adaptive.settings(), {'max_width': 1280, 'quality': 75})
         adaptive.update(10**9, 0)  # Uncapped uplink keeps the configured profile.
         self.assertEqual(adaptive.settings(), {'max_width': 1280, 'quality': 75})
+        locked = AdaptiveJpeg(1920, 75, min_width=1920)  # 1080p fixed: only quality may drop.
+        for _ in range(20):
+            locked.update(10**9, target)
+        self.assertEqual(locked.settings(), {'max_width': 1920, 'quality': 35})
         camera = ArducamCamera()
         camera.set_target_bytes(1234.9)
         self.assertEqual(camera.config['target_bytes'].value, 1234)

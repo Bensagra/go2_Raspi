@@ -32,7 +32,8 @@ def encode_media_frame(header, payload):
 
 async def run(args):
     url = f"{args.server.rstrip('/')}/ws/edge-media/{args.robot_id}?token={args.token}"
-    camera = ArducamCamera(media=args.media, fps=args.fps, max_width=args.max_width, quality=args.quality)
+    camera = ArducamCamera(media=args.media, fps=args.fps, max_width=args.max_width, quality=args.quality,
+                           min_width=args.min_width)
     camera.start()
     sent, last_report, last_error = 0, time.monotonic(), None
     try:
@@ -72,6 +73,8 @@ def main():
     parser.add_argument("--fps", type=float, default=5.0)
     parser.add_argument("--max-width", type=int, default=1280)
     parser.add_argument("--quality", type=int, default=75)
+    parser.add_argument("--min-width", type=int, default=480,
+                        help="Ancho mínimo; igual a --max-width fija la resolución")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))

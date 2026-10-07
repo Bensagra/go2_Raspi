@@ -144,8 +144,9 @@ MIN_QUALITY, MIN_WIDTH = 35, 480
 class AdaptiveJpeg:
     """Steer JPEG width/quality so each frame fits the uplink share (one encode per frame)."""
 
-    def __init__(self, max_width, quality):
+    def __init__(self, max_width, quality, min_width=MIN_WIDTH):
         self.max_width, self.max_quality = max_width, quality
+        self.min_width = min(min_width, max_width)  # Equal to max_width locks the resolution.
         self.width, self.quality = max_width, quality
 
     def settings(self):
@@ -157,8 +158,8 @@ class AdaptiveJpeg:
         elif size > target:
             if self.quality > MIN_QUALITY:
                 self.quality = max(MIN_QUALITY, self.quality - (10 if size > 1.5 * target else 5))
-            elif self.width > MIN_WIDTH:
-                self.width = max(MIN_WIDTH, int(self.width * 0.8) // 16 * 16)
+            elif self.width > self.min_width:
+                self.width = max(self.min_width, int(self.width * 0.8) // 16 * 16)
         elif size < 0.6 * target:
             if self.width < self.max_width:
                 self.width = min(self.max_width, int(self.width * 1.25) // 16 * 16)
@@ -173,7 +174,7 @@ def capture_worker(config, mailbox, stop):
         camera = V4L2Camera(config['media'], config['prepare_graph'])
         session, seq, last_emit = uuid.uuid4().hex, 0, float('-inf')
         target = config.get('target_bytes')
-        adaptive = AdaptiveJpeg(config['max_width'], config['quality'])
+        adaptive = AdaptiveJpeg(config['max_width'], config['quality'], config.get('min_width', MIN_WIDTH))
         while not stop.is_set():
             camera.grab()  # Always drain the sensor, even between uplink frames.
             now, captured_at = time.monotonic(), time.time()
@@ -198,11 +199,12 @@ def capture_worker(config, mailbox, stop):
 class ArducamCamera:
     def __init__(self, media=None, fps=5.0, max_width=1280, quality=75, prepare_graph=True,
                  retry_s=3.0, timeout_s=8.0, startup_timeout_s=40.0,
-                 worker=capture_worker):
+                 worker=capture_worker, min_width=MIN_WIDTH):
         # Per-frame byte target shared with the spawned worker; 0 = uncapped.
         self.target_bytes = mp.get_context('spawn').Value('i', 0)
         self.config = dict(media=media, fps=fps, max_width=max_width, quality=quality,
-                           prepare_graph=prepare_graph, target_bytes=self.target_bytes)
+                           min_width=min_width, prepare_graph=prepare_graph,
+                           target_bytes=self.target_bytes)
         self.retry_s, self.timeout_s, self.startup_timeout_s = retry_s, timeout_s, startup_timeout_s
         self.worker = worker
         self.stop_event = threading.Event()

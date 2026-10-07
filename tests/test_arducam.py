@@ -11,7 +11,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from edge.arducam_camera import ArducamCamera, discover, prepare, encode_packet, put_latest
+from edge.arducam_camera import AdaptiveJpeg, ArducamCamera, discover, prepare, encode_packet, put_latest
 from edge.edge_gateway_service import parse_args as edge_args
 from server.arducam import ArducamProcessor
 from server.server_core import CoreRuntime, parse_args, encode_media_frame, decode_media_frame
@@ -78,6 +78,24 @@ class CaptureTests(unittest.TestCase):
             camera.stop()
         self.assertFalse(camera.thread.is_alive())
         self.assertLess(time.monotonic() - before, 4)
+
+    def test_adaptive_jpeg_fits_budget_and_recovers(self):
+        image = np.random.default_rng(0).integers(0, 255, (2160, 3840, 3), np.uint8)
+        adaptive, target = AdaptiveJpeg(1280, 75), 30_000
+        for _ in range(20):
+            size = len(encode_packet(image, adaptive.settings(), 's', 1, time.time(), 0)['payload'])
+            adaptive.update(size, target)
+        self.assertLessEqual(len(encode_packet(image, adaptive.settings(), 's', 1, time.time(), 0)['payload']),
+                             target * 1.5)
+        self.assertGreaterEqual(adaptive.width, 480)
+        for _ in range(20):
+            adaptive.update(1_000, target)
+        self.assertEqual(adaptive.settings(), {'max_width': 1280, 'quality': 75})
+        adaptive.update(10**9, 0)  # Uncapped uplink keeps the configured profile.
+        self.assertEqual(adaptive.settings(), {'max_width': 1280, 'quality': 75})
+        camera = ArducamCamera()
+        camera.set_target_bytes(1234.9)
+        self.assertEqual(camera.config['target_bytes'].value, 1234)
 
     def test_gateway_defaults_and_invalid_options(self):
         with patch('sys.argv', ['edge']):

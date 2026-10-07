@@ -42,6 +42,10 @@ except Exception:
 # base64 encode on the Pi for every frame.
 MEDIA_FRAME_MAGIC = 0xA7
 MEDIA_FRAME_VERSION = 1
+# Fraction of --media-max-kbps that sizes each Arducam JPEG.
+ARDUCAM_UPLINK_SHARE = 0.3
+# Latest-only snapshot streams that wait for uplink budget instead of being dropped.
+DEFERRABLE_MEDIA_STREAMS = {"arducam", "thermal_csv"}
 
 
 def encode_media_frame(header: Dict[str, Any], payload: bytes) -> bytes:
@@ -2788,6 +2792,11 @@ class EdgeGatewayService:
         last_error = None
         try:
             while not self.stop_event.is_set():
+                if name == "arducam" and self.args.arducam_fps > 0:
+                    # Size Arducam JPEGs to their share of the shared uplink budget
+                    # (re-read every tick: the dashboard network profile can change it).
+                    share = max(self.media_max_kbps, 0) * 125.0 * ARDUCAM_UPLINK_SHARE
+                    camera.set_target_bytes(share / self.args.arducam_fps)
                 packet = camera.take_latest()
                 if packet is not None:
                     await self._enqueue_media(packet)
@@ -2906,6 +2915,17 @@ class EdgeGatewayService:
                                 # droppable streams (lidar/audio) yield bandwidth to it.
                                 if not reliable and payload_size > budget_tokens:
                                     stream = str(payload.get("stream", "unknown"))
+                                    if (stream in DEFERRABLE_MEDIA_STREAMS
+                                            and stream not in self.latest_media_by_stream):
+                                        # Snapshot streams: hold the frame until the bucket
+                                        # refills instead of dropping it (a newer one replaces
+                                        # it; the 3 s staleness check above still applies).
+                                        self.latest_media_by_stream[stream] = payload
+                                        wait_s = (payload_size - budget_tokens) / max_bytes_per_second
+                                        asyncio.get_running_loop().call_later(
+                                            min(max(wait_s, 0.02), 1.0), self.media_ready.set)
+                                        continue
+
                                     self.media_budget_drops[stream] = (
                                         self.media_budget_drops.get(stream, 0) + 1
                                     )

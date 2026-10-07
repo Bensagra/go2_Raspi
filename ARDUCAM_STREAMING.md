@@ -42,7 +42,7 @@ python edge/edge_gateway_service.py \
 
 Reemplazar los marcadores y conservar las demás opciones de MQTT/TLS/robot que ya usás. Para un servidor HTTPS usar su URL `wss://...`, manteniendo cualquier prefijo de ruta.
 
-`--media-max-kbps 6000` da margen inicial a los tres streams; es un límite compartido, no un consumo garantizado. El perfil de red aplicado desde el dashboard puede cambiarlo: el perfil equilibrado fija 5000 kbps y el débil 2200. Si aumentan `media.media_budget_drops.arducam` o faltan imágenes, revisar ese límite y probar `--arducam-max-width 640 --arducam-fps 3 --arducam-quality 60`. El formato JPEG tiene bitrate variable según la escena. La cola descarta imágenes para evitar acumular retraso.
+`--media-max-kbps 6000` da margen inicial a los tres streams; es un límite compartido, no un consumo garantizado. El perfil de red aplicado desde el dashboard puede cambiarlo: el perfil equilibrado fija 5000 kbps y el débil 2200. Si aumentan `media.media_budget_drops.arducam` o faltan imágenes, revisar ese límite y probar `--arducam-max-width 640 --arducam-fps 3 --arducam-quality 60`. El formato JPEG tiene bitrate variable según la escena. Cada JPEG se ajusta automáticamente al 30 % de ese límite (baja calidad hasta 35 y después ancho hasta 480; vuelve a subir cuando sobra margen), y si un cuadro no entra en el presupuesto espera a que se libere en lugar de descartarse. Solo se descarta si se reemplaza por uno más nuevo o supera los 3 s de antigüedad. El sensor se drena sin convertir: solo se decodifican los cuadros que se envían.
 
 ## Comprobar el flujo completo
 

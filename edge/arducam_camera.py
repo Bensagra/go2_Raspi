@@ -88,8 +88,13 @@ class V4L2Camera:
             self.close()
             raise
 
+    def grab(self):
+        # Dequeue only: draining the sensor must not pay the 4K UYVY->BGR conversion.
+        if not self.cap.grab():
+            raise RuntimeError('La Arducam no entrega cuadros')
+
     def read(self):
-        ok, image = self.cap.read()
+        ok, image = self.cap.retrieve()
         if not ok or image is None:
             raise RuntimeError('La Arducam no entrega cuadros')
         if image.shape != (HEIGHT, WIDTH, 3) or str(image.dtype) != 'uint8':
@@ -133,19 +138,51 @@ def put_latest(mailbox, value):
             mailbox.put_nowait(value)
 
 
+MIN_QUALITY, MIN_WIDTH = 35, 480
+
+
+class AdaptiveJpeg:
+    """Steer JPEG width/quality so each frame fits the uplink share (one encode per frame)."""
+
+    def __init__(self, max_width, quality):
+        self.max_width, self.max_quality = max_width, quality
+        self.width, self.quality = max_width, quality
+
+    def settings(self):
+        return {'max_width': self.width, 'quality': self.quality}
+
+    def update(self, size, target):
+        if target <= 0:  # Uncapped uplink: configured profile.
+            self.width, self.quality = self.max_width, self.max_quality
+        elif size > target:
+            if self.quality > MIN_QUALITY:
+                self.quality = max(MIN_QUALITY, self.quality - (10 if size > 1.5 * target else 5))
+            elif self.width > MIN_WIDTH:
+                self.width = max(MIN_WIDTH, int(self.width * 0.8) // 16 * 16)
+        elif size < 0.6 * target:
+            if self.width < self.max_width:
+                self.width = min(self.max_width, int(self.width * 1.25) // 16 * 16)
+            elif self.quality < self.max_quality:
+                self.quality = min(self.max_quality, self.quality + 5)
+
+
 def capture_worker(config, mailbox, stop):
     camera = None
     try:
         cv2.setNumThreads(1)
         camera = V4L2Camera(config['media'], config['prepare_graph'])
         session, seq, last_emit = uuid.uuid4().hex, 0, float('-inf')
+        target = config.get('target_bytes')
+        adaptive = AdaptiveJpeg(config['max_width'], config['quality'])
         while not stop.is_set():
-            image = camera.read()  # Always drain the sensor, even between uplink frames.
+            camera.grab()  # Always drain the sensor, even between uplink frames.
             now, captured_at = time.monotonic(), time.time()
             if now - last_emit < 1 / config['fps']:
                 continue
+            image = camera.read()
             seq += 1
-            packet = encode_packet(image, config, session, seq, captured_at, now)
+            packet = encode_packet(image, adaptive.settings(), session, seq, captured_at, now)
+            adaptive.update(len(packet['payload']), target.value if target is not None else 0)
             packet['header']['device'] = camera.video
             put_latest(mailbox, packet)
             last_emit = now
@@ -162,8 +199,10 @@ class ArducamCamera:
     def __init__(self, media=None, fps=5.0, max_width=1280, quality=75, prepare_graph=True,
                  retry_s=3.0, timeout_s=8.0, startup_timeout_s=40.0,
                  worker=capture_worker):
+        # Per-frame byte target shared with the spawned worker; 0 = uncapped.
+        self.target_bytes = mp.get_context('spawn').Value('i', 0)
         self.config = dict(media=media, fps=fps, max_width=max_width, quality=quality,
-                           prepare_graph=prepare_graph)
+                           prepare_graph=prepare_graph, target_bytes=self.target_bytes)
         self.retry_s, self.timeout_s, self.startup_timeout_s = retry_s, timeout_s, startup_timeout_s
         self.worker = worker
         self.stop_event = threading.Event()
@@ -183,6 +222,9 @@ class ArducamCamera:
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=5)
+
+    def set_target_bytes(self, value):
+        self.target_bytes.value = max(0, int(value))
 
     def status(self):
         with self.lock:

@@ -461,17 +461,30 @@ class EdgeGatewayService:
             self.mqtt_client.tls_set()
 
         self.mqtt_client.on_connect = self._on_mqtt_connect
+        self.mqtt_client.on_connect_fail = self._on_mqtt_connect_fail
         self.mqtt_client.on_message = self._on_mqtt_message
         self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
+        print(f"[edge] MQTT: conectando a {self.args.mqtt_host}:{self.args.mqtt_port}", flush=True)
 
         self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
         self.mqtt_client.connect_async(self.args.mqtt_host, self.args.mqtt_port, keepalive=30)
         self.mqtt_client.loop_start()
 
+    # MQTT failures are printed: events travel over MQTT itself, so they are
+    # invisible exactly when the broker is unreachable.
+    def _on_mqtt_connect_fail(self, client, userdata) -> None:
+        print(f"[edge] MQTT: no se pudo conectar a {self.args.mqtt_host}:{self.args.mqtt_port} "
+              "(broker apagado, puerto cerrado o firewall); reintentando", flush=True)
+
     def _on_mqtt_connect(self, client, userdata, flags, rc, properties=None) -> None:
         if rc != 0:
+            print(f"[edge] MQTT: el broker rechazó la conexión (rc={rc}); "
+                  "revisar --mqtt-username/--mqtt-password", flush=True)
             self._publish_event("mqtt_connect_failed", {"rc": rc})
             return
+
+        print(f"[edge] MQTT: conectado a {self.args.mqtt_host}:{self.args.mqtt_port} "
+              f"(publicando en {self._mqtt_topic('telemetry')})", flush=True)
 
         client.subscribe(self._mqtt_topic("commands/in"), qos=1)
         client.subscribe(self._mqtt_topic("talk/in"), qos=1)
@@ -487,6 +500,7 @@ class EdgeGatewayService:
         )
 
     def _on_mqtt_disconnect(self, client, userdata, rc, properties=None) -> None:
+        print(f"[edge] MQTT: desconectado (rc={rc}); reintentando", flush=True)
         self._publish_event("mqtt_disconnected", {"rc": rc})
 
     def _on_mqtt_message(self, client, userdata, msg) -> None:

@@ -5294,6 +5294,9 @@
     });
 
     els.networkProfile.addEventListener("change", async () => {
+      // Remember the choice: on every connect the profile's uplink limit is sent to
+      // the Raspy and overrides its --media-max-kbps.
+      try { localStorage.setItem("go2.networkProfile", els.networkProfile.value); } catch (e) { /* private mode */ }
       state.netStats.adaptLevel = 0;   // manual choice wins over auto-quality
       state.netStats.lastAdaptAt = Date.now();
       applyNetworkProfileValues();
@@ -5648,6 +5651,10 @@
     });
 
     els.maxApiToggle.disabled = true;
+    try {
+      const savedProfile = localStorage.getItem("go2.networkProfile");
+      if (savedProfile && NETWORK_PROFILES[savedProfile]) els.networkProfile.value = savedProfile;
+    } catch (e) { /* storage unavailable: keep the default */ }
     applyNetworkProfileValues();
     setupSavedMapInteraction();
     setupLiveInteraction();

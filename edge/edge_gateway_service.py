@@ -3411,10 +3411,11 @@ def parse_args() -> argparse.Namespace:
                         help="Read the CSI Arducam B0541 independently of the Go2 camera (default: on).")
     parser.add_argument("--disable-arducam", dest="enable_arducam", action="store_false")
     parser.add_argument("--arducam-media", default=None, help="Optional /dev/mediaN when several cameras exist")
-    parser.add_argument("--arducam-fps", type=float, default=5.0, help="Maximum JPEG uplink FPS (CSI stays 4K)")
-    parser.add_argument("--arducam-max-width", type=int, default=1280, help="JPEG width, 320..3840")
-    parser.add_argument("--arducam-quality", type=int, default=75, help="JPEG quality, 25..95")
-    parser.add_argument("--arducam-min-width", type=int, default=480,
+    # Defaults favour frame rate over detail for weak Wi-Fi (~12 KB JPEGs at 480x270).
+    parser.add_argument("--arducam-fps", type=float, default=10.0, help="Maximum JPEG uplink FPS (CSI stays 4K)")
+    parser.add_argument("--arducam-max-width", type=int, default=480, help="JPEG width, 320..3840")
+    parser.add_argument("--arducam-quality", type=int, default=35, help="JPEG quality, 25..95")
+    parser.add_argument("--arducam-min-width", type=int, default=320,
                         help="Smallest width the bandwidth adaptation may use; "
                              "set it equal to --arducam-max-width to lock the resolution")
     parser.add_argument("--enable-thermal", dest="enable_thermal", action="store_true", default=True,

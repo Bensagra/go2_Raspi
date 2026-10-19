@@ -70,10 +70,10 @@ def main():
     parser.add_argument("--robot-id", default="go2_01")
     parser.add_argument("--token", default="edge-media-dev-token")
     parser.add_argument("--media", default=None, help="/dev/mediaN si hay varias cámaras")
-    parser.add_argument("--fps", type=float, default=5.0)
-    parser.add_argument("--max-width", type=int, default=1280)
-    parser.add_argument("--quality", type=int, default=75)
-    parser.add_argument("--min-width", type=int, default=480,
+    parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--max-width", type=int, default=480)
+    parser.add_argument("--quality", type=int, default=35)
+    parser.add_argument("--min-width", type=int, default=320,
                         help="Ancho mínimo; igual a --max-width fija la resolución")
     args = parser.parse_args()
     try:

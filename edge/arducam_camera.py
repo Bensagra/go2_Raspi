@@ -138,7 +138,7 @@ def put_latest(mailbox, value):
             mailbox.put_nowait(value)
 
 
-MIN_QUALITY, MIN_WIDTH = 35, 480
+MIN_QUALITY, MIN_WIDTH = 25, 320  # Adaptation floor: 320x180 at quality 25 (~5 KB).
 
 
 class AdaptiveJpeg:

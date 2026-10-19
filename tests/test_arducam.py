@@ -11,7 +11,8 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from edge.arducam_camera import AdaptiveJpeg, ArducamCamera, discover, prepare, encode_packet, put_latest
+from edge.arducam_camera import (AdaptiveJpeg, ArducamCamera, MIN_QUALITY, MIN_WIDTH, discover, prepare,
+                                 encode_packet, put_latest)
 from edge.edge_gateway_service import parse_args as edge_args
 from server.arducam import ArducamProcessor
 from server.server_core import CoreRuntime, parse_args, encode_media_frame, decode_media_frame
@@ -87,7 +88,7 @@ class CaptureTests(unittest.TestCase):
             adaptive.update(size, target)
         self.assertLessEqual(len(encode_packet(image, adaptive.settings(), 's', 1, time.time(), 0)['payload']),
                              target * 1.5)
-        self.assertGreaterEqual(adaptive.width, 480)
+        self.assertGreaterEqual(adaptive.width, MIN_WIDTH)
         for _ in range(20):
             adaptive.update(1_000, target)
         self.assertEqual(adaptive.settings(), {'max_width': 1280, 'quality': 75})
@@ -96,7 +97,7 @@ class CaptureTests(unittest.TestCase):
         locked = AdaptiveJpeg(1920, 75, min_width=1920)  # 1080p fixed: only quality may drop.
         for _ in range(20):
             locked.update(10**9, target)
-        self.assertEqual(locked.settings(), {'max_width': 1920, 'quality': 35})
+        self.assertEqual(locked.settings(), {'max_width': 1920, 'quality': MIN_QUALITY})
         camera = ArducamCamera()
         camera.set_target_bytes(1234.9)
         self.assertEqual(camera.config['target_bytes'].value, 1234)
